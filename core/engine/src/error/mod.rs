@@ -361,8 +361,7 @@ impl From<PanicError> for JsError {
 #[boa_gc(unsafe_no_drop)]
 #[allow(variant_size_differences)]
 pub enum EngineError {
-    /// Error thrown when no instructions remain. Only used in a fuzzing context.
-    #[cfg(feature = "fuzz")]
+    /// Error thrown when an instruction budget is exhausted.
     #[error("NoInstructionsRemainError: instruction budget was exhausted")]
     NoInstructionsRemain,
 
@@ -383,7 +382,6 @@ impl EngineError {
     /// error reporting frameworks such as `anyhow`, `eyre` or `miette`.
     fn into_erased(self, context: &mut Context) -> ErasedEngineError {
         match self {
-            #[cfg(feature = "fuzz")]
             EngineError::NoInstructionsRemain => ErasedEngineError::NoInstructionsRemain,
             EngineError::RuntimeLimit(err) => ErasedEngineError::RuntimeLimit(err),
             EngineError::Panic(err) => ErasedEngineError::Panic(ErasedPanicError {
@@ -1603,8 +1601,7 @@ impl ErasedPanicError {
 #[derive(Debug, Clone, Error, Eq, PartialEq, Trace, Finalize)]
 #[allow(variant_size_differences)]
 pub enum ErasedEngineError {
-    /// Error thrown when no instructions remain. Only used in a fuzzing context.
-    #[cfg(feature = "fuzz")]
+    /// Error thrown when an instruction budget is exhausted.
     #[error("NoInstructionsRemainError: instruction budget was exhausted")]
     NoInstructionsRemain,
 

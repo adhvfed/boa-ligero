@@ -483,6 +483,10 @@ macro_rules! generate_opcodes {
                 ) -> u64 {
                     // SAFETY: upheld by the JIT trampoline calling this shim.
                     let context = unsafe { &mut *context };
+                    if let Err(error) = context.consume_instruction_budget() {
+                        context.vm.jit_pending = Some(CompletionRecord::Throw(error.into()));
+                        return crate::jit::JIT_BREAK_BIT;
+                    }
                     match [<handle_ $Variant:snake>](context, pc as usize) {
                         ControlFlow::Continue(()) => u64::from(context.vm.frame().pc),
                         ControlFlow::Break(record) => {

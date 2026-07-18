@@ -1,4 +1,4 @@
-use crate::error::RuntimeLimitError;
+use crate::error::{EngineError, RuntimeLimitError};
 use crate::vm::CallFrame;
 use crate::vm::call_frame::CallFrameLocation;
 use crate::vm::source_info::SourcePath;
@@ -341,6 +341,88 @@ fn loop_runtime_limit() {
             RuntimeLimitError::LoopIteration,
         ),
     ]);
+}
+
+#[test]
+fn instruction_budget_stops_straight_line_execution() {
+    let mut context = Context::builder()
+        .instruction_budget(8)
+        .build()
+        .expect("context creation must succeed");
+
+    let error = context
+        .eval(Source::from_bytes(indoc! {r#"
+            let total = 0;
+            total += 1;
+            total += 2;
+            total += 3;
+            total += 4;
+            total += 5;
+            total += 6;
+            total += 7;
+            total += 8;
+            total;
+        "#}))
+        .expect_err("straight-line bytecode must consume the finite budget");
+
+    assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+    assert_eq!(context.instruction_budget_remaining(), Some(0));
+}
+
+#[test]
+fn instruction_budget_exhaustion_is_uncatchable() {
+    let mut context = Context::builder()
+        .instruction_budget(0)
+        .build()
+        .expect("context creation must succeed");
+
+    let error = context
+        .eval(Source::from_bytes(
+            "try { globalThis.caught = false; } catch { globalThis.caught = true; }",
+        ))
+        .expect_err("engine errors must escape ECMAScript exception handlers");
+
+    assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+}
+
+#[test]
+fn instruction_budget_is_persistent_resettable_and_optional() {
+    let mut context = Context::default();
+    assert_eq!(context.instruction_budget_remaining(), None);
+
+    context.set_instruction_budget(1_000);
+    context
+        .eval(Source::from_bytes("function nested() { return 40 + 2; }"))
+        .expect("the definition must fit in the budget");
+    let after_definition = context
+        .instruction_budget_remaining()
+        .expect("the budget must remain enabled");
+
+    assert_eq!(
+        context
+            .eval(Source::from_bytes("nested()"))
+            .expect("the nested call must fit in the shared budget"),
+        JsValue::new(42)
+    );
+    assert!(
+        context.instruction_budget_remaining().unwrap() < after_definition,
+        "nested execution must consume the existing context-wide budget"
+    );
+
+    context.set_instruction_budget(0);
+    let error = context
+        .eval(Source::from_bytes("nested()"))
+        .expect_err("resetting to zero must stop the next task");
+    assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+
+    context.clear_instruction_budget();
+    assert_eq!(context.instruction_budget_remaining(), None);
+    assert_eq!(
+        context
+            .eval(Source::from_bytes("nested()"))
+            .expect("clearing the budget must restore unlimited execution"),
+        JsValue::new(42)
+    );
 }
 
 #[test]

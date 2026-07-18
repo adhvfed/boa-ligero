@@ -832,15 +832,8 @@ impl Context {
     where
         F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
     {
-        #[cfg(feature = "fuzz")]
-        {
-            use crate::error::EngineError;
-            if self.instructions_remaining == 0 {
-                return ControlFlow::Break(CompletionRecord::Throw(
-                    EngineError::NoInstructionsRemain.into(),
-                ));
-            }
-            self.instructions_remaining -= 1;
+        if let Err(error) = self.consume_instruction_budget() {
+            return ControlFlow::Break(CompletionRecord::Throw(error.into()));
         }
 
         #[cfg(feature = "trace")]
@@ -852,6 +845,18 @@ impl Context {
 
         #[cfg(not(feature = "trace"))]
         self.execute_instruction(f, opcode)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
+    pub(crate) fn consume_instruction_budget(&mut self) -> Result<(), crate::error::EngineError> {
+        if let Some(remaining) = &mut self.instruction_budget_remaining {
+            if *remaining == 0 {
+                return Err(crate::error::EngineError::NoInstructionsRemain);
+            }
+            *remaining -= 1;
+        }
+        Ok(())
     }
 
     fn handle_error(&mut self, mut err: JsError) -> ControlFlow<CompletionRecord> {

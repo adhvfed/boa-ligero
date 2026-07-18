@@ -99,9 +99,11 @@ pub struct Context {
     /// Execute in strict mode,
     strict: bool,
 
-    /// Number of instructions remaining before a forced exit
-    #[cfg(feature = "fuzz")]
-    pub(crate) instructions_remaining: usize,
+    /// Number of instructions remaining before a forced exit.
+    ///
+    /// `None` leaves instruction accounting disabled, preserving the default
+    /// behavior for embedders that do not need an execution budget.
+    pub(crate) instruction_budget_remaining: Option<usize>,
 
     pub(crate) vm: Vm,
 
@@ -448,12 +450,39 @@ impl Context {
         self.vm.frame().realm.intrinsics()
     }
 
-    /// Returns the amount of remaining instructions to be executed
+    /// Returns the remaining instruction budget, or `None` if instruction
+    /// accounting is disabled.
+    #[inline]
+    #[must_use]
+    pub const fn instruction_budget_remaining(&self) -> Option<usize> {
+        self.instruction_budget_remaining
+    }
+
+    /// Replaces the remaining instruction budget.
+    ///
+    /// The budget is shared by nested ECMAScript execution in this context.
+    /// Embedders with long-lived contexts should reset it at the start of each
+    /// independently bounded task.
+    #[inline]
+    pub const fn set_instruction_budget(&mut self, instruction_budget: usize) {
+        self.instruction_budget_remaining = Some(instruction_budget);
+    }
+
+    /// Disables instruction accounting for this context.
+    #[inline]
+    pub const fn clear_instruction_budget(&mut self) {
+        self.instruction_budget_remaining = None;
+    }
+
+    /// Returns the amount of remaining instructions to be executed.
+    ///
+    /// This compatibility accessor is only available with the `fuzz` feature.
+    /// An unlimited context reports `usize::MAX`.
     #[cfg(feature = "fuzz")]
     #[inline]
     #[must_use]
     pub fn instructions_remaining(&self) -> usize {
-        self.instructions_remaining
+        self.instruction_budget_remaining.unwrap_or(usize::MAX)
     }
 
     /// Returns the currently active realm.
@@ -1016,8 +1045,7 @@ pub struct ContextBuilder {
     icu: Option<icu::IntlProvider>,
     #[cfg(feature = "temporal")]
     timezone_provider: Option<Box<dyn TimeZoneProvider>>,
-    #[cfg(feature = "fuzz")]
-    instructions_remaining: usize,
+    instruction_budget: Option<usize>,
 }
 
 impl std::fmt::Debug for ContextBuilder {
@@ -1055,8 +1083,7 @@ impl std::fmt::Debug for ContextBuilder {
             &self.timezone_provider.as_ref().map(|_| "TimeZoneProvider"),
         );
 
-        #[cfg(feature = "fuzz")]
-        out.field("instructions_remaining", &self.instructions_remaining);
+        out.field("instruction_budget", &self.instruction_budget);
 
         out.finish()
     }
@@ -1178,13 +1205,24 @@ impl ContextBuilder {
         self
     }
 
+    /// Specifies the initial instruction budget for the [`Context`].
+    ///
+    /// The default is unlimited. The budget is shared by nested ECMAScript
+    /// execution and is not reset automatically between evaluations.
+    #[must_use]
+    pub const fn instruction_budget(mut self, instruction_budget: usize) -> Self {
+        self.instruction_budget = Some(instruction_budget);
+        self
+    }
+
     /// Specifies the number of instructions remaining to the [`Context`].
     ///
-    /// This function is only available if the `fuzz` feature is enabled.
+    /// This is a compatibility alias for [`Self::instruction_budget`] used by
+    /// Boa's fuzz targets.
     #[cfg(feature = "fuzz")]
     #[must_use]
     pub const fn instructions_remaining(mut self, instructions_remaining: usize) -> Self {
-        self.instructions_remaining = instructions_remaining;
+        self.instruction_budget = Some(instructions_remaining);
         self
     }
 
@@ -1249,8 +1287,7 @@ impl ContextBuilder {
                     }
                 }
             },
-            #[cfg(feature = "fuzz")]
-            instructions_remaining: self.instructions_remaining,
+            instruction_budget_remaining: self.instruction_budget,
             kept_alive: Vec::new(),
             host_hooks,
             clock,
