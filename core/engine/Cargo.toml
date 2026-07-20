@@ -236,7 +236,12 @@ husky-rs.workspace = true
 jemallocator.workspace = true
 
 [lib]
-crate-type = ["cdylib", "lib"]
+# Ligero consumes boa as a plain Rust library. Building a `cdylib` as well made
+# cargo emit un-hashed `libboa_engine.{dylib,rlib}` alongside the hashed rlib,
+# which collide (cargo#6313) and intermittently break `cargo test --workspace`
+# with spurious "can't find crate" / "found possibly newer version of crate
+# boa_engine" errors. Nothing links the dynamic library.
+crate-type = ["lib"]
 name = "boa_engine"
 bench = false
 
