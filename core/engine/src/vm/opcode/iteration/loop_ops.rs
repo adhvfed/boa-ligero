@@ -15,7 +15,11 @@ impl IncrementLoopIteration {
         let frame = context.vm.frame_mut();
         let previous_iteration_count = frame.loop_iteration_count;
 
-        if previous_iteration_count > max {
+        // `loop_iteration_count` is the number of iterations already entered,
+        // so reject the next one once the configured maximum has been reached.
+        // Keep `u64::MAX` as the documented disabled sentinel instead of
+        // turning its final (theoretical) increment into a limit error.
+        if max != u64::MAX && previous_iteration_count >= max {
             return Err(RuntimeLimitError::LoopIteration.into());
         }
 

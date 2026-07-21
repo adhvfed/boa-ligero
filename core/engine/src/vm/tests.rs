@@ -336,6 +336,30 @@ fn loop_runtime_limit() {
         ),
         TestAction::assert_runtime_limit_error(
             indoc! {r#"
+                for (let i = 0; i < 11; ++i) { }
+            "#},
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(0);
+        }),
+        TestAction::assert_eq(
+            indoc! {r#"
+                for (let i = 0; i < 0; ++i) { }
+            "#},
+            JsValue::undefined(),
+        ),
+        TestAction::assert_runtime_limit_error(
+            indoc! {r#"
+                for (let i = 0; i < 1; ++i) { }
+            "#},
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(10);
+        }),
+        TestAction::assert_runtime_limit_error(
+            indoc! {r#"
                 while (1) { }
             "#},
             RuntimeLimitError::LoopIteration,
