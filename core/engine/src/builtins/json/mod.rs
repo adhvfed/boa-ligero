@@ -1145,13 +1145,21 @@ impl Json {
         };
 
         // 5. Let partial be a new empty List.
-        let mut partial = Vec::with_capacity(len as usize);
+        // Array lengths can reach 2^32 - 1 without allocating their elements.
+        // Bound this optimization so the runtime loop limit can reject hostile
+        // sparse arrays before we attempt a proportional allocation.
+        let mut partial = Vec::with_capacity(len.min(1024) as usize);
 
         // 7. Let index be 0.
         let mut index = 0;
 
         // 8. Repeat, while index < len,
         while index < len {
+            if let Err(error) = crate::vm::opcode::IncrementLoopIteration::operation((), context) {
+                let removed = state.stack_set.remove(value);
+                debug_assert!(removed);
+                return Err(error);
+            }
             // a. Let strP be ? SerializeJSONProperty(state, ! ToString(𝔽(index)), value).
             let str_p = Self::serialize_json_property(state, index.into(), value, context);
             let str_p = match str_p {

@@ -1,7 +1,9 @@
 use boa_macros::js_str;
 use indoc::indoc;
 
-use crate::{JsNativeErrorKind, JsValue, TestAction, js_string, run_test_actions};
+use crate::{
+    JsNativeErrorKind, JsValue, TestAction, error::RuntimeLimitError, js_string, run_test_actions,
+};
 
 #[test]
 fn json_sanity() {
@@ -76,6 +78,19 @@ fn json_stringify_arrays() {
         "JSON.stringify(['a', 'b'])",
         js_string!(r#"["a","b"]"#),
     )]);
+}
+
+#[test]
+fn json_stringify_rejects_hostile_sparse_length_before_large_allocation() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(0);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "const array = []; array.length = 0xffff_ffff; JSON.stringify(array)",
+            RuntimeLimitError::LoopIteration,
+        ),
+    ]);
 }
 
 #[test]
