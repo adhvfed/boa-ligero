@@ -368,6 +368,27 @@ fn loop_runtime_limit() {
 }
 
 #[test]
+fn native_loop_iteration_batches_enforce_the_exact_remaining_limit() {
+    let mut context = Context::default();
+    context.runtime_limits_mut().set_loop_iteration_limit(3);
+
+    context
+        .consume_loop_iterations(2)
+        .expect("a batch within the remaining limit must succeed");
+    context
+        .consume_loop_iterations(1)
+        .expect("a batch ending exactly at the limit must succeed");
+
+    let error = context
+        .consume_loop_iterations(1)
+        .expect_err("the first iteration beyond the limit must fail");
+    assert_eq!(
+        error.as_engine(),
+        Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+    );
+}
+
+#[test]
 fn instruction_budget_stops_straight_line_execution() {
     let mut context = Context::builder()
         .instruction_budget(8)

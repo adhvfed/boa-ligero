@@ -1155,7 +1155,7 @@ impl Json {
 
         // 8. Repeat, while index < len,
         while index < len {
-            if let Err(error) = crate::vm::opcode::IncrementLoopIteration::operation((), context) {
+            if let Err(error) = context.consume_loop_iterations(1) {
                 let removed = state.stack_set.remove(value);
                 debug_assert!(removed);
                 return Err(error);

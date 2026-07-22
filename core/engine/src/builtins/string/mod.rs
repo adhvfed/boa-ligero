@@ -735,7 +735,7 @@ impl String {
 
         // Charge every repetition before allocating so hostile counts are
         // rejected without proportional memory work.
-        crate::vm::opcode::IncrementLoopIteration::consume_iterations(n as u64, context)?;
+        context.consume_loop_iterations(n as u64)?;
 
         // Keep the best-effort allocation bounded so a configured loop limit
         // can reject hostile counts before memory is reserved proportionally.
@@ -1583,7 +1583,7 @@ impl String {
         // Padding performs `repetitions` native concatenation steps. Charge
         // them before reserving the output buffer so finite runtime limits can
         // reject hostile target lengths without risking a large allocation.
-        crate::vm::opcode::IncrementLoopIteration::consume_iterations(repetitions, context)?;
+        context.consume_loop_iterations(repetitions)?;
 
         let mut truncated_string_filler = Vec::with_capacity(fill_len as usize);
         let filler_slice = filler.to_vec();

@@ -955,7 +955,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -1010,7 +1010,7 @@ impl Array {
         // 6. Let k be 0.
         // 7. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. If k > 0, set R to the string-concatenation of R and sep.
             if k > 0 {
                 r.push(separator.clone());
@@ -1366,7 +1366,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -1420,7 +1420,7 @@ impl Array {
         // 5. Let k be 0.
         // 6. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let k_present be ? HasProperty(O, Pk).
             // c. If k_present is true, then
@@ -1497,7 +1497,7 @@ impl Array {
         // 10. Repeat, while k < len,
         while k < len {
             // Charge native scans against the same loop limit as ECMAScript loops.
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let kPresent be ? HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ? Get(O, ! ToString(𝔽(k))).
@@ -1573,7 +1573,7 @@ impl Array {
         // 8. Repeat, while k ≥ 0,
         while k >= 0 {
             // Charge native scans against the same loop limit as ECMAScript loops.
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let kPresent be ? HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ? Get(O, ! ToString(𝔽(k))).
@@ -2075,7 +2075,7 @@ impl Array {
         // 10. Repeat, while k < len,
         while k < len {
             // Charge native scans against the same loop limit as ECMAScript loops.
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let elementK be ? Get(O, ! ToString(𝔽(k))).
             let element_k = o.get(k, context)?;
             // b. If SameValueZero(searchElement, elementK) is true, return true.
@@ -2220,7 +2220,7 @@ impl Array {
         // 5. Let k be 0.
         // 6. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. If k > 0, then
             if k > 0 {
                 // i. Set R to the string-concatenation of R and separator.
@@ -2563,7 +2563,7 @@ impl Array {
         let mut to = 0u32;
         // 7. Repeat, while k < len,
         for idx in 0..length {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -2620,7 +2620,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -2664,7 +2664,7 @@ impl Array {
         // 2. Let k be 0.
         // 3. Repeat, while k < len,
         for i in 0..len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. If holes is skip-holes, then
             let read = if skip_holes {
@@ -2877,7 +2877,7 @@ impl Array {
             let mut k_present = false;
             // b. Repeat, while kPresent is false and k < len,
             while !k_present && k < len {
-                crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+                context.consume_loop_iterations(1)?;
                 // i. Let Pk be ! ToString(𝔽(k)).
                 let pk = k;
                 // ii. Set kPresent to ? HasProperty(O, Pk).
@@ -2902,7 +2902,7 @@ impl Array {
 
         // 9. Repeat, while k < len,
         while k < len {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -2973,7 +2973,7 @@ impl Array {
             let mut k_present = false;
             // b. Repeat, while kPresent is false and k ≥ 0,
             while !k_present && k >= 0 {
-                crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+                context.consume_loop_iterations(1)?;
                 // i. Let Pk be ! ToString(𝔽(k)).
                 let pk = k;
                 // ii. Set kPresent to ? HasProperty(O, Pk).
@@ -2998,7 +2998,7 @@ impl Array {
 
         // 9. Repeat, while k ≥ 0,
         while k >= 0 {
-            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -3434,7 +3434,7 @@ pub(crate) fn find_via_predicate(
 
     // 4. For each integer k of indices, do
     for k in indices {
-        crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
+        context.consume_loop_iterations(1)?;
         // a. Let Pk be ! ToString(𝔽(k)).
         let pk = k;
 

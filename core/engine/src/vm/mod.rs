@@ -859,6 +859,27 @@ impl Context {
         Ok(())
     }
 
+    /// Charges `count` native iterations against the current frame's loop limit.
+    ///
+    /// Bytecode loops call this through `IncrementLoopIteration`; built-ins use
+    /// it directly when their implementation performs work proportional to a
+    /// web-controlled length.
+    #[inline]
+    pub(crate) fn consume_loop_iterations(&mut self, count: u64) -> JsResult<()> {
+        let max = self.vm.runtime_limits.loop_iteration_limit();
+        let frame = self.vm.frame_mut();
+        let previous_iteration_count = frame.loop_iteration_count;
+
+        // Keep `u64::MAX` as the documented disabled sentinel. For finite
+        // limits, subtraction avoids overflowing while checking a batch.
+        if max != u64::MAX && count > max.saturating_sub(previous_iteration_count) {
+            return Err(RuntimeLimitError::LoopIteration.into());
+        }
+
+        frame.loop_iteration_count = previous_iteration_count.wrapping_add(count);
+        Ok(())
+    }
+
     fn handle_error(&mut self, mut err: JsError) -> ControlFlow<CompletionRecord> {
         // Capture the backtrace early, before any exception handler check,
         // so that errors caught by internal handlers (e.g. async module
