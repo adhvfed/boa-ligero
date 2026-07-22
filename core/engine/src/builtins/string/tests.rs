@@ -151,6 +151,27 @@ fn repeat_rejects_hostile_count_before_large_allocation() {
 }
 
 #[test]
+fn padding_respects_loop_limit_before_allocating() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("''.padEnd(3, 'x')", js_str!("xxx")),
+        TestAction::assert_runtime_limit_error(
+            "''.padStart(4, 'x')",
+            crate::error::RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(0);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "''.padEnd(0xffff_ffff, 'x')",
+            crate::error::RuntimeLimitError::LoopIteration,
+        ),
+    ]);
+}
+
+#[test]
 fn repeat_throws_when_count_is_negative() {
     run_test_actions([TestAction::assert_native_error(
         "'x'.repeat(-1)",
