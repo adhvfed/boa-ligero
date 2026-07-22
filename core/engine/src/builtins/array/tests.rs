@@ -457,6 +457,51 @@ fn bulk_traversals_reject_hostile_lengths_before_large_allocations() {
 }
 
 #[test]
+fn callback_traversals_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.forEach.call({ length: 4 }, () => {})",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.every.call({ length: 4 }, () => true)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.some.call({ length: 4 }, () => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.map.call({ length: 4 }, value => value)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.filter.call({ length: 4 }, () => true)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.find.call({ length: 4 }, () => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.findLast.call({ length: 4 }, () => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.reduce.call({ length: 4 }, value => value, 0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.reduceRight.call({ length: 4 }, value => value, 0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+    ]);
+}
+
+#[test]
 fn map() {
     run_test_actions([
         TestAction::run_harness(),

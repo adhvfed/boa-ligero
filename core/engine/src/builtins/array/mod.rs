@@ -955,6 +955,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -1365,6 +1366,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -1418,6 +1420,7 @@ impl Array {
         // 5. Let k be 0.
         // 6. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let k_present be ? HasProperty(O, Pk).
             // c. If k_present is true, then
@@ -2560,6 +2563,7 @@ impl Array {
         let mut to = 0u32;
         // 7. Repeat, while k < len,
         for idx in 0..length {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -2616,6 +2620,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kPresent be ? HasProperty(O, Pk).
             // c. If kPresent is true, then
@@ -2872,6 +2877,7 @@ impl Array {
             let mut k_present = false;
             // b. Repeat, while kPresent is false and k < len,
             while !k_present && k < len {
+                crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
                 // i. Let Pk be ! ToString(𝔽(k)).
                 let pk = k;
                 // ii. Set kPresent to ? HasProperty(O, Pk).
@@ -2896,6 +2902,7 @@ impl Array {
 
         // 9. Repeat, while k < len,
         while k < len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -2966,6 +2973,7 @@ impl Array {
             let mut k_present = false;
             // b. Repeat, while kPresent is false and k ≥ 0,
             while !k_present && k >= 0 {
+                crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
                 // i. Let Pk be ! ToString(𝔽(k)).
                 let pk = k;
                 // ii. Set kPresent to ? HasProperty(O, Pk).
@@ -2990,6 +2998,7 @@ impl Array {
 
         // 9. Repeat, while k ≥ 0,
         while k >= 0 {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -3425,6 +3434,7 @@ pub(crate) fn find_via_predicate(
 
     // 4. For each integer k of indices, do
     for k in indices {
+        crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
         // a. Let Pk be ! ToString(𝔽(k)).
         let pk = k;
 
