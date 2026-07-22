@@ -554,6 +554,7 @@ fn collection_and_recursive_traversals_respect_loop_iteration_limit() {
             context.runtime_limits_mut().set_loop_iteration_limit(3);
         }),
         TestAction::assert_eq("Array.from({ length: 3 }).length", 3),
+        TestAction::assert_eq("Array.from([1, 2, 3].values()).length", 3),
         TestAction::assert_runtime_limit_error(
             "Array.from({ length: 4 })",
             RuntimeLimitError::LoopIteration,

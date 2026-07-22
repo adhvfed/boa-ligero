@@ -653,6 +653,19 @@ impl IteratorRecord {
         }
     }
 
+    /// Charges one native iterator step and closes the iterator if the runtime
+    /// loop limit has been exhausted.
+    pub(crate) fn consume_loop_iteration(&self, context: &mut Context) -> JsResult<()> {
+        let Err(error) = context.consume_loop_iterations(1) else {
+            return Ok(());
+        };
+
+        match self.close(Err(error), context) {
+            Err(error) => Err(error),
+            Ok(_) => unreachable!("an abrupt completion must remain abrupt after IteratorClose"),
+        }
+    }
+
     /// `IteratorToList ( iteratorRecord )`
     ///
     /// More information:
@@ -666,6 +679,8 @@ impl IteratorRecord {
         // 2. Repeat,
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(value) = self.step_value(context)? {
+            self.consume_loop_iteration(context)?;
+
             // c. Append next to values.
             values.push(value);
         }

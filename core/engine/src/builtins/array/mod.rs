@@ -624,9 +624,6 @@ impl Array {
         //     ...
         //     ix. Set k to k + 1.
         for k in 0..9_007_199_254_740_991_u64 {
-            let iteration_status = context.consume_loop_iterations(1);
-            if_abrupt_close_iterator!(iteration_status, iterator_record, context);
-
             // iii. Let next be ? IteratorStepValue(iteratorRecord).
             let Some(next) = iterator_record.step_value(context)? else {
                 // iv. If next is done, then
@@ -635,6 +632,8 @@ impl Array {
                 //     2. Return A.
                 return Ok(a.into());
             };
+
+            iterator_record.consume_loop_iteration(context)?;
 
             // v. If mapping is true, then
             let mapped_value = if let Some(ref mapfn) = mapping {

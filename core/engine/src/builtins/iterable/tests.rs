@@ -1,6 +1,6 @@
 //! Tests for the Iterator Helpers proposal implementation (#4444).
 
-use crate::{JsNativeErrorKind, JsValue, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, JsValue, TestAction, error::RuntimeLimitError, run_test_actions};
 use boa_macros::js_str;
 
 // ── Iterator Constructor ──────────────────────────────────────────────────────
@@ -255,6 +255,56 @@ fn iterator_to_array_empty() {
 }
 
 // ── Eager — forEach ───────────────────────────────────────────────────────────
+
+#[test]
+fn eager_iterator_traversals_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("Iterator.from([1, 2, 3]).toArray().length", 3),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).toArray()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).reduce((sum, value) => sum + value, 0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).forEach(() => {})",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).some(() => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).every(() => true)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).find(() => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(
+            "var loopLimitedIteratorClosed = false;\n\
+             var loopLimitedIterator = {\n\
+                 next() { return { value: 1, done: false }; },\n\
+                 return() { loopLimitedIteratorClosed = true; return { done: true }; }\n\
+             };\n\
+             Object.setPrototypeOf(loopLimitedIterator, Iterator.prototype);",
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedIterator.toArray()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().disable_loop_iteration_limit();
+        }),
+        TestAction::assert("loopLimitedIteratorClosed"),
+    ]);
+}
 
 #[test]
 fn iterator_for_each_basic() {

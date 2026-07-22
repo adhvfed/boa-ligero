@@ -495,6 +495,8 @@ impl Iterator {
 
         // 9. Repeat,
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // a. Let value be ? IteratorStepValue(iterated).
             // b. If value is done, return false.
             // c. If skipped < toSkip, then
@@ -551,6 +553,7 @@ impl Iterator {
             // 6. If initialValue is not present, then
             //    a. Let accumulator be ? IteratorStepValue(iterated).
             //    c. Let counter be 1.
+            iterated.consume_loop_iteration(context)?;
             (first, 1u64)
         } else {
             // b. If accumulator is done, throw a TypeError exception.
@@ -563,6 +566,8 @@ impl Iterator {
         //    a. Let value be ? IteratorStepValue(iterated).
         //    b. If value is done, return accumulator.
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // c. Let result be Completion(Call(reducer, undefined, « accumulator, value, 𝔽(counter) »)).
             let result = reducer.call(
                 &JsValue::undefined(),
@@ -644,6 +649,8 @@ impl Iterator {
         //    a. Let value be ? IteratorStepValue(iterated).
         //    b. If value is done, return undefined.
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // c. Let result be Completion(Call(procedure, undefined, « value, 𝔽(counter) »)).
             let result = func.call(
                 &JsValue::undefined(),
@@ -699,6 +706,8 @@ impl Iterator {
         //    a. Let value be ? IteratorStepValue(iterated).
         //    b. If value is done, return false.
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
             let result = predicate.call(
                 &JsValue::undefined(),
@@ -759,6 +768,8 @@ impl Iterator {
         //    a. Let value be ? IteratorStepValue(iterated).
         //    b. If value is done, return true.
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
             let result = predicate.call(
                 &JsValue::undefined(),
@@ -818,6 +829,8 @@ impl Iterator {
         //    a. Let value be ? IteratorStepValue(iterated).
         //    b. If value is done, return undefined.
         while let Some(value) = iterated.step_value(context)? {
+            iterated.consume_loop_iteration(context)?;
+
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
             let result = predicate.call(
                 &JsValue::undefined(),
