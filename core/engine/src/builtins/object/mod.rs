@@ -1388,6 +1388,7 @@ impl OrdinaryObject {
                 // i. Return groups.
                 break;
             };
+            iterator.consume_loop_iteration(context)?;
 
             // d. Let value be next.
             let value = next;

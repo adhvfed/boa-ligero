@@ -110,6 +110,8 @@ impl BuiltInConstructor for WeakSet {
         // 8. Repeat,
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
+            iterator_record.consume_loop_iteration(context)?;
+
             //     c. Let status be Completion(Call(adder, set, « next »)).
             if let Err(status) = adder.call(&weak_set.clone().into(), &[next], context) {
                 //     d. IfAbruptCloseIterator(status, iteratorRecord).

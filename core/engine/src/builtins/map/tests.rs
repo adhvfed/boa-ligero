@@ -1,4 +1,4 @@
-use crate::{JsNativeErrorKind, JsValue, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, JsValue, TestAction, error::RuntimeLimitError, run_test_actions};
 use boa_macros::js_str;
 use indoc::indoc;
 
@@ -7,6 +7,47 @@ fn construct() {
     run_test_actions([
         TestAction::assert_eq("(new Map()).size", 0),
         TestAction::assert_eq("(new Map([['1', 'one'], ['2', 'two']])).size", 2),
+    ]);
+}
+
+#[test]
+fn iterable_consumers_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("new Map([[1, 1], [2, 2], [3, 3]]).size", 3),
+        TestAction::assert_runtime_limit_error(
+            "new Map([[1, 1], [2, 2], [3, 3], [4, 4]])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Map.groupBy([1, 2, 3, 4], value => value)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Object.groupBy([1, 2, 3, 4], value => value)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(indoc! {r#"
+            var loopLimitedMapIteratorClosed = false;
+            var loopLimitedMapIterable = {
+                [Symbol.iterator]() { return this; },
+                next() { return { value: [1, 1], done: false }; },
+                return() {
+                    loopLimitedMapIteratorClosed = true;
+                    return { done: true };
+                }
+            };
+        "#}),
+        TestAction::assert_runtime_limit_error(
+            "new Map(loopLimitedMapIterable)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().disable_loop_iteration_limit();
+        }),
+        TestAction::assert("loopLimitedMapIteratorClosed"),
     ]);
 }
 

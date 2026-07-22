@@ -1,10 +1,24 @@
-use crate::{JsNativeErrorKind, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, TestAction, error::RuntimeLimitError, run_test_actions};
 
 #[test]
 fn weakset_add_and_has() {
     run_test_actions([
         TestAction::run("var ws = new WeakSet(); var obj = {}; ws.add(obj);"),
         TestAction::assert("ws.has(obj)"),
+    ]);
+}
+
+#[test]
+fn constructor_respects_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("new WeakSet([{}, {}, {}]) instanceof WeakSet", true),
+        TestAction::assert_runtime_limit_error(
+            "new WeakSet([{}, {}, {}, {}])",
+            RuntimeLimitError::LoopIteration,
+        ),
     ]);
 }
 

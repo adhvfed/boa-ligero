@@ -759,6 +759,7 @@ impl Map {
                 // i. Return groups.
                 break;
             };
+            iterator.consume_loop_iteration(context)?;
 
             // d. Let value be next.
             let value = next;
@@ -825,6 +826,8 @@ pub(crate) fn add_entries_from_iterable(
     //     a. Let next be ? IteratorStepValue(iteratorRecord).
     //     b. If next is done, return target.
     while let Some(next) = iterator_record.step_value(context)? {
+        iterator_record.consume_loop_iteration(context)?;
+
         let Some(next) = next.as_object() else {
             //     c. If next is not an Object, then
             //         i. Let error be ThrowCompletion(a newly created TypeError object).

@@ -1,4 +1,4 @@
-use crate::{JsNativeErrorKind, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, TestAction, error::RuntimeLimitError, run_test_actions};
 use indoc::indoc;
 
 #[test]
@@ -6,6 +6,28 @@ fn construct() {
     run_test_actions([
         TestAction::assert_eq("(new Set()).size", 0),
         TestAction::assert_eq("(new Set(['one', 'two'])).size", 2),
+    ]);
+}
+
+#[test]
+fn iterable_consumers_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("new Set([1, 2, 3]).size", 3),
+        TestAction::assert_runtime_limit_error(
+            "new Set([1, 2, 3, 4])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "new Set().union({\n\
+                size: 4,\n\
+                has() { return false; },\n\
+                keys() { return [1, 2, 3, 4].values(); }\n\
+            })",
+            RuntimeLimitError::LoopIteration,
+        ),
     ]);
 }
 

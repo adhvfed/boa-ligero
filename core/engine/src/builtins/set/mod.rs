@@ -247,6 +247,8 @@ impl BuiltInConstructor for Set {
         // 8. Repeat,
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
+            iterator_record.consume_loop_iteration(context)?;
+
             // c. Let status be Completion(Call(adder, set, « next »)).
             if let Err(status) = adder.call(&set.clone().into(), &[next], context) {
                 // d. IfAbruptCloseIterator(status, iteratorRecord).
@@ -642,6 +644,8 @@ impl Set {
             //    c. Repeat, while next is not done,
             //       i. Set next to ? IteratorStepValue(keysIter).
             while let Some(next) = keys_iter.step_value(context)? {
+                keys_iter.consume_loop_iteration(context)?;
+
                 //   ii. If next is not done, then
                 //       1. If SetDataHas(O.[[SetData]], next) is true, then
                 let next = canonicalize_keyed_collection_key(next);
@@ -766,6 +770,8 @@ impl Set {
         // 7. Repeat, while next is not done,
         //    a. Set next to ? IteratorStepValue(keysIter).
         while let Some(next) = keys_iter.step_value(context)? {
+            keys_iter.consume_loop_iteration(context)?;
+
             //  b. If next is not done, then
             //     i. If SetDataHas(O.[[SetData]], next) is false, then
             let next = canonicalize_keyed_collection_key(next);
@@ -817,6 +823,8 @@ impl Set {
         // 6. Let next be not-started.
         // 7. Repeat, while next is not done,
         while let Some(next) = keys_iter.step_value(context)? {
+            keys_iter.consume_loop_iteration(context)?;
+
             //  a. Set next to ? IteratorStepValue(keysIter).
             //  b. If next is not done, then
             //    i. Set next to CanonicalizeKeyedCollectionKey(next).
@@ -890,6 +898,7 @@ impl Set {
         //               ii. If SetDataHas(resultSetData, next) is false, then
         //                       1. Append next to resultSetData.
         while let Some(next) = keys_iter.step_value(context)? {
+            keys_iter.consume_loop_iteration(context)?;
             result_set.add(canonicalize_keyed_collection_key(next));
         }
 
@@ -977,6 +986,8 @@ impl Set {
             // b. Let next be not-started.
             // c. Repeat, while next is not done,
             while let Some(next) = keys_iter.step_value(context)? {
+                keys_iter.consume_loop_iteration(context)?;
+
                 // i. Set next to ? IteratorStepValue(keysIter).
                 // ii. If next is not done, then
                 //     1. Set next to CanonicalizeKeyedCollectionKey(next).
@@ -1079,6 +1090,8 @@ impl Set {
             // c. Repeat, while next is not done,
             //     i. Set next to ? IteratorStepValue(keysIter).
             while let Some(next) = keys_iter.step_value(context)? {
+                keys_iter.consume_loop_iteration(context)?;
+
                 // ii. If next is not done, then
                 //     1. Set next to CanonicalizeKeyedCollectionKey(next).
                 let next = canonicalize_keyed_collection_key(next);

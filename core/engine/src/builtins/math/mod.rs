@@ -1010,6 +1010,8 @@ impl Math {
         // 7. Repeat, while next is not done,
         // a. Set next to ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
+            iterator_record.consume_loop_iteration(context)?;
+
             // b. If next is not done, then
             // i. If count ≥ 2**53 - 1, then
             if count >= ITERATION_MAX {
