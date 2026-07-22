@@ -734,7 +734,9 @@ impl String {
         let n = n as usize;
 
         // Charge each repetition against the VM loop-iteration limit.
-        let mut result = Vec::with_capacity(n);
+        // Keep the best-effort allocation bounded so a configured loop limit
+        // can reject hostile counts before memory is reserved proportionally.
+        let mut result = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             result.push(string.as_str());

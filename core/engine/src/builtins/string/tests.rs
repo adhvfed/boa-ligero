@@ -138,6 +138,19 @@ fn repeat_large_count_hits_limit() {
 }
 
 #[test]
+fn repeat_rejects_hostile_count_before_large_allocation() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(0);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "'x'.repeat(0xffff_ffff)",
+            crate::error::RuntimeLimitError::LoopIteration,
+        ),
+    ]);
+}
+
+#[test]
 fn repeat_throws_when_count_is_negative() {
     run_test_actions([TestAction::assert_native_error(
         "'x'.repeat(-1)",
