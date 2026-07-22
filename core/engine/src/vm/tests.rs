@@ -373,6 +373,9 @@ fn native_loop_iteration_batches_enforce_the_exact_remaining_limit() {
     context.runtime_limits_mut().set_loop_iteration_limit(3);
 
     context
+        .check_loop_iterations(3)
+        .expect("checking an exact batch must not consume it");
+    context
         .consume_loop_iterations(2)
         .expect("a batch within the remaining limit must succeed");
     context

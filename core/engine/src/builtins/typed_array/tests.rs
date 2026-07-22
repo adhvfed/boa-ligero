@@ -1,4 +1,4 @@
-use crate::{JsNativeErrorKind, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, TestAction, error::RuntimeLimitError, run_test_actions};
 
 #[test]
 fn uint8array_constructor_length() {
@@ -180,5 +180,92 @@ fn typedarray_exotic_prevent_extensions() {
         TestAction::run("Object.preventExtensions(fixedLengthWithOffset1);"),
         TestAction::assert("!Object.isExtensible(fixedLength1)"),
         TestAction::assert("!Object.isExtensible(fixedLengthWithOffset1)"),
+    ]);
+}
+
+#[test]
+fn typed_array_traversals_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::run(
+            "var loopLimitedTyped3 = new Uint8Array([1, 2, 3]);\n\
+             var loopLimitedTyped4 = new Uint8Array([1, 2, 3, 4]);\n\
+             var loopLimitedTyped6 = new Uint8Array([1, 2, 3, 4, 5, 6]);\n\
+             var loopLimitedTarget4 = new Uint8Array(4);",
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert("loopLimitedTyped3.every(() => true)"),
+        TestAction::assert("loopLimitedTyped3.includes(99) === false"),
+        TestAction::assert_eq("loopLimitedTyped6.reverse().length", 6),
+        TestAction::assert_eq("Uint8Array.from({ length: 3 }).length", 3),
+        TestAction::assert_runtime_limit_error(
+            "new Uint8Array({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "new Uint16Array(loopLimitedTyped4)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Uint8Array.from({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.fill(0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.filter(() => true)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.forEach(() => {})",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.includes(99)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.join(',')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.map(value => value)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTarget4.set(loopLimitedTyped4)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.slice()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.some(() => false)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.sort()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.toReversed()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.toSorted()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.toLocaleString()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedTyped4.with(0, 9)",
+            RuntimeLimitError::LoopIteration,
+        ),
     ]);
 }

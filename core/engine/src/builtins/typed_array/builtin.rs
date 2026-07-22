@@ -230,6 +230,7 @@ impl BuiltinTypedArray {
             let values = source
                 .get_iterator_from_method(&using_iterator, context)?
                 .into_list(context)?;
+            context.check_loop_iterations(values.len() as u64)?;
 
             // b. Let len be the number of elements in values.
             // c. Let targetObj be ? TypedArrayCreate(C, « 𝔽(len) »).
@@ -238,6 +239,8 @@ impl BuiltinTypedArray {
             // d. Let k be 0.
             // e. Repeat, while k < len,
             for (k, k_value) in values.iter().enumerate() {
+                context.consume_loop_iterations(1)?;
+
                 // i. Let Pk be ! ToString(𝔽(k)).
                 // ii. Let kValue be the first element of values and remove that element from values.
                 // iii. If mapping is true, then
@@ -267,6 +270,7 @@ impl BuiltinTypedArray {
 
         // 9. Let len be ? LengthOfArrayLike(arrayLike).
         let len = array_like.length_of_array_like(context)?;
+        context.check_loop_iterations(len)?;
 
         // 10. Let targetObj be ? TypedArrayCreate(C, « 𝔽(len) »).
         let target_obj = Self::create(&constructor, &[len.into()], context)?.upcast();
@@ -274,6 +278,8 @@ impl BuiltinTypedArray {
         // 11. Let k be 0.
         // 12. Repeat, while k < len,
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ? Get(arrayLike, Pk).
             let k_value = array_like.get(k, context)?;
@@ -676,6 +682,8 @@ impl BuiltinTypedArray {
         // 6. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context)?;
@@ -767,6 +775,8 @@ impl BuiltinTypedArray {
 
         let ta = ta.upcast();
         for k in start_index..end_index {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Perform ! Set(O, Pk, value, true).
             ta.set(k, value.clone(), true, context)
@@ -819,6 +829,8 @@ impl BuiltinTypedArray {
         // 8. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -1035,6 +1047,8 @@ impl BuiltinTypedArray {
         // 6. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -1100,6 +1114,8 @@ impl BuiltinTypedArray {
         // 11. Repeat, while k < len,
         let ta = ta.upcast();
         for k in k..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let elementK be ! Get(O, ! ToString(𝔽(k))).
             let element_k = ta.get(k, context).js_expect("Get cannot fail here")?;
 
@@ -1164,6 +1180,8 @@ impl BuiltinTypedArray {
         // 11. Repeat, while k < len,
         let ta = ta.upcast();
         for k in k..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let kPresent be ! HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ! Get(O, ! ToString(𝔽(k))).
@@ -1210,12 +1228,15 @@ impl BuiltinTypedArray {
         };
 
         // 6. Let R be the empty String.
+        context.check_loop_iterations(len)?;
         let mut r = Vec::with_capacity(len as usize);
 
         // 7. Let k be 0.
         // 8. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. If k > 0, set R to the string-concatenation of R and sep.
             if k > 0 {
                 r.extend(sep.iter());
@@ -1299,6 +1320,8 @@ impl BuiltinTypedArray {
         // 9. Repeat, while k ≥ 0,
         let ta = ta.upcast();
         for k in (0..k).rev() {
+            context.consume_loop_iterations(1)?;
+
             // a. Let kPresent be ! HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ! Get(O, ! ToString(𝔽(k))).
@@ -1385,11 +1408,14 @@ impl BuiltinTypedArray {
         let ta = ta.upcast();
 
         // 5. Let A be ? TypedArraySpeciesCreate(O, « 𝔽(len) »).
+        context.check_loop_iterations(len)?;
         let a = Self::species_create(&ta, typed_array_kind, &[len.into()], context)?.upcast();
 
         // 6. Let k be 0.
         // 7. Repeat, while k < len,
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -1466,6 +1492,8 @@ impl BuiltinTypedArray {
 
         // 10. Repeat, while k < len,
         for k in k..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -1539,6 +1567,8 @@ impl BuiltinTypedArray {
 
         // 10. Repeat, while k ≥ 0,
         for k in (0..k).rev() {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -1585,6 +1615,8 @@ impl BuiltinTypedArray {
         let mut lower = 0;
         // 6. Repeat, while lower ≠ middle,
         while lower != middle {
+            context.consume_loop_iterations(1)?;
+
             // a. Let upper be len - lower - 1.
             let upper = len - lower - 1;
 
@@ -1627,12 +1659,15 @@ impl BuiltinTypedArray {
         let kind = ta.borrow().data().kind();
 
         // 4. Let A be ? TypedArrayCreateSameType(O, « 𝔽(length) »).
+        context.check_loop_iterations(len)?;
         let new_array = Self::from_kind_and_length(kind, len, context)?;
 
         // 5. Let k be 0.
         // 6. Repeat, while k < length,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let from be ! ToString(𝔽(length - k - 1)).
             // b. Let Pk be ! ToString(𝔽(k)).
             // c. Let fromValue be ! Get(O, from).
@@ -1806,6 +1841,8 @@ impl BuiltinTypedArray {
                 )
                 .into());
         }
+
+        context.consume_loop_iterations(src_length)?;
 
         // 18. If IsSharedArrayBuffer(srcBuffer) is true, IsSharedArrayBuffer(targetBuffer) is true,
         //     and srcBuffer.[[ArrayBufferData]] is targetBuffer.[[ArrayBufferData]], let
@@ -1985,6 +2022,8 @@ impl BuiltinTypedArray {
         // 9. Repeat, while k < srcLength,
         let target = target.clone().upcast();
         for k in 0..src_length {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let value be ? Get(src, Pk).
             let value = src.get(k, context)?;
@@ -2041,6 +2080,7 @@ impl BuiltinTypedArray {
 
         // 12. Let countBytes be max(endIndex - startIndex, 0).
         let count = end_index.saturating_sub(start_index);
+        context.consume_loop_iterations(count)?;
 
         // 13. Let A be ? TypedArraySpeciesCreate(O, « 𝔽(countBytes) »).
         let target =
@@ -2232,6 +2272,8 @@ impl BuiltinTypedArray {
         // 6. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ! Get(O, Pk).
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
@@ -2336,6 +2378,7 @@ impl BuiltinTypedArray {
         let len = ta.borrow().data().array_length(buf_len);
 
         // 5. Let A be ? TypedArrayCreateSameType(O, « 𝔽(len) »).
+        context.check_loop_iterations(len)?;
         let new_array = Self::from_kind_and_length(ta.borrow().data().kind(), len, context)?;
 
         // 6. NOTE: The following closure performs a numeric comparison rather than the string comparison used in 23.1.3.34.
@@ -2535,9 +2578,12 @@ impl BuiltinTypedArray {
             }
         };
 
+        context.check_loop_iterations(len)?;
         let mut r = Vec::with_capacity((len + len.saturating_sub(1)) as usize);
 
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             if k > 0 {
                 r.extend(separator.iter());
             }
@@ -2636,12 +2682,15 @@ impl BuiltinTypedArray {
         })?;
 
         // 10. Let A be ? TypedArrayCreateSameType(O, « 𝔽(len) »).
+        context.check_loop_iterations(len)?;
         let new_array = Self::from_kind_and_length(kind, len, context)?;
 
         // 11. Let k be 0.
         // 12. Repeat, while k < len,
         let ta = ta.upcast();
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             let value = if k == actual_index {
                 // b. If k is actualIndex, let fromValue be numericValue.
@@ -2813,6 +2862,7 @@ impl BuiltinTypedArray {
     ) -> JsResult<JsObject> {
         // 1. Let len be the number of elements in values.
         let len = values.len() as u64;
+        context.check_loop_iterations(len)?;
         // 2. Perform ? AllocateTypedArrayBuffer(O, len).
         let buf = Self::allocate_buffer::<T>(len, context)?;
         let obj = JsObject::from_proto_and_data_with_shared_shape(context.root_shape(), proto, buf)
@@ -2821,6 +2871,8 @@ impl BuiltinTypedArray {
         // 3. Let k be 0.
         // 4. Repeat, while k < len,
         for (k, k_value) in values.into_iter().enumerate() {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be the first element of values and remove that element from values.
             // c. Perform ? Set(O, Pk, kValue, true).
@@ -2916,6 +2968,7 @@ impl BuiltinTypedArray {
 
         // 9. Let elementLength be TypedArrayLength(srcRecord).
         let element_length = src_array.array_length(src_data.len());
+        context.consume_loop_iterations(element_length)?;
         // 10. Let byteLength be elementSize × elementLength.
         let byte_length = element_size * element_length;
 
@@ -3148,6 +3201,7 @@ impl BuiltinTypedArray {
     ) -> JsResult<JsObject> {
         // 1. Let len be ? LengthOfArrayLike(arrayLike).
         let len = array_like.length_of_array_like(context)?;
+        context.check_loop_iterations(len)?;
 
         // 2. Perform ? AllocateTypedArrayBuffer(O, len).
         let buf = Self::allocate_buffer::<T>(len, context)?;
@@ -3157,6 +3211,8 @@ impl BuiltinTypedArray {
         // 3. Let k be 0.
         // 4. Repeat, while k < len,
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. Let kValue be ? Get(arrayLike, Pk).
             let k_value = array_like.get(k, context)?;
