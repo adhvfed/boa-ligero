@@ -150,6 +150,8 @@ pub(crate) fn canonicalize_locale_list(
     // 6 Let k be 0.
     // 7. Repeat, while k < len,
     for k in 0..len {
+        context.consume_loop_iterations(1)?;
+
         // a. Let Pk be ToString(k).
         // b. Let kPresent be ? HasProperty(O, Pk).
         // c. If kPresent is true, then

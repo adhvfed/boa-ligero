@@ -1416,6 +1416,7 @@ impl JsValue {
 
         // 3. Let len be ? LengthOfArrayLike(obj).
         let len = obj.length_of_array_like(context)?;
+        context.check_loop_iterations(len)?;
 
         // 4. Let list be a new empty List.
         let mut list = Vec::with_capacity(len as usize);
@@ -1423,6 +1424,8 @@ impl JsValue {
         // 5. Let index be 0.
         // 6. Repeat, while index < len,
         for index in 0..len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let indexName be ! ToString(𝔽(index)).
             // b. Let next be ? Get(obj, indexName).
             let next = obj.get(index, context)?;

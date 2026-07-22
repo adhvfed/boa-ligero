@@ -228,6 +228,7 @@ enum Inner {
     InspectContext {
         op: fn(&mut Context),
     },
+    #[cfg_attr(all(feature = "intl", not(feature = "intl_bundled")), allow(dead_code))]
     InspectContextAsync {
         op: Box<dyn for<'a> FnOnce(&'a mut Context) -> PinBoxFuture<'a>>,
     },
@@ -282,6 +283,7 @@ impl TestAction {
     }
 
     /// Executes `op` with the currently active context in an async environment.
+    #[cfg_attr(all(feature = "intl", not(feature = "intl_bundled")), allow(dead_code))]
     pub(crate) fn inspect_context_async(op: impl AsyncFnOnce(&mut Context) + 'static) -> Self {
         Self(Inner::InspectContextAsync {
             op: Box::new(move |ctx| Box::pin(op(ctx))),

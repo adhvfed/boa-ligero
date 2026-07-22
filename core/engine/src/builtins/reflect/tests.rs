@@ -1,4 +1,4 @@
-use crate::{JsValue, TestAction, run_test_actions};
+use crate::{JsValue, TestAction, error::RuntimeLimitError, run_test_actions};
 use boa_macros::js_str;
 use indoc::indoc;
 
@@ -23,6 +23,33 @@ fn construct() {
                 Reflect.construct(f, [42]);
             "#}),
         TestAction::assert_eq("called.result", 42),
+    ]);
+}
+
+#[test]
+fn array_like_argument_lists_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq(
+            "Reflect.apply((a, b, c) => a + b + c, undefined, {\n\
+                0: 1, 1: 2, 2: 3, length: 3\n\
+            })",
+            6,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Reflect.apply(() => {}, undefined, { length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Reflect.construct(function () {}, { length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Function.prototype.apply.call(() => {}, undefined, { length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
     ]);
 }
 

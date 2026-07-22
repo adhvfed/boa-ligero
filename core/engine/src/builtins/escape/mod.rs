@@ -46,7 +46,7 @@ fn escape(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsVa
         };
 
         // 4. Let unescapedSet be the string-concatenation of the ASCII word characters and "@*+-./".
-        cp.is_ascii_alphanumeric() || [b'_', b'@', b'*', b'+', b'-', b'.', b'/'].contains(&cp)
+        cp.is_ascii_alphanumeric() || b"_@*+-./".contains(&cp)
     }
 
     // 1. Set string to ? ToString(string).
@@ -60,6 +60,8 @@ fn escape(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsVa
     // 6. Repeat, while k < len,
     //     a. Let C be the code unit at index k within string.
     for cp in &string {
+        context.consume_loop_iterations(1)?;
+
         // b. If unescapedSet contains C, then
         if is_unescaped(cp) {
             // i. Let S be C.
@@ -131,6 +133,8 @@ fn unescape(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Js
     // 5. Repeat, while k < len,
     // a. Let C be the code unit at index k within string.
     while let Some(cp) = codepoints.next() {
+        context.consume_loop_iterations(1)?;
+
         // b. If C is the code unit 0x0025 (PERCENT SIGN), then
         if cp != u16::from(b'%') {
             vec.push(cp);
@@ -247,5 +251,30 @@ where
             return Some(item);
         }
         self.iterator.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{TestAction, error::RuntimeLimitError, run_test_actions};
+    use boa_macros::js_str;
+
+    #[test]
+    fn legacy_escape_traversals_respect_loop_iteration_limit() {
+        run_test_actions([
+            TestAction::inspect_context(|context| {
+                context.runtime_limits_mut().set_loop_iteration_limit(3);
+            }),
+            TestAction::assert_eq("escape('abc')", js_str!("abc")),
+            TestAction::assert_eq("unescape('abc')", js_str!("abc")),
+            TestAction::assert_runtime_limit_error(
+                "escape('abcd')",
+                RuntimeLimitError::LoopIteration,
+            ),
+            TestAction::assert_runtime_limit_error(
+                "unescape('abcd')",
+                RuntimeLimitError::LoopIteration,
+            ),
+        ]);
     }
 }
