@@ -578,6 +578,8 @@ impl Array {
             //     ...
             //     f. Set k to k + 1.
             for k in 0..len {
+                context.consume_loop_iterations(1)?;
+
                 // a. Let Pk be ! ToString(𝔽(k)).
                 // b. Let kValue be ? Get(arrayLike, Pk).
                 let k_value = array_like.get(k, context)?;
@@ -622,6 +624,9 @@ impl Array {
         //     ...
         //     ix. Set k to k + 1.
         for k in 0..9_007_199_254_740_991_u64 {
+            let iteration_status = context.consume_loop_iterations(1);
+            if_abrupt_close_iterator!(iteration_status, iterator_record, context);
+
             // iii. Let next be ? IteratorStepValue(iteratorRecord).
             let Some(next) = iterator_record.step_value(context)? else {
                 // iv. If next is done, then
@@ -809,6 +814,8 @@ impl Array {
                 }
                 // iv. Repeat, while k < len,
                 for k in 0..len {
+                    context.consume_loop_iterations(1)?;
+
                     // 1. Let P be ! ToString(𝔽(k)).
                     // 2. Let exists be ? HasProperty(E, P).
                     // 3. If exists is true, then
@@ -1891,6 +1898,8 @@ impl Array {
 
         // 6. Repeat, while R(sourceIndex) < sourceLen
         while source_index < source_len {
+            context.consume_loop_iterations(1)?;
+
             // a. Let P be ToString(sourceIndex)
             let p = source_index;
 
@@ -2348,6 +2357,8 @@ impl Array {
         // 13. Let k be 0.
         // 14. Repeat, while k < actualDeleteCount,
         for k in 0..actual_delete_count {
+            context.consume_loop_iterations(1)?;
+
             // a. Let from be ! ToString(𝔽(actualStart + k)).
             // b. If ? HasProperty(O, from) is true, then
             // b.i. Let fromValue be ? Get(O, from).
@@ -2370,6 +2381,8 @@ impl Array {
                 // a. Set k to actualStart.
                 // b. Repeat, while k < (len - actualDeleteCount),
                 for k in actual_start..(len - actual_delete_count) {
+                    context.consume_loop_iterations(1)?;
+
                     // i. Let from be ! ToString(𝔽(k + actualDeleteCount)).
                     let from = k + actual_delete_count;
 
@@ -2392,6 +2405,8 @@ impl Array {
                 // c. Set k to len.
                 // d. Repeat, while k > (len - actualDeleteCount + itemCount),
                 for k in ((len - actual_delete_count + item_count)..len).rev() {
+                    context.consume_loop_iterations(1)?;
+
                     // i. Perform ? DeletePropertyOrThrow(O, ! ToString(𝔽(k - 1))).
                     o.delete_property_or_throw(k, context)?;
 
@@ -2403,6 +2418,8 @@ impl Array {
                 // a. Set k to (len - actualDeleteCount).
                 // b. Repeat, while k > actualStart,
                 for k in (actual_start..len - actual_delete_count).rev() {
+                    context.consume_loop_iterations(1)?;
+
                     // i. Let from be ! ToString(𝔽(k + actualDeleteCount - 1)).
                     let from = k + actual_delete_count;
 
@@ -2486,6 +2503,8 @@ impl Array {
         let mut i = 0;
         // 16. Repeat, while i < actualStart,
         while i < actual_start {
+            context.consume_loop_iterations(1)?;
+
             //     a. Let Pi be ! ToString(𝔽(i)).
             //     b. Let iValue be ? Get(O, Pi).
             let value = o.get(i, context)?;
@@ -2514,6 +2533,8 @@ impl Array {
 
         // 18. Repeat, while i < newLen,
         while i < new_len {
+            context.consume_loop_iterations(1)?;
+
             //     a. Let Pi be ! ToString(𝔽(i)).
             //     b. Let from be ! ToString(𝔽(r)).
             //     c. Let fromValue be ? Get(O, from).

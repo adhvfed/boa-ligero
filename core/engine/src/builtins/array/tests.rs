@@ -548,6 +548,62 @@ fn mutation_and_copy_traversals_respect_loop_iteration_limit() {
 }
 
 #[test]
+fn collection_and_recursive_traversals_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("Array.from({ length: 3 }).length", 3),
+        TestAction::assert_runtime_limit_error(
+            "Array.from({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.concat.call({ [Symbol.isConcatSpreadable]: true, length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.flat.call({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.flatMap.call({ length: 4 }, value => [value])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.splice.call({ length: 4 }, 0, 4)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.toSpliced.call({ length: 4 }, 0, 0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(indoc! {r#"
+            var arrayFromIteratorClosed = false;
+            var endlessArrayFromIterable = {
+                [Symbol.iterator]() {
+                    return {
+                        next() { return { value: 1, done: false }; },
+                        return() {
+                            arrayFromIteratorClosed = true;
+                            return {};
+                        }
+                    };
+                }
+            };
+        "#}),
+        TestAction::assert_runtime_limit_error(
+            "Array.from(endlessArrayFromIterable)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().disable_loop_iteration_limit();
+        }),
+        TestAction::assert("arrayFromIteratorClosed"),
+    ]);
+}
+
+#[test]
 fn map() {
     run_test_actions([
         TestAction::run_harness(),
