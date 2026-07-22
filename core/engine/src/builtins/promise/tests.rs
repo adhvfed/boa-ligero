@@ -1,4 +1,4 @@
-use crate::{TestAction, run_test_actions};
+use crate::{TestAction, error::RuntimeLimitError, run_test_actions};
 use indoc::indoc;
 
 #[test]
@@ -96,5 +96,50 @@ fn promise_race_resolves_first() {
         "#}),
         TestAction::inspect_context(|ctx| ctx.run_jobs().unwrap()),
         TestAction::assert_eq("val", 10),
+    ]);
+}
+
+#[test]
+fn combinators_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert("Promise.all([1, 2, 3]) instanceof Promise"),
+        TestAction::assert_runtime_limit_error(
+            "Promise.all([1, 2, 3, 4])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Promise.allSettled([1, 2, 3, 4])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Promise.any([1, 2, 3, 4])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Promise.race([1, 2, 3, 4])",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(indoc! {r#"
+            var loopLimitedPromiseIteratorClosed = false;
+            var loopLimitedPromiseIterable = {
+                [Symbol.iterator]() { return this; },
+                next() { return { value: 1, done: false }; },
+                return() {
+                    loopLimitedPromiseIteratorClosed = true;
+                    return { done: true };
+                }
+            };
+        "#}),
+        TestAction::assert_runtime_limit_error(
+            "Promise.all(loopLimitedPromiseIterable)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().disable_loop_iteration_limit();
+        }),
+        TestAction::assert("loopLimitedPromiseIteratorClosed"),
     ]);
 }

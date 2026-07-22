@@ -663,6 +663,8 @@ impl Promise {
 
         // 4. Repeat,
         while let Some(next) = iterator_record.step_value(context)? {
+            context.consume_loop_iterations(1)?;
+
             // c. Append undefined to values.
             values.borrow_mut().push(JsValue::undefined());
 
@@ -878,6 +880,8 @@ impl Promise {
 
         // 4. Repeat,
         while let Some(next) = iterator_record.step_value(context)? {
+            context.consume_loop_iterations(1)?;
+
             // c. Append undefined to values.
             values.borrow_mut().push(JsValue::undefined());
 
@@ -1556,6 +1560,8 @@ impl Promise {
         // 4. Repeat,
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
+            context.consume_loop_iterations(1)?;
+
             // c. Append undefined to errors.
             errors.borrow_mut().push(JsValue::undefined());
 
@@ -1773,6 +1779,8 @@ impl Promise {
         // 1. Repeat,
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
+            context.consume_loop_iterations(1)?;
+
             // c. Let nextPromise be ? Call(promiseResolve, constructor, « next »).
             let next_promise = promise_resolve.call(&constructor, &[next], context)?;
             // d. Perform ? Invoke(nextPromise, "then", « resultCapability.[[Resolve]], resultCapability.[[Reject]] »).
