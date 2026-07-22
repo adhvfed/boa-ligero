@@ -436,6 +436,27 @@ fn search_methods_respect_loop_iteration_limit() {
 }
 
 #[test]
+fn bulk_traversals_reject_hostile_lengths_before_large_allocations() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(0);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.join.call({ length: Number.MAX_SAFE_INTEGER })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.toLocaleString.call({ length: Number.MAX_SAFE_INTEGER })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.sort.call({ length: Number.MAX_SAFE_INTEGER })",
+            RuntimeLimitError::LoopIteration,
+        ),
+    ]);
+}
+
+#[test]
 fn map() {
     run_test_actions([
         TestAction::run_harness(),

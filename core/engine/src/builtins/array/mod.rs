@@ -1002,10 +1002,14 @@ impl Array {
         };
 
         // 5. Let R be the empty String.
-        let mut r = Vec::with_capacity(len as usize + len.saturating_sub(1) as usize);
+        // `len` comes from an arbitrary array-like object and can be as large as
+        // 2^53 - 1. Keep this best-effort allocation bounded so the runtime loop
+        // limit can reject hostile lengths before we request enormous memory.
+        let mut r = Vec::with_capacity(len.min(1024) as usize);
         // 6. Let k be 0.
         // 7. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. If k > 0, set R to the string-concatenation of R and sep.
             if k > 0 {
                 r.push(separator.clone());
@@ -2207,11 +2211,13 @@ impl Array {
         };
 
         // 4. Let R be the empty String.
-        let mut r = Vec::with_capacity(len as usize + len.saturating_sub(1) as usize);
+        // Avoid preallocating directly from an attacker-controlled array-like length.
+        let mut r = Vec::with_capacity(len.min(1024) as usize);
 
         // 5. Let k be 0.
         // 6. Repeat, while k < len,
         for k in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. If k > 0, then
             if k > 0 {
                 // i. Set R to the string-concatenation of R and separator.
@@ -2645,12 +2651,15 @@ impl Array {
         F: Fn(&JsValue, &JsValue, &mut Context) -> JsResult<Ordering>,
     {
         // 1. Let items be a new empty List.
-        // doesn't matter if it clamps since it's just a best-effort optimization
-        let mut items = Vec::with_capacity(len as usize);
+        // `len` can come from an arbitrary array-like object. Bound the
+        // best-effort allocation so the loop limit gets a chance to reject
+        // hostile lengths before an enormous allocation is attempted.
+        let mut items = Vec::with_capacity(len.min(1024) as usize);
 
         // 2. Let k be 0.
         // 3. Repeat, while k < len,
         for i in 0..len {
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             // b. If holes is skip-holes, then
             let read = if skip_holes {
