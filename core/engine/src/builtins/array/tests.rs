@@ -1,6 +1,7 @@
 use super::Array;
 use crate::{
-    Context, JsNativeErrorKind, JsValue, TestAction, builtins::Number, js_string, run_test_actions,
+    Context, JsNativeErrorKind, JsValue, TestAction, builtins::Number, error::RuntimeLimitError,
+    js_string, run_test_actions,
 };
 use boa_macros::js_str;
 use indoc::indoc;
@@ -401,6 +402,36 @@ fn includes_value() {
         TestAction::assert("duplicates.includes('a')"),
         // Missing from duplicates
         TestAction::assert("!duplicates.includes('d')"),
+    ]);
+}
+
+#[test]
+fn search_methods_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq("Array.prototype.indexOf.call({ length: 3 }, 'missing')", -1),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.indexOf.call({ length: 4 }, 'missing')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_eq(
+            "Array.prototype.lastIndexOf.call({ length: 3 }, 'missing')",
+            -1,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.lastIndexOf.call({ length: 4 }, 'missing')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_eq(
+            "Array.prototype.includes.call({ length: 3 }, 'missing')",
+            false,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.includes.call({ length: 4 }, 'missing')",
+            RuntimeLimitError::LoopIteration,
+        ),
     ]);
 }
 

@@ -1489,6 +1489,8 @@ impl Array {
 
         // 10. Repeat, while k < len,
         while k < len {
+            // Charge native scans against the same loop limit as ECMAScript loops.
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let kPresent be ? HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ? Get(O, ! ToString(𝔽(k))).
@@ -1563,6 +1565,8 @@ impl Array {
 
         // 8. Repeat, while k ≥ 0,
         while k >= 0 {
+            // Charge native scans against the same loop limit as ECMAScript loops.
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let kPresent be ? HasProperty(O, ! ToString(𝔽(k))).
             // b. If kPresent is true, then
             // b.i. Let elementK be ? Get(O, ! ToString(𝔽(k))).
@@ -2063,6 +2067,8 @@ impl Array {
 
         // 10. Repeat, while k < len,
         while k < len {
+            // Charge native scans against the same loop limit as ECMAScript loops.
+            crate::vm::opcode::IncrementLoopIteration::operation((), context)?;
             // a. Let elementK be ? Get(O, ! ToString(𝔽(k))).
             let element_k = o.get(k, context)?;
             // b. If SameValueZero(searchElement, elementK) is true, return true.
