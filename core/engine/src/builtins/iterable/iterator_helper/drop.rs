@@ -61,7 +61,9 @@ impl Drop {
                         } => {
                             // ii. Let next be ? IteratorStep(iterated).
                             // iii. If next is done, return ReturnCompletion(undefined).
-                            while !iterated.step(context).branch()? {}
+                            while !iterated.step(context).branch()? {
+                                iterated.consume_loop_iteration(context).branch()?;
+                            }
                             return CoroutineState::Break(Ok(()));
                         }
                         Self::Dropping {
@@ -79,6 +81,7 @@ impl Drop {
                                 if iterated.step(context).branch()? {
                                     return CoroutineState::Break(Ok(()));
                                 }
+                                iterated.consume_loop_iteration(context).branch()?;
                             }
 
                             state.set(Self::Yielding { iterated });
@@ -87,6 +90,7 @@ impl Drop {
                             // i. Let value be ? IteratorStepValue(iterated).
                             return match iterated.step_value(context).branch()? {
                                 Some(value) => {
+                                    iterated.consume_loop_iteration(context).branch()?;
                                     state.set(Self::Yielding { iterated });
                                     // iii. Let completion be Completion(Yield(value)).
                                     CoroutineState::Continue(value)

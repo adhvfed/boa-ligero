@@ -102,6 +102,7 @@ impl Concat {
                         } => match current.step_value(context).branch()? {
                             // 3. Else,
                             Some(value) => {
+                                current.consume_loop_iteration(context).branch()?;
                                 state.set(Self::Yielding { iterables, current });
                                 // a. Let completion be Completion(Yield(innerValue)).
                                 return CoroutineState::Continue(value);

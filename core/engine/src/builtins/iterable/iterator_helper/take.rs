@@ -73,6 +73,7 @@ impl Take {
                 // iii. Let value be ? IteratorStepValue(iterated).
                 match iterated.step_value(context).branch()? {
                     Some(value) => {
+                        iterated.consume_loop_iteration(context).branch()?;
                         state.set(Self::Yielding {
                             remaining,
                             iterated,

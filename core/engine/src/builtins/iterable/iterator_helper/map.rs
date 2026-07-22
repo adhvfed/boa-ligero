@@ -54,6 +54,7 @@ impl Map {
                         let Some(value) = iterated.step_value(context).branch()? else {
                             return CoroutineState::Break(Ok(()));
                         };
+                        iterated.consume_loop_iteration(context).branch()?;
 
                         // iii. Let mapped be Completion(Call(mapper, undefined, « value, 𝔽(counter) »)).
                         // iv. IfAbruptCloseIterator(mapped, iterated).

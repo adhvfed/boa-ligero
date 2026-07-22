@@ -307,6 +307,43 @@ fn eager_iterator_traversals_respect_loop_iteration_limit() {
 }
 
 #[test]
+fn lazy_iterator_helpers_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).filter(() => false).next()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).drop(4).next()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Iterator.from([1, 2, 3, 4]).flatMap(() => []).next()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(
+            "var loopLimitedFilterClosed = false;\n\
+             var loopLimitedFilterSource = {\n\
+                 next() { return { value: 1, done: false }; },\n\
+                 return() { loopLimitedFilterClosed = true; return { done: true }; }\n\
+             };\n\
+             Object.setPrototypeOf(loopLimitedFilterSource, Iterator.prototype);",
+        ),
+        TestAction::assert_runtime_limit_error(
+            "loopLimitedFilterSource.filter(() => false).next()",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().disable_loop_iteration_limit();
+        }),
+        TestAction::assert("loopLimitedFilterClosed"),
+    ]);
+}
+
+#[test]
 fn iterator_for_each_basic() {
     run_test_actions([
         TestAction::run("let sum = 0; Iterator.from([1,2,3]).forEach(x => { sum += x; });"),

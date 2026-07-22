@@ -98,6 +98,7 @@ impl FlatMap {
                             let Some(value) = iterated.step_value(context).branch()? else {
                                 return CoroutineState::Break(Ok(()));
                             };
+                            iterated.consume_loop_iteration(context).branch()?;
 
                             let mapped_value = if_abrupt_close_iterator!(
                                 mapper.call(
@@ -137,6 +138,11 @@ impl FlatMap {
                                 context
                             ) {
                                 Some(inner_value) => {
+                                    if_abrupt_close_iterator!(
+                                        inner_iterator.consume_loop_iteration(context),
+                                        iterated,
+                                        context
+                                    );
                                     state.set(Self::Yielding {
                                         iterated,
                                         inner_iterator,

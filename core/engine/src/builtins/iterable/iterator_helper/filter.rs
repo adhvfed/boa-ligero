@@ -65,6 +65,7 @@ impl Filter {
                             let Some(value) = iterated.step_value(context).branch()? else {
                                 return CoroutineState::Break(Ok(()));
                             };
+                            iterated.consume_loop_iteration(context).branch()?;
 
                             // iii. Let selected be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
                             let selected = match predicate.call(
