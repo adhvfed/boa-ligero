@@ -1089,6 +1089,7 @@ impl Array {
         let mut lower = 0;
         // 5. Repeat, while lower ≠ middle,
         while lower != middle {
+            context.consume_loop_iterations(1)?;
             // a. Let upper be len - lower - 1.
             let upper = len - lower - 1;
             // Skipped: b. Let upperP be ! ToString(𝔽(upper)).
@@ -1159,6 +1160,7 @@ impl Array {
         // 4. Let k be 0.
         // 5. Repeat, while k < len,
         for i in 0..len {
+            context.consume_loop_iterations(1)?;
             // a. Let from be ! ToString(𝔽(len - k - 1)).
             let from = len - i - 1;
 
@@ -1239,6 +1241,7 @@ impl Array {
         // 5. Let k be 1.
         // 6. Repeat, while k < len,
         for k in 1..len {
+            context.consume_loop_iterations(1)?;
             // a. Let from be ! ToString(𝔽(k)).
             let from = k;
             // b. Let to be ! ToString(𝔽(k - 1)).
@@ -1300,6 +1303,7 @@ impl Array {
             let mut k = len;
             // c. Repeat, while k > 0,
             while k > 0 {
+                context.consume_loop_iterations(1)?;
                 // i. Let from be ! ToString(𝔽(k - 1)).
                 let from = k - 1;
                 // ii. Let to be ! ToString(𝔽(k + argCount - 1)).
@@ -2003,6 +2007,7 @@ impl Array {
 
         // 11. Repeat, while k < final,
         while k < final_ {
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Perform ? Set(O, Pk, value, true).
@@ -2136,6 +2141,7 @@ impl Array {
         let mut n: u64 = 0;
         // 14. Repeat, while k < final,
         while k < final_ {
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let pk = k;
             // b. Let kPresent be ? HasProperty(O, Pk).
@@ -3080,6 +3086,7 @@ impl Array {
 
         // 18. Repeat, while count > 0,
         while count > 0 {
+            context.consume_loop_iterations(1)?;
             // a. Let fromKey be ! ToString(𝔽(from)).
             let from_key = from;
 
@@ -3226,6 +3233,7 @@ impl Array {
         // 8. Let k be 0.
         // 9. Repeat, while k < len,
         for k in 0..len {
+            context.consume_loop_iterations(1)?;
             // a. Let Pk be ! ToString(𝔽(k)).
             let from_value = if k == actual_index {
                 // b. If k is actualIndex, let fromValue be value.

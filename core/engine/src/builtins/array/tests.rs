@@ -502,6 +502,52 @@ fn callback_traversals_respect_loop_iteration_limit() {
 }
 
 #[test]
+fn mutation_and_copy_traversals_respect_loop_iteration_limit() {
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_loop_iteration_limit(3);
+        }),
+        TestAction::assert_eq(
+            "(() => { const value = { 0: 'a', 5: 'b', length: 6 }; \
+             Array.prototype.reverse.call(value); return value[0] + value[5]; })()",
+            js_str!("ba"),
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.reverse.call({ length: 8 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.shift.call({ length: 5 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.unshift.call({ length: 4 }, 'value')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.fill.call({ length: 4 }, 'value')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.slice.call({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.toReversed.call({ length: 4 })",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.copyWithin.call({ length: 8 }, 4, 0)",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.with.call({ length: 4 }, 0, 'value')",
+            RuntimeLimitError::LoopIteration,
+        ),
+    ]);
+}
+
+#[test]
 fn map() {
     run_test_actions([
         TestAction::run_harness(),
