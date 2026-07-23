@@ -20,7 +20,7 @@ use crate::{
     property::{PropertyDescriptor, PropertyKey},
     value::PreferredType,
 };
-use boa_gc::{self, Finalize, Gc, GcRef, GcRefCell, GcRefMut, Trace};
+use boa_gc::{self, Finalize, Gc, GcRef, GcRefCell, GcRefMut, Trace, WeakGc};
 use core::ptr::fn_addr_eq;
 use std::collections::HashSet;
 use std::{
@@ -63,6 +63,25 @@ pub struct JsObject<T: NativeObject = ErasedObjectData> {
     inner: Gc<VTableObject<T>>,
 }
 
+/// A weak handle to a JavaScript object.
+///
+/// Unlike [`JsObject`], this handle does not keep the object alive across a
+/// garbage collection. Embedders can use it for host-side dependency graphs
+/// whose edges must not root otherwise unreachable JavaScript objects.
+#[derive(Clone, Trace, Finalize)]
+pub struct WeakJsObject {
+    inner: WeakGc<VTableObject<ErasedObjectData>>,
+}
+
+impl Debug for WeakJsObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WeakJsObject")
+            .field("is_live", &self.inner.is_upgradable())
+            .finish()
+    }
+}
+
 impl<T: NativeObject> Clone for JsObject<T> {
     fn clone(&self) -> Self {
         Self {
@@ -84,6 +103,14 @@ pub(crate) struct VTableObject<T: NativeObject + ?Sized> {
 }
 
 impl JsObject {
+    /// Creates a weak handle that does not keep this object alive.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakJsObject {
+        WeakJsObject {
+            inner: WeakGc::new(&self.inner),
+        }
+    }
+
     /// Converts the `JsObject` into a raw pointer to its inner `GcBox<ErasedVTableObject>`.
     #[cfg(not(feature = "jsvalue-enum"))]
     pub(crate) fn into_raw(self) -> NonNull<GcBox<ErasedVTableObject>> {
@@ -815,6 +842,14 @@ Cannot both specify accessors and a value or writable attribute",
                 .downcast::<SharedArrayBuffer>()
                 .map(BufferObject::SharedBuffer),
         }
+    }
+}
+
+impl WeakJsObject {
+    /// Promotes this handle when the object is still alive.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<JsObject> {
+        self.inner.upgrade().map(JsObject::from_inner)
     }
 }
 

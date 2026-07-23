@@ -672,7 +672,20 @@ impl IteratorRecord {
     ///  - [ECMA reference][spec]
     ///
     ///  [spec]: https://tc39.es/ecma262/#sec-iteratortolist
-    pub(crate) fn into_list(mut self, context: &mut Context) -> JsResult<Vec<JsValue>> {
+    pub fn into_list(self, context: &mut Context) -> JsResult<Vec<JsValue>> {
+        self.try_into_list(context, |value, _| Ok(value))
+    }
+
+    /// Collects this iterator into a list while fallibly converting each item.
+    ///
+    /// Conversion is interleaved with iteration, so an error stops before the
+    /// next item is requested. Native loop limits are charged exactly as they
+    /// are by [`Self::into_list`].
+    pub fn try_into_list<T>(
+        mut self,
+        context: &mut Context,
+        mut convert: impl FnMut(JsValue, &mut Context) -> JsResult<T>,
+    ) -> JsResult<Vec<T>> {
         // 1. Let values be a new empty List.
         let mut values = Vec::new();
 
@@ -682,7 +695,7 @@ impl IteratorRecord {
             self.consume_loop_iteration(context)?;
 
             // c. Append next to values.
-            values.push(value);
+            values.push(convert(value, context)?);
         }
 
         //     b. If next is done, then

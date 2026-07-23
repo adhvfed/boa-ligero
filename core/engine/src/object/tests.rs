@@ -1,4 +1,4 @@
-use crate::{JsNativeErrorKind, TestAction, run_test_actions};
+use crate::{JsNativeErrorKind, JsObject, TestAction, run_test_actions};
 use indoc::indoc;
 
 #[test]
@@ -37,4 +37,17 @@ fn object_properties_return_order() {
             r#"arrayEquals(Object.values(o), [ "iv0", "iv1", "iv2", "v2", "v4", "v1" ])"#,
         ),
     ]);
+}
+
+#[test]
+fn weak_js_object_does_not_keep_object_alive() {
+    let weak = {
+        let object = JsObject::with_null_proto();
+        let weak = object.downgrade();
+        assert!(weak.upgrade().is_some());
+        weak
+    };
+
+    boa_gc::force_collect();
+    assert!(weak.upgrade().is_none());
 }
