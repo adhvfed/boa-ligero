@@ -40,7 +40,7 @@ use std::{
 };
 
 use crate::{
-    JsBigInt, JsStr, JsString, SourceText, SpannedSourceText,
+    JsBigInt, JsString, SourceText, SpannedSourceText,
     builtins::function::{ThisMode, arguments::MappedArguments},
     js_string,
     vm::{
@@ -95,15 +95,13 @@ pub(crate) trait ToJsString {
 }
 
 impl ToJsString for Sym {
-    #[allow(clippy::cast_possible_truncation)]
     fn to_js_string(&self, interner: &Interner) -> JsString {
-        let utf16 = interner.resolve_expect(*self).utf16();
-        if interner.is_latin1(*self) {
-            let bytes: Vec<u8> = utf16.iter().map(|&c| c as u8).collect();
-            js_string!(JsStr::latin1(&bytes))
-        } else {
-            js_string!(utf16)
-        }
+        // Prefer the interner's retained UTF-8 spelling. `JsString::from`
+        // copies ASCII directly into its compact Latin-1 representation, so
+        // this avoids first collecting the UTF-16 spelling into a temporary
+        // byte vector. Strings containing unpaired surrogates automatically
+        // fall back to the interner's UTF-16 spelling.
+        interner.resolve_expect(*self).into_common(true)
     }
 }
 
