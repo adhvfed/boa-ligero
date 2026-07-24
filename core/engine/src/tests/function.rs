@@ -324,3 +324,83 @@ fn function_constructor_nested_lexical_binding() {
         42,
     )]);
 }
+
+#[test]
+fn nested_arrow_created_by_returned_arrow_keeps_method_this() {
+    run_test_actions([
+        TestAction::assert(indoc! {r#"
+            class Receiver {
+                callback() {
+                    return () => () => this;
+                }
+            }
+
+            const receiver = new Receiver();
+            receiver.callback()()() === receiver;
+        "#}),
+        TestAction::assert(indoc! {r#"
+            class Subscriptions {
+                constructor() {
+                    this.items = [];
+                }
+
+                add(callback) {
+                    this.items.push(callback);
+                    return () => {
+                        const index = this.items.indexOf(callback);
+                        if (index >= 0) {
+                            this.items.splice(index, 1);
+                        }
+                    };
+                }
+
+                getSize() {
+                    return this.items.length;
+                }
+            }
+
+            class MotionValue {
+                constructor() {
+                    this.events = {};
+                    this.stopped = false;
+                }
+
+                on(name, callback) {
+                    this.events[name] ||= new Subscriptions();
+                    const remove = this.events[name].add(callback);
+                    return name === "change"
+                        ? () => {
+                            remove();
+                            return () => {
+                                this.events.change.getSize() || this.stop();
+                            };
+                        }
+                        : remove;
+                }
+
+                stop() {
+                    this.stopped = true;
+                }
+            }
+
+            const motion = new MotionValue();
+            const remove = motion.on("change", () => {});
+            const deferredCleanup = remove();
+            deferredCleanup();
+            motion.stopped;
+        "#}),
+    ]);
+}
+
+#[test]
+fn arrow_in_class_field_nested_in_arrow_keeps_initializer_this() {
+    run_test_actions([TestAction::assert(indoc! {r#"
+        const makeClass = () => class {
+            receiver = () => this;
+        };
+
+        const Class = makeClass();
+        const instance = new Class();
+        instance.receiver() === instance;
+    "#})]);
+}

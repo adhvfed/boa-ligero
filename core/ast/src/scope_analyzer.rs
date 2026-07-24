@@ -50,8 +50,9 @@ where
     let mut visitor = BindingCollectorVisitor {
         strict,
         eval,
-        in_arrow: false,
         scope: scope.clone(),
+        this_scope: scope.clone(),
+        in_arrow: false,
         interner,
     };
     match visitor.visit(node) {
@@ -578,6 +579,7 @@ struct BindingCollectorVisitor<'interner> {
     strict: bool,
     eval: bool,
     scope: Scope,
+    this_scope: Scope,
     in_arrow: bool,
     interner: &'interner Interner,
 }
@@ -589,9 +591,10 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
         &mut self,
         _node: &'ast mut crate::expression::This,
     ) -> ControlFlow<Self::BreakTy> {
-        // NOTE: Arrow functions inherit 'this' from their enclosing scope, so we must escape it.
+        // Arrow functions inherit `this`, including through other arrows, so retain
+        // the function scope that actually owns the binding.
         if self.in_arrow {
-            self.scope.escape_this_in_enclosing_function_scope();
+            self.this_scope.escape_this();
         }
         ControlFlow::Continue(())
     }
@@ -849,22 +852,30 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
             ClassElement::FieldDefinition(field) | ClassElement::StaticFieldDefinition(field) => {
                 self.visit_property_name_mut(&mut field.name)?;
                 let mut scope = Scope::new(self.scope.clone(), true);
+                let old_this_scope = std::mem::replace(&mut self.this_scope, scope.clone());
+                let old_in_arrow = std::mem::replace(&mut self.in_arrow, false);
                 std::mem::swap(&mut self.scope, &mut scope);
                 if let Some(e) = &mut field.initializer {
                     self.visit_expression_mut(e)?;
                 }
                 std::mem::swap(&mut self.scope, &mut scope);
+                self.this_scope = old_this_scope;
+                self.in_arrow = old_in_arrow;
                 field.scope = scope;
                 ControlFlow::Continue(())
             }
             ClassElement::PrivateFieldDefinition(field)
             | ClassElement::PrivateStaticFieldDefinition(field) => {
                 let mut scope = Scope::new(self.scope.clone(), true);
+                let old_this_scope = std::mem::replace(&mut self.this_scope, scope.clone());
+                let old_in_arrow = std::mem::replace(&mut self.in_arrow, false);
                 std::mem::swap(&mut self.scope, &mut scope);
                 if let Some(e) = &mut field.initializer {
                     self.visit_expression_mut(e)?;
                 }
                 std::mem::swap(&mut self.scope, &mut scope);
+                self.this_scope = old_this_scope;
+                self.in_arrow = old_in_arrow;
                 field.scope = scope;
                 ControlFlow::Continue(())
             }
@@ -1180,6 +1191,7 @@ impl BindingCollectorVisitor<'_> {
         arrow: bool,
     ) -> ControlFlow<&'static str> {
         let strict = self.strict || strict;
+        let old_this_scope = self.this_scope.clone();
         let old_in_arrow = self.in_arrow;
         self.in_arrow = arrow;
 
@@ -1192,6 +1204,9 @@ impl BindingCollectorVisitor<'_> {
         } else {
             Scope::new(self.scope.clone(), true)
         };
+        if !arrow {
+            self.this_scope = function_scope.clone();
+        }
 
         let function_scopes = function_declaration_instantiation(
             body,
@@ -1215,6 +1230,7 @@ impl BindingCollectorVisitor<'_> {
 
         *scopes = function_scopes;
 
+        self.this_scope = old_this_scope;
         self.in_arrow = old_in_arrow;
 
         ControlFlow::Continue(())

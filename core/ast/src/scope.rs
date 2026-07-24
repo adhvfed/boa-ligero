@@ -351,25 +351,10 @@ impl Scope {
         }
     }
 
-    /// Escape enclosing function environment's `this`.
-    pub fn escape_this_in_enclosing_function_scope(&self) {
-        let mut current = self;
-        let mut crossed_function_border = false;
-
-        loop {
-            if crossed_function_border && current.is_function() {
-                current.inner.this_escaped.set(true);
-                return;
-            }
-            if let Some(outer) = &current.inner.outer {
-                if current.is_function() {
-                    crossed_function_border = true;
-                }
-                current = outer;
-            } else {
-                return;
-            }
-        }
+    /// Marks this function environment's `this` binding as escaping.
+    pub(crate) fn escape_this(&self) {
+        debug_assert!(self.is_function());
+        self.inner.this_escaped.set(true);
     }
 
     /// Creates a mutable binding.
