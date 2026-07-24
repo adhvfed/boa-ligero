@@ -32,7 +32,7 @@ impl ByteCompiler<'_> {
                 let finally_jump_index = self.register_allocator.alloc();
 
                 self.bytecode.emit_store_true(finally_re_throw.variable());
-                self.bytecode.emit_store_zero(finally_jump_index.variable());
+                self.emit_store_integer(-1, &finally_jump_index);
 
                 self.push_try_with_finally_control_info(
                     &finally_re_throw,
@@ -47,7 +47,7 @@ impl ByteCompiler<'_> {
                 let finally_jump_index = self.register_allocator.alloc();
 
                 self.bytecode.emit_store_true(finally_re_throw.variable());
-                self.bytecode.emit_store_zero(finally_jump_index.variable());
+                self.emit_store_integer(-1, &finally_jump_index);
 
                 self.push_try_with_finally_control_info(
                     &finally_re_throw,

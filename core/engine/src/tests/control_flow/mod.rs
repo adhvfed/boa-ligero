@@ -107,6 +107,27 @@ fn catch_finally() {
 }
 
 #[test]
+fn catch_finally_preserves_function_local_assignment() {
+    run_test_actions([TestAction::assert_eq(
+        indoc! {r#"
+            function compute() {
+                let result;
+                try {
+                    result = 42;
+                } catch (error) {
+                    return -1;
+                } finally {
+                }
+                return result;
+            }
+
+            compute();
+        "#},
+        42,
+    )]);
+}
+
+#[test]
 fn catch() {
     run_test_actions([TestAction::assert_eq(
         indoc! {r#"

@@ -615,10 +615,10 @@ impl ByteCompiler<'_> {
             thin_vec![Self::DUMMY_ADDRESS; info.jumps.len()],
         );
 
-        // We are assuming any indices outside our jump table will fallback
-        // to executing the next available op. Since we kinda control the jump
-        // table index here, this doesn't matter too much, but we _could_ also
-        // throw a PanicError on the next instruction.
+        // Normal completion keeps the sentinel index (`-1`) and falls through
+        // the table. Skip the abrupt-completion continuations emitted below;
+        // only an in-range break/continue/return index should enter one.
+        let normal_completion = self.jump();
 
         let mut patch_jumps = Vec::with_capacity(info.jumps.len());
         // Handle breaks/continue/returns in a finally block
@@ -631,6 +631,7 @@ impl ByteCompiler<'_> {
 
         self.bytecode
             .patch_jump_table(jump_table_index, &patch_jumps);
+        self.patch_jump(normal_completion);
     }
 
     pub(crate) fn jump_info_open_environment_count(&self, index: usize) -> u32 {
