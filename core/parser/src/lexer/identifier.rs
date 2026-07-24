@@ -35,7 +35,13 @@ impl Identifier {
     /// [spec]: https://tc39.es/ecma262/#sec-names-and-keywords
     pub(super) fn is_identifier_start(ch: u32) -> bool {
         const ID_START: CodePointSetDataBorrowed<'static> = CodePointSetData::new::<IdStart>();
-        matches!(ch, 0x0024 /* $ */ | 0x005F /* _ */) || ID_START.contains32(ch)
+        matches!(
+            ch,
+            0x0024 /* $ */
+                | 0x0041..=0x005A /* A-Z */
+                | 0x005F /* _ */
+                | 0x0061..=0x007A /* a-z */
+        ) || (ch > 0x007F && ID_START.contains32(ch))
     }
 
     /// Checks if a character is `IdentifierPart` as per ECMAScript standards.
@@ -49,8 +55,14 @@ impl Identifier {
             CodePointSetData::new::<IdContinue>();
         matches!(
             ch,
-            0x0024 /* $ */ | 0x005F /* _ */ | 0x200C /* <ZWNJ> */ | 0x200D /* <ZWJ> */
-        ) || ID_CONTINUE.contains32(ch)
+            0x0024 /* $ */
+                | 0x0030..=0x0039 /* 0-9 */
+                | 0x0041..=0x005A /* A-Z */
+                | 0x005F /* _ */
+                | 0x0061..=0x007A /* a-z */
+                | 0x200C /* <ZWNJ> */
+                | 0x200D /* <ZWJ> */
+        ) || (ch > 0x007F && ID_CONTINUE.contains32(ch))
     }
 }
 
@@ -102,22 +114,23 @@ impl Identifier {
         R: ReadChar,
     {
         let mut contains_escaped_chars = false;
-        let mut identifier_name = if init == '\\' && cursor.next_if(0x75 /* u */)? {
+        let mut identifier_name = String::with_capacity(16);
+        if init == '\\' && cursor.next_if(0x75 /* u */)? {
             let ch = StringLiteral::take_unicode_escape_sequence(cursor, start_pos.position())?;
 
             if Self::is_identifier_start(ch) {
                 contains_escaped_chars = true;
-                String::from(
+                identifier_name.push(
                     char::try_from(ch)
                         .expect("all identifier starts must be convertible to strings"),
-                )
+                );
             } else {
                 return Err(Error::syntax("invalid identifier start", start_pos));
             }
         } else {
             // The caller guarantees that `init` is a valid identifier start
-            String::from(init)
-        };
+            identifier_name.push(init);
+        }
 
         loop {
             let ch = match cursor.peek_char()? {
