@@ -16,17 +16,14 @@ fn context() {
     assert_eq!(result.context(), Some("after"));
 
     let error = result.unwrap_err();
-    if let Error::Expected {
-        expected,
-        found,
-        span,
-        context,
-    } = error
-    {
-        assert_eq!(expected.as_ref(), &["testing".to_owned()]);
-        assert_eq!(found, "nottesting".into());
-        assert_eq!(span, Span::new(Position::new(1, 1), Position::new(1, 1)));
-        assert_eq!(context, "after");
+    if let Error::Expected(error) = error {
+        assert_eq!(error.expected(), &["testing".to_owned()]);
+        assert_eq!(error.found(), "nottesting");
+        assert_eq!(
+            error.span(),
+            Span::new(Position::new(1, 1), Position::new(1, 1))
+        );
+        assert_eq!(error.context(), "after");
     } else {
         unreachable!();
     }
@@ -145,6 +142,16 @@ fn display() {
         Span::new(Position::new(1, 1), Position::new(1, 3)),
         "error message",
     );
+    if let Error::Unexpected(error) = &err {
+        assert_eq!(error.found(), "nottesting");
+        assert_eq!(error.message(), "error message");
+        assert_eq!(
+            error.span(),
+            Span::new(Position::new(1, 1), Position::new(1, 3))
+        );
+    } else {
+        unreachable!();
+    }
     assert_eq!(
         err.to_string(),
         "unexpected token 'nottesting', error message at line 1, col 1"

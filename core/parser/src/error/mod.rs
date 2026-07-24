@@ -10,6 +10,69 @@ use std::fmt;
 /// Result of a parsing operation.
 pub type ParseResult<T> = Result<T, Error>;
 
+/// Details for an error caused by encountering an unexpected token.
+#[derive(Debug)]
+pub struct ExpectedError {
+    expected: Box<[String]>,
+    found: Box<str>,
+    context: &'static str,
+    span: Span,
+}
+
+impl ExpectedError {
+    /// Returns the token descriptions that the parser expected.
+    #[must_use]
+    pub fn expected(&self) -> &[String] {
+        &self.expected
+    }
+
+    /// Returns the token description that the parser found.
+    #[must_use]
+    pub fn found(&self) -> &str {
+        &self.found
+    }
+
+    /// Returns the parsing context for the error.
+    #[must_use]
+    pub const fn context(&self) -> &'static str {
+        self.context
+    }
+
+    /// Returns the source span of the unexpected token.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
+/// Details for an error caused by an invalid token in a parsing context.
+#[derive(Debug)]
+pub struct UnexpectedError {
+    message: Box<str>,
+    found: Box<str>,
+    span: Span,
+}
+
+impl UnexpectedError {
+    /// Returns why the token is invalid in this parsing context.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the token description that the parser found.
+    #[must_use]
+    pub fn found(&self) -> &str {
+        &self.found
+    }
+
+    /// Returns the source span of the unexpected token.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+
 /// Adds context to a parser error.
 pub(crate) trait ErrorContext {
     /// Sets the context of the error, if possible.
@@ -32,19 +95,17 @@ impl<T> ErrorContext for ParseResult<T> {
 impl ErrorContext for Error {
     fn set_context(self, new_context: &'static str) -> Self {
         match self {
-            Self::Expected {
-                expected,
-                found,
-                span,
-                ..
-            } => Self::expected(expected, found, span, new_context),
+            Self::Expected(mut error) => {
+                error.context = new_context;
+                Self::Expected(error)
+            }
             e => e,
         }
     }
 
     fn context(&self) -> Option<&'static str> {
-        if let Self::Expected { context, .. } = self {
-            Some(context)
+        if let Self::Expected(error) = self {
+            Some(error.context)
         } else {
             None
         }
@@ -62,31 +123,10 @@ impl From<LexError> for Error {
 #[derive(Debug)]
 pub enum Error {
     /// When it expected a certain kind of token, but got another as part of something
-    Expected {
-        /// The token(s) that were expected.
-        expected: Box<[String]>,
-
-        /// The token that was not expected.
-        found: Box<str>,
-
-        /// The parsing context in which the error occurred.
-        context: &'static str,
-
-        /// Position of the source code where the error occurred.
-        span: Span,
-    },
+    Expected(Box<ExpectedError>),
 
     /// When a token is unexpected
-    Unexpected {
-        /// The error message.
-        message: Box<str>,
-
-        /// The token that was not expected.
-        found: Box<str>,
-
-        /// Position of the source code where the error occurred.
-        span: Span,
-    },
+    Unexpected(Box<UnexpectedError>),
 
     /// When there is an abrupt end to the parsing
     AbruptEnd,
@@ -123,12 +163,12 @@ impl Error {
         let expected = expected.into();
         debug_assert_ne!(expected.len(), 0);
 
-        Self::Expected {
+        Self::Expected(Box::new(ExpectedError {
             expected,
             found: found.into(),
             span,
             context,
-        }
+        }))
     }
 
     /// Creates an `Unexpected` parsing error.
@@ -137,11 +177,11 @@ impl Error {
         F: Into<Box<str>>,
         C: Into<Box<str>>,
     {
-        Self::Unexpected {
+        Self::Unexpected(Box::new(UnexpectedError {
             found: found.into(),
             span,
             message: message.into(),
-        }
+        }))
     }
 
     /// Creates a `ScopeAnalysis` parsing error.
@@ -191,14 +231,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Expected {
-                expected,
-                found,
-                span,
-                ..
-            } => {
+            Self::Expected(error) => {
                 write!(f, "expected ")?;
-                match &**expected {
+                match &*error.expected {
                     [single] => write!(f, "token '{single}'")?,
                     expected => {
                         write!(f, "one of ")?;
@@ -217,28 +252,28 @@ impl fmt::Display for Error {
                 if let Some(context) = self.context() {
                     write!(
                         f,
-                        ", got '{found}' in {context} at line {}, col {}",
-                        span.start().line_number(),
-                        span.start().column_number()
+                        ", got '{}' in {context} at line {}, col {}",
+                        error.found,
+                        error.span.start().line_number(),
+                        error.span.start().column_number()
                     )
                 } else {
                     write!(
                         f,
-                        ", got '{found}' at line {}, col {}",
-                        span.start().line_number(),
-                        span.start().column_number()
+                        ", got '{}' at line {}, col {}",
+                        error.found,
+                        error.span.start().line_number(),
+                        error.span.start().column_number()
                     )
                 }
             }
-            Self::Unexpected {
-                found,
-                span,
-                message,
-            } => write!(
+            Self::Unexpected(error) => write!(
                 f,
-                "unexpected token '{found}', {message} at line {}, col {}",
-                span.start().line_number(),
-                span.start().column_number()
+                "unexpected token '{}', {} at line {}, col {}",
+                error.found,
+                error.message,
+                error.span.start().line_number(),
+                error.span.start().column_number()
             ),
             Self::AbruptEnd => f.write_str("abrupt end"),
             Self::General { message, position } => write!(
