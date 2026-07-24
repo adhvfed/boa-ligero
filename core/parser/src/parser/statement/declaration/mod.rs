@@ -68,7 +68,6 @@ where
         let tok = cursor.peek(0, interner).or_abrupt()?;
         let tok_kind = tok.kind().clone();
         let tok_span = tok.span();
-        let tok_str = tok.to_string(interner);
 
         match tok_kind {
             TokenKind::Keyword((Keyword::Function | Keyword::Async | Keyword::Class, _)) => {
@@ -105,12 +104,12 @@ where
                         Keyword::Let.to_string(),
                         Keyword::Using.to_string(),
                     ],
-                    tok_str,
+                    Keyword::Await.to_string(),
                     tok_span,
                     "export declaration",
                 ))
             }
-            _ => Err(Error::expected(
+            found => Err(Error::expected(
                 [
                     Keyword::Function.to_string(),
                     Keyword::Async.to_string(),
@@ -119,7 +118,7 @@ where
                     Keyword::Let.to_string(),
                     Keyword::Using.to_string(),
                 ],
-                tok_str,
+                found.to_string(interner),
                 tok_span,
                 "export declaration",
             )),
