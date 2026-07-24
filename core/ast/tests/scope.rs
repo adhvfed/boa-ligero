@@ -5,7 +5,7 @@
 use boa_ast::{
     Declaration, Expression, LinearPosition, LinearSpan, Script, Span, Statement, StatementList,
     StatementListItem,
-    declaration::{LexicalDeclaration, Variable},
+    declaration::{LexicalDeclaration, VarDeclaration, Variable},
     expression::Identifier,
     function::{FormalParameter, FormalParameterList, FunctionBody, FunctionDeclaration},
     scope::Scope,
@@ -278,6 +278,89 @@ fn script_function_mapped_arguments_accessed() {
     assert!(!a.is_global_object());
     assert!(a.is_lexical());
     assert!(a.local());
+}
+
+#[test]
+fn large_function_scope_deduplicates_parameters_and_var_declarations() {
+    let scope = Scope::new_global();
+    let mut interner = Interner::new();
+    let span = Span::new((1, 1), (1, 1));
+    let function_name = interner.get_or_intern("large");
+    let names = (0..40)
+        .map(|index| {
+            let name = format!("v{index}");
+            interner.get_or_intern(name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let parameters = FormalParameterList::from_parameters(
+        names[..2]
+            .iter()
+            .map(|name| {
+                FormalParameter::new(
+                    Variable::from_identifier(Identifier::new(*name, span), None),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let mut variables = names
+        .iter()
+        .map(|name| Variable::from_identifier(Identifier::new(*name, span), None))
+        .collect::<Vec<_>>();
+    // A repeated `var` and names already created by parameters must not create
+    // extra bindings when the large-scope membership path is selected.
+    variables.push(Variable::from_identifier(
+        Identifier::new(names[0], span),
+        None,
+    ));
+    let mut script = Script::new(StatementList::new(
+        [Declaration::FunctionDeclaration(FunctionDeclaration::new(
+            Identifier::new(function_name, span),
+            parameters,
+            FunctionBody::new(
+                StatementList::new(
+                    [Statement::Var(VarDeclaration(
+                        variables.try_into().expect("non-empty variable list"),
+                    ))
+                    .into()],
+                    LinearPosition::default(),
+                    false,
+                ),
+                span,
+            ),
+            LinearSpan::default(),
+        ))
+        .into()],
+        LinearPosition::default(),
+        false,
+    ));
+
+    script
+        .analyze_scope(&scope, &interner)
+        .expect("large function scope should analyze");
+    let StatementListItem::Declaration(declaration) = script
+        .statements()
+        .first()
+        .expect("function declaration should remain")
+    else {
+        panic!("expected function declaration");
+    };
+    let Declaration::FunctionDeclaration(function) = declaration.as_ref() else {
+        panic!("expected function declaration");
+    };
+
+    // Forty unique vN bindings plus the implicit `arguments` binding.
+    assert_eq!(function.scopes().function_scope().num_bindings(), 41);
+    for (index, name) in names.iter().enumerate() {
+        assert!(
+            function
+                .scopes()
+                .function_scope()
+                .get_binding_reference(&JsString::from(format!("v{index}")))
+                .is_some(),
+            "missing binding for {name:?}"
+        );
+    }
 }
 
 #[test]

@@ -30,7 +30,7 @@ use crate::{
     visitor::{NodeRef, NodeRefMut, VisitorMut},
 };
 use boa_interner::{Interner, Sym};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::ControlFlow;
 
 /// Collect bindings and fill the scopes with them.
@@ -1874,6 +1874,48 @@ where
 ///  - [ECMAScript reference][spec]
 ///
 /// [spec]: https://tc39.es/ecma262/#sec-functiondeclarationinstantiation
+enum InstantiatedVarNames {
+    Small(Vec<Sym>),
+    Large(FxHashSet<Sym>),
+}
+
+impl InstantiatedVarNames {
+    /// Linear scans are cheaper for the overwhelmingly common small function;
+    /// switch before repeated membership checks become quadratic in a large
+    /// generated/minified scope.
+    const SET_THRESHOLD: usize = 32;
+
+    fn new(initial: Vec<Sym>, additional_names: usize) -> Self {
+        if initial.len().saturating_add(additional_names) >= Self::SET_THRESHOLD {
+            Self::Large(initial.into_iter().collect())
+        } else {
+            Self::Small(initial)
+        }
+    }
+
+    #[cfg(feature = "annex-b")]
+    fn contains(&self, name: Sym) -> bool {
+        match self {
+            Self::Small(names) => names.contains(&name),
+            Self::Large(names) => names.contains(&name),
+        }
+    }
+
+    fn insert(&mut self, name: Sym) -> bool {
+        match self {
+            Self::Small(names) => {
+                if names.contains(&name) {
+                    false
+                } else {
+                    names.push(name);
+                    true
+                }
+            }
+            Self::Large(names) => names.insert(name),
+        }
+    }
+}
+
 fn function_declaration_instantiation(
     body: &FunctionBody,
     formals: &FormalParameterList,
@@ -2061,14 +2103,15 @@ fn function_declaration_instantiation(
         // c. Set the VariableEnvironment of calleeContext to varEnv.
 
         // d. Let instantiatedVarNames be a new empty List.
-        let mut instantiated_var_names = Vec::new();
+        let mut instantiated_var_names = InstantiatedVarNames::new(Vec::new(), var_names.len());
 
         // e. For each element n of varNames, do
         for n in var_names {
             // i. If instantiatedVarNames does not contain n, then
-            if !instantiated_var_names.contains(&n) {
-                // 1. Append n to instantiatedVarNames.
-                instantiated_var_names.push(n);
+            if instantiated_var_names.insert(n) {
+                // 1. Append n to instantiatedVarNames. The specification uses
+                //    a List; only membership is observed below, while binding
+                //    creation still follows `var_names` order.
 
                 let n_string = n.to_js_string(interner);
 
@@ -2081,14 +2124,15 @@ fn function_declaration_instantiation(
     } else {
         // a. NOTE: Only a single Environment Record is needed for the parameters and top-level vars.
         // b. Let instantiatedVarNames be a copy of the List parameterBindings.
-        let mut instantiated_var_names = parameter_bindings;
+        let mut instantiated_var_names =
+            InstantiatedVarNames::new(parameter_bindings, var_names.len());
 
         // c. For each element n of varNames, do
         for n in var_names {
             // i. If instantiatedVarNames does not contain n, then
-            if !instantiated_var_names.contains(&n) {
-                // 1. Append n to instantiatedVarNames.
-                instantiated_var_names.push(n);
+            if instantiated_var_names.insert(n) {
+                // 1. Append n to instantiatedVarNames. See the membership-only
+                //    representation note in the parameter-expression branch.
 
                 let n = n.to_js_string(interner);
 
@@ -2118,7 +2162,7 @@ fn function_declaration_instantiation(
                 //    VarDeclaredName, the name of a formal parameter, or another FunctionDeclaration.
 
                 // 2. If initializedBindings does not contain F and F is not "arguments", then
-                if !instantiated_var_names.contains(&f) && f != arguments {
+                if !instantiated_var_names.contains(f) && f != arguments {
                     let f_string = f.to_js_string(interner);
 
                     // a. Perform ! varEnv.CreateMutableBinding(F, false).
@@ -2126,7 +2170,7 @@ fn function_declaration_instantiation(
                     drop(var_env.create_mutable_binding(f_string, false));
 
                     // c. Append F to instantiatedVarNames.
-                    instantiated_var_names.push(f);
+                    instantiated_var_names.insert(f);
                 }
             }
         }
