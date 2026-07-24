@@ -15,7 +15,7 @@ mod update;
 
 use std::ops::Deref;
 
-use super::{Access, CallResultDest, Callable, NodeKind, Register, ToJsString};
+use super::{Access, CallResultDest, Callable, NodeKind, Register};
 use crate::{
     bytecompiler::{ByteCompiler, Literal},
     vm::{CallFrame, GeneratorResumeKind},
@@ -36,9 +36,7 @@ use thin_vec::ThinVec;
 impl ByteCompiler<'_> {
     fn compile_literal(&mut self, lit: &AstLiteral, dst: &Register) {
         match lit.kind() {
-            AstLiteralKind::String(v) => {
-                self.emit_store_literal(Literal::String(v.to_js_string(self.interner())), dst);
-            }
+            AstLiteralKind::String(v) => self.emit_store_interned_string(*v, dst),
             AstLiteralKind::Int(v) => self.emit_store_integer(*v, dst),
             AstLiteralKind::Num(v) => self.emit_store_rational(*v, dst),
             AstLiteralKind::BigInt(v) => {
@@ -66,10 +64,7 @@ impl ByteCompiler<'_> {
             let value = self.register_allocator.alloc();
             match element {
                 TemplateElement::String(s) => {
-                    self.emit_store_literal(
-                        Literal::String(s.to_js_string(self.interner())),
-                        &value,
-                    );
+                    self.emit_store_interned_string(*s, &value);
                 }
                 TemplateElement::Expr(expr) => {
                     self.compile_expr(expr, &value);
@@ -300,19 +295,13 @@ impl ByteCompiler<'_> {
                 for (cooked, raw) in template.cookeds().iter().zip(template.raws()) {
                     let value = self.register_allocator.alloc();
                     if let Some(cooked) = cooked {
-                        self.emit_store_literal(
-                            Literal::String(cooked.to_js_string(self.interner())),
-                            &value,
-                        );
+                        self.emit_store_interned_string(*cooked, &value);
                     } else {
                         self.bytecode.emit_store_undefined(value.variable());
                     }
                     part_registers.push(value);
                     let value = self.register_allocator.alloc();
-                    self.emit_store_literal(
-                        Literal::String(raw.to_js_string(self.interner())),
-                        &value,
-                    );
+                    self.emit_store_interned_string(*raw, &value);
                     part_registers.push(value);
                 }
 

@@ -1,4 +1,4 @@
-use super::{BindingAccessOpcode, ByteCompiler, Literal, Register, ToJsString};
+use super::{BindingAccessOpcode, ByteCompiler, Register, ToJsString};
 use crate::{
     js_string,
     vm::{CodeBlock, CodeBlockFlags, opcode::BindingOpcode},
@@ -392,14 +392,7 @@ impl ByteCompiler<'_> {
                     let name = self.register_allocator.alloc();
                     match field.name() {
                         PropertyName::Literal(ident) => {
-                            self.emit_store_literal(
-                                Literal::String(
-                                    self.interner()
-                                        .resolve_expect(ident.sym())
-                                        .into_common(false),
-                                ),
-                                &name,
-                            );
+                            self.emit_store_interned_string(ident.sym(), &name);
                         }
                         PropertyName::Computed(expr) => {
                             self.compile_expr(expr, &name);

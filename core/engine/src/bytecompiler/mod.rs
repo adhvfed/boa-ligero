@@ -1165,6 +1165,12 @@ impl<'ctx> ByteCompiler<'ctx> {
             .emit_store_literal(dst.variable(), index.into());
     }
 
+    fn emit_store_interned_string(&mut self, value: Sym, dst: &Register) {
+        let index = self.get_or_insert_name(value);
+        self.bytecode
+            .emit_store_literal(dst.variable(), index.into());
+    }
+
     fn emit_store_rational(&mut self, value: f64, dst: &Register) {
         if value.is_nan() {
             return self.bytecode.emit_store_nan(dst.variable());

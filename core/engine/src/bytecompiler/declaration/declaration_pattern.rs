@@ -1,5 +1,5 @@
 use crate::{
-    bytecompiler::{Access, ByteCompiler, Literal, Register, ToJsString},
+    bytecompiler::{Access, ByteCompiler, Register, ToJsString},
     vm::opcode::BindingOpcode,
 };
 use boa_ast::{
@@ -42,14 +42,7 @@ impl ByteCompiler<'_> {
                                 PropertyName::Literal(ident) => {
                                     self.emit_get_property_by_name(&dst, None, object, ident.sym());
                                     let key = self.register_allocator.alloc();
-                                    self.emit_store_literal(
-                                        Literal::String(
-                                            self.interner()
-                                                .resolve_expect(ident.sym())
-                                                .into_common(false),
-                                        ),
-                                        &key,
-                                    );
+                                    self.emit_store_interned_string(ident.sym(), &key);
                                     excluded_keys_registers.push(key);
                                 }
                                 PropertyName::Computed(node) => {
@@ -132,14 +125,7 @@ impl ByteCompiler<'_> {
                             match &name {
                                 PropertyName::Literal(ident) => {
                                     let key = self.register_allocator.alloc();
-                                    self.emit_store_literal(
-                                        Literal::String(
-                                            self.interner()
-                                                .resolve_expect(ident.sym())
-                                                .into_common(false),
-                                        ),
-                                        &key,
-                                    );
+                                    self.emit_store_interned_string(ident.sym(), &key);
                                     excluded_keys_registers.push(key);
                                 }
                                 PropertyName::Computed(node) => {
