@@ -484,7 +484,9 @@ macro_rules! generate_opcodes {
                     // SAFETY: upheld by the JIT trampoline calling this shim.
                     let context = unsafe { &mut *context };
                     if let Err(error) = context.consume_instruction_budget() {
-                        context.vm.jit_pending = Some(CompletionRecord::Throw(error.into()));
+                        let mut error = crate::JsError::from(error);
+                        context.capture_error_backtrace(&mut error);
+                        context.vm.jit_pending = Some(CompletionRecord::Throw(error));
                         return crate::jit::JIT_BREAK_BIT;
                     }
                     match [<handle_ $Variant:snake>](context, pc as usize) {

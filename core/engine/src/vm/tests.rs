@@ -398,22 +398,30 @@ fn instruction_budget_stops_straight_line_execution() {
         .build()
         .expect("context creation must succeed");
 
+    let source = Source::from_bytes(indoc! {r#"
+        let total = 0;
+        total += 1;
+        total += 2;
+        total += 3;
+        total += 4;
+        total += 5;
+        total += 6;
+        total += 7;
+        total += 8;
+        total;
+    "#})
+    .with_path(std::path::Path::new("instruction-budget.js"));
     let error = context
-        .eval(Source::from_bytes(indoc! {r#"
-            let total = 0;
-            total += 1;
-            total += 2;
-            total += 3;
-            total += 4;
-            total += 5;
-            total += 6;
-            total += 7;
-            total += 8;
-            total;
-        "#}))
+        .eval(source)
         .expect_err("straight-line bytecode must consume the finite budget");
 
     assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+    assert!(
+        error
+            .to_string()
+            .contains("at <main> (instruction-budget.js:"),
+        "instruction termination must retain its source frame: {error}"
+    );
     assert_eq!(context.instruction_budget_remaining(), Some(0));
 }
 

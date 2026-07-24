@@ -833,7 +833,9 @@ impl Context {
         F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
     {
         if let Err(error) = self.consume_instruction_budget() {
-            return ControlFlow::Break(CompletionRecord::Throw(error.into()));
+            let mut error = JsError::from(error);
+            self.capture_error_backtrace(&mut error);
+            return ControlFlow::Break(CompletionRecord::Throw(error));
         }
 
         #[cfg(feature = "trace")]
@@ -889,10 +891,7 @@ impl Context {
         Ok(())
     }
 
-    fn handle_error(&mut self, mut err: JsError) -> ControlFlow<CompletionRecord> {
-        // Capture the backtrace early, before any exception handler check,
-        // so that errors caught by internal handlers (e.g. async module
-        // evaluation) still carry source position information.
+    pub(crate) fn capture_error_backtrace(&self, err: &mut JsError) {
         if err.backtrace.is_none() {
             err.backtrace = Some(
                 self.vm
@@ -900,6 +899,13 @@ impl Context {
                     .take(self.vm.runtime_limits.backtrace_limit(), self.vm.frame().pc),
             );
         }
+    }
+
+    fn handle_error(&mut self, mut err: JsError) -> ControlFlow<CompletionRecord> {
+        // Capture the backtrace early, before any exception handler check,
+        // so that errors caught by internal handlers (e.g. async module
+        // evaluation) still carry source position information.
+        self.capture_error_backtrace(&mut err);
 
         // If we hit the execution step limit, bubble up the error to the
         // (Rust) caller instead of trying to handle as an exception.
