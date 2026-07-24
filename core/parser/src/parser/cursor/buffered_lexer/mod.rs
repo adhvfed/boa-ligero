@@ -244,15 +244,22 @@ where
             if self.read_index == self.write_index {
                 self.fill(interner)?;
             }
-            match self.peeked[self.read_index].as_ref() {
-                None => return Ok(None),
-                Some(token)
-                    if !skip_line_terminators || token.kind() != &TokenKind::LineTerminator =>
-                {
-                    return Ok(self.peeked[self.read_index].as_ref());
-                }
-                Some(_) => {}
+
+            let should_skip_line_terminator = skip_line_terminators
+                && self.peeked[self.read_index]
+                    .as_ref()
+                    .is_some_and(|token| token.kind() == &TokenKind::LineTerminator);
+            if !should_skip_line_terminator {
+                return Ok(self.peeked[self.read_index].as_ref());
             }
+
+            // `fill` coalesces contiguous line terminators, so the following
+            // buffered token is either a real token or end-of-input.
+            let next_index = (self.read_index + 1) % PEEK_BUF_SIZE;
+            if next_index == self.write_index {
+                self.fill(interner)?;
+            }
+            return Ok(self.peeked[next_index].as_ref());
         }
 
         let mut read_index = self.read_index;

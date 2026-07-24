@@ -281,6 +281,36 @@ fn skip_peeked_terminators() {
 }
 
 #[test]
+fn peek_current_skips_leading_line_terminator_without_consuming_it() {
+    let mut cur = BufferedLexer::from(&b"\nA"[..]);
+    let interner = &mut Interner::default();
+
+    assert_eq!(
+        *cur.peek(0, true, interner)
+            .unwrap()
+            .expect("identifier expected")
+            .kind(),
+        TokenKind::identifier(interner.get_or_intern_static("A", utf16!("A")))
+    );
+    assert_eq!(
+        cur.next(false, interner)
+            .unwrap()
+            .expect("line terminator expected")
+            .kind(),
+        &TokenKind::LineTerminator
+    );
+    assert_eq!(
+        *cur.peek(0, true, interner)
+            .unwrap()
+            .expect("identifier expected")
+            .kind(),
+        TokenKind::identifier(interner.get_or_intern_static("A", utf16!("A")))
+    );
+    assert!(cur.next(true, interner).unwrap().is_some());
+    assert!(cur.peek(0, true, interner).unwrap().is_none());
+}
+
+#[test]
 fn issue_1768() {
     let mut cur = BufferedLexer::from(&b"\n(\nx\n)\n"[..]);
     let interner = &mut Interner::default();
