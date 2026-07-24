@@ -238,6 +238,23 @@ where
             "you cannot skip more than {MAX_PEEK_SKIP} elements",
         );
 
+        // Nearly three quarters of parser lookahead sites ask only for the
+        // current token. Keep that path out of the general skip loop.
+        if skip_n == 0 {
+            if self.read_index == self.write_index {
+                self.fill(interner)?;
+            }
+            match self.peeked[self.read_index].as_ref() {
+                None => return Ok(None),
+                Some(token)
+                    if !skip_line_terminators || token.kind() != &TokenKind::LineTerminator =>
+                {
+                    return Ok(self.peeked[self.read_index].as_ref());
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut read_index = self.read_index;
         let mut count = 0;
         let res_token = loop {
