@@ -2,7 +2,7 @@ use crate::{
     Error,
     lexer::{InputElement, Lexer, Token, TokenKind},
     parser::ParseResult,
-    source::{ReadChar, UTF8Input},
+    source::{ReadChar, UTF8SliceInput},
 };
 use boa_ast::{LinearPosition, PositionGroup};
 use boa_interner::Interner;
@@ -66,7 +66,7 @@ where
     }
 }
 
-impl<'a> From<&'a [u8]> for BufferedLexer<UTF8Input<&'a [u8]>> {
+impl<'a> From<&'a [u8]> for BufferedLexer<UTF8SliceInput<'a>> {
     fn from(reader: &'a [u8]) -> Self {
         Lexer::from(reader).into()
     }

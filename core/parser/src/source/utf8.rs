@@ -7,6 +7,31 @@ pub struct UTF8Input<R> {
     input: Bytes<R>,
 }
 
+/// Input for UTF-8 encoded byte slices.
+///
+/// Unlike [`UTF8Input`], this advances directly through the borrowed slice
+/// instead of routing every byte through [`Read::bytes`].
+#[derive(Debug)]
+pub struct UTF8SliceInput<'a> {
+    input: &'a [u8],
+    index: usize,
+}
+
+impl<'a> UTF8SliceInput<'a> {
+    pub(crate) const fn new(input: &'a [u8]) -> Self {
+        Self { input, index: 0 }
+    }
+
+    #[inline]
+    fn next_byte(&mut self) -> Option<u8> {
+        let byte = self.input.get(self.index).copied();
+        if byte.is_some() {
+            self.index += 1;
+        }
+        byte
+    }
+}
+
 impl<R: Read> UTF8Input<R> {
     /// Creates a new `UTF8Input` from a UTF-8 encoded source.
     pub(crate) fn new(iter: R) -> Self {
@@ -49,6 +74,32 @@ impl<R: Read> ReadChar for UTF8Input<R> {
                 // [x y z w] case
                 // use only the lower 3 bits of `init`
                 let w = self.next_byte()?.unwrap_or(0);
+                ch = ((init & 7) << 18) | utf8_acc_cont_byte(y_z, w);
+            }
+        }
+
+        Ok(Some(ch))
+    }
+}
+
+impl ReadChar for UTF8SliceInput<'_> {
+    /// Retrieves the next unchecked char in u32 code point.
+    #[inline]
+    fn next_char(&mut self) -> io::Result<Option<u32>> {
+        let x = match self.next_byte() {
+            Some(b) if b >= 128 => b,
+            b => return Ok(b.map(u32::from)),
+        };
+
+        let init = utf8_first_byte(x, 2);
+        let y = self.next_byte().unwrap_or(0);
+        let mut ch = utf8_acc_cont_byte(init, y);
+        if x >= 0xE0 {
+            let z = self.next_byte().unwrap_or(0);
+            let y_z = utf8_acc_cont_byte(u32::from(y & CONT_MASK), z);
+            ch = (init << 12) | y_z;
+            if x >= 0xF0 {
+                let w = self.next_byte().unwrap_or(0);
                 ch = ((init & 7) << 18) | utf8_acc_cont_byte(y_z, w);
             }
         }

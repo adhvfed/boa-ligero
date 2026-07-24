@@ -1,6 +1,6 @@
 //! Boa's lexer cursor that manages the input byte stream.
 
-use crate::source::{ReadChar, UTF8Input};
+use crate::source::{ReadChar, UTF8SliceInput};
 use boa_ast::{LinearPosition, Position, PositionGroup, SourceText};
 use std::io::{self, Error, ErrorKind};
 
@@ -217,8 +217,8 @@ impl<R: ReadChar> Cursor<R> {
     }
 }
 
-impl<'a> From<&'a [u8]> for Cursor<UTF8Input<&'a [u8]>> {
+impl<'a> From<&'a [u8]> for Cursor<UTF8SliceInput<'a>> {
     fn from(input: &'a [u8]) -> Self {
-        Self::new(UTF8Input::new(input))
+        Self::new(UTF8SliceInput::new(input))
     }
 }

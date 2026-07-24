@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-pub use utf8::UTF8Input;
+pub use utf8::{UTF8Input, UTF8SliceInput};
 pub use utf16::UTF16Input;
 
 mod utf16;
@@ -22,7 +22,7 @@ pub struct Source<'path, R> {
     pub(crate) path: Option<&'path Path>,
 }
 
-impl<'bytes> Source<'static, UTF8Input<&'bytes [u8]>> {
+impl<'bytes> Source<'static, UTF8SliceInput<'bytes>> {
     /// Creates a new `Source` from any type equivalent to a slice of bytes e.g. [`&str`][str],
     /// <code>[Vec]<[u8]></code>, <code>[Box]<[\[u8\]][slice]></code> or a plain slice
     /// <code>[&\[u8\]][slice]</code>.
@@ -38,7 +38,7 @@ impl<'bytes> Source<'static, UTF8Input<&'bytes [u8]>> {
     /// [slice]: std::slice
     pub fn from_bytes<T: AsRef<[u8]> + ?Sized>(source: &'bytes T) -> Self {
         Self {
-            reader: UTF8Input::new(source.as_ref()),
+            reader: UTF8SliceInput::new(source.as_ref()),
             path: None,
         }
     }
@@ -163,6 +163,19 @@ mod tests {
         }
 
         assert_eq!(content, "'Hello' + 'World';");
+    }
+
+    #[test]
+    fn from_bytes_decodes_multibyte_utf8() {
+        let expected = "const greeting = 'Hei, verden 🌍';";
+        let mut source = Source::from_bytes(expected);
+        let mut content = String::new();
+
+        while let Some(c) = source.reader.next_char().unwrap() {
+            content.push(char::from_u32(c).unwrap());
+        }
+
+        assert_eq!(content, expected);
     }
 
     #[test]

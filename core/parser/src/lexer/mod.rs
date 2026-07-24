@@ -41,7 +41,7 @@ use self::{
     string::StringLiteral,
     template::TemplateLiteral,
 };
-use crate::source::{ReadChar, UTF8Input};
+use crate::source::{ReadChar, UTF8SliceInput};
 use boa_ast::{PositionGroup, Punctuator};
 use boa_interner::Interner;
 
@@ -403,9 +403,9 @@ impl<R> Lexer<R> {
     }
 }
 
-impl<'a> From<&'a [u8]> for Lexer<UTF8Input<&'a [u8]>> {
+impl<'a> From<&'a [u8]> for Lexer<UTF8SliceInput<'a>> {
     fn from(input: &'a [u8]) -> Self {
-        Self::new(UTF8Input::new(input))
+        Self::new(UTF8SliceInput::new(input))
     }
 }
 
