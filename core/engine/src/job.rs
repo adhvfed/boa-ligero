@@ -48,6 +48,7 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration as ProfileDuration, Instant as ProfileInstant};
 use std::{cell::RefCell, collections::VecDeque, fmt::Debug, future::Future, pin::Pin};
 
 /// An ECMAScript [Job Abstract Closure].
@@ -787,6 +788,47 @@ impl From<GenericJob> for Job {
     }
 }
 
+/// Opt-in measurements for one or more [`JobExecutor::run_jobs`] calls.
+///
+/// The default executor records these only while profiling is enabled, keeping
+/// ordinary execution free from clock reads. [`Context::take_job_executor_metrics`]
+/// returns and resets the accumulated snapshot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JobExecutorMetrics {
+    /// Number of executor drain calls represented by this snapshot.
+    pub run_calls: usize,
+    /// Total wall time spent inside those drain calls.
+    pub wall_time: ProfileDuration,
+    /// Number of outer scheduler iterations.
+    pub scheduler_iterations: usize,
+    /// Promise reaction jobs executed.
+    pub promise_jobs: usize,
+    /// Wall time spent invoking promise reaction jobs.
+    pub promise_time: ProfileDuration,
+    /// Slowest individual promise reaction job.
+    pub slowest_promise_job: ProfileDuration,
+    /// Native async jobs admitted to the active future group.
+    pub async_jobs: usize,
+    /// Number of non-blocking polls of the async future group.
+    pub async_polls: usize,
+    /// Native async jobs observed completing.
+    pub async_completions: usize,
+    /// Wall time spent polling the async future group.
+    pub async_poll_time: ProfileDuration,
+    /// Number of times the synchronous executor parked for async completion.
+    pub async_waits: usize,
+    /// Wall time the synchronous executor spent parked for async completion.
+    pub async_wait_time: ProfileDuration,
+    /// Generic host jobs executed.
+    pub generic_jobs: usize,
+    /// Wall time spent invoking generic host jobs.
+    pub generic_time: ProfileDuration,
+    /// Clock-backed timeout or interval jobs executed.
+    pub clock_jobs: usize,
+    /// Wall time spent invoking clock-backed jobs.
+    pub clock_time: ProfileDuration,
+}
+
 /// An executor of `ECMAscript` [Jobs].
 ///
 /// This is the main API that allows creating custom event loops.
@@ -803,6 +845,19 @@ pub trait JobExecutor: Any {
 
     /// Runs all jobs in the executor.
     fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()>;
+
+    /// Enable or disable opt-in executor measurements.
+    ///
+    /// Custom executors may ignore this request.
+    fn set_profiling_enabled(&self, _enabled: bool) {}
+
+    /// Return and reset accumulated executor measurements.
+    ///
+    /// Returns `None` when the executor does not support profiling or profiling
+    /// is disabled.
+    fn take_metrics(&self) -> Option<JobExecutorMetrics> {
+        None
+    }
 
     /// Asynchronously runs all jobs in the executor.
     ///
@@ -874,6 +929,8 @@ pub struct SimpleJobExecutor {
     clock_jobs: RefCell<BTreeMap<JsInstant, Vec<ClockJob>>>,
     generic_jobs: RefCell<VecDeque<GenericJob>>,
     stop: Arc<AtomicBool>,
+    profiling_enabled: Cell<bool>,
+    metrics: RefCell<JobExecutorMetrics>,
 }
 
 impl SimpleJobExecutor {
@@ -943,23 +1000,70 @@ impl JobExecutor for SimpleJobExecutor {
     }
 
     fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
-        future::block_on(self.run_jobs_async(&RefCell::new(context)))
+        future::block_on(
+            self.run_jobs_async_impl(&RefCell::new(context), AsyncWaitMode::ParkWhenIdle),
+        )
+    }
+
+    fn set_profiling_enabled(&self, enabled: bool) {
+        self.profiling_enabled.set(enabled);
+        if !enabled {
+            self.metrics.replace(JobExecutorMetrics::default());
+        }
+    }
+
+    fn take_metrics(&self) -> Option<JobExecutorMetrics> {
+        self.profiling_enabled
+            .get()
+            .then(|| self.metrics.replace(JobExecutorMetrics::default()))
     }
 
     async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()>
     where
         Self: Sized,
     {
+        self.run_jobs_async_impl(context, AsyncWaitMode::Cooperative)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncWaitMode {
+    /// Yield to an embedding-owned executor after every scheduler pass.
+    Cooperative,
+    /// Park the calling thread on the async future group's registered waker
+    /// when no newly queued JavaScript work can run.
+    ParkWhenIdle,
+}
+
+impl SimpleJobExecutor {
+    async fn run_jobs_async_impl(
+        self: Rc<Self>,
+        context: &RefCell<&mut Context>,
+        wait_mode: AsyncWaitMode,
+    ) -> JsResult<()> {
+        let profiling = self.profiling_enabled.get();
+        let run_start = profiling.then(ProfileInstant::now);
+        if profiling {
+            self.metrics.borrow_mut().run_calls += 1;
+        }
         let mut group = FutureGroup::new();
         let mut fr_group = FutureGroup::new();
         loop {
+            if profiling {
+                self.metrics.borrow_mut().scheduler_iterations += 1;
+            }
             if self.stop.load(Ordering::Relaxed) {
                 self.stop.store(false, Ordering::Relaxed);
                 self.clear();
                 return Ok(());
             }
 
-            for job in mem::take(&mut *self.async_jobs.borrow_mut()) {
+            let async_jobs = mem::take(&mut *self.async_jobs.borrow_mut());
+            if profiling {
+                self.metrics.borrow_mut().async_jobs += async_jobs.len();
+            }
+            for job in async_jobs {
                 group.insert(job.call(context));
             }
 
@@ -985,7 +1089,14 @@ impl JobExecutor for SimpleJobExecutor {
                         if !job.cancelled() {
                             match job {
                                 ClockJob::Timeout(job) => {
-                                    if let Err(err) = job.call(&mut context.borrow_mut()) {
+                                    let started = profiling.then(ProfileInstant::now);
+                                    let result = job.call(&mut context.borrow_mut());
+                                    if let Some(started) = started {
+                                        let mut metrics = self.metrics.borrow_mut();
+                                        metrics.clock_jobs += 1;
+                                        metrics.clock_time += started.elapsed();
+                                    }
+                                    if let Err(err) = result {
                                         self.clear();
                                         return Err(err);
                                     }
@@ -993,7 +1104,14 @@ impl JobExecutor for SimpleJobExecutor {
                                 ClockJob::Interval(job) => {
                                     let context = &mut context.borrow_mut();
                                     let now = context.clock().now();
-                                    if let Err(err) = job.call(context) {
+                                    let started = profiling.then(ProfileInstant::now);
+                                    let result = job.call(context);
+                                    if let Some(started) = started {
+                                        let mut metrics = self.metrics.borrow_mut();
+                                        metrics.clock_jobs += 1;
+                                        metrics.clock_time += started.elapsed();
+                                    }
+                                    if let Err(err) = result {
                                         self.clear();
                                         return Err(err);
                                     }
@@ -1020,14 +1138,31 @@ impl JobExecutor for SimpleJobExecutor {
                 }
             }
 
-            if let Some(Err(err)) = future::poll_once(group.next()).await.flatten() {
+            let async_poll_start = profiling.then(ProfileInstant::now);
+            let async_result = future::poll_once(group.next()).await.flatten();
+            if let Some(started) = async_poll_start {
+                let mut metrics = self.metrics.borrow_mut();
+                metrics.async_polls += 1;
+                metrics.async_poll_time += started.elapsed();
+                metrics.async_completions += usize::from(async_result.is_some());
+            }
+            if let Some(Err(err)) = async_result {
                 self.clear();
                 return Err(err);
             }
 
             let jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
             for job in jobs {
-                if let Err(err) = job.call(&mut context.borrow_mut()) {
+                let started = profiling.then(ProfileInstant::now);
+                let result = job.call(&mut context.borrow_mut());
+                if let Some(started) = started {
+                    let elapsed = started.elapsed();
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.promise_jobs += 1;
+                    metrics.promise_time += elapsed;
+                    metrics.slowest_promise_job = metrics.slowest_promise_job.max(elapsed);
+                }
+                if let Err(err) = result {
                     self.clear();
                     return Err(err);
                 }
@@ -1035,15 +1170,41 @@ impl JobExecutor for SimpleJobExecutor {
 
             let jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
             for job in jobs {
-                if let Err(err) = job.call(&mut context.borrow_mut()) {
+                let started = profiling.then(ProfileInstant::now);
+                let result = job.call(&mut context.borrow_mut());
+                if let Some(started) = started {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.generic_jobs += 1;
+                    metrics.generic_time += started.elapsed();
+                }
+                if let Err(err) = result {
                     self.clear();
                     return Err(err);
                 }
             }
             context.borrow_mut().clear_kept_objects();
-            future::yield_now().await;
+
+            if wait_mode == AsyncWaitMode::ParkWhenIdle && self.is_empty() && !group.is_empty() {
+                let wait_start = profiling.then(ProfileInstant::now);
+                let async_result = group.next().await;
+                if let Some(started) = wait_start {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.async_waits += 1;
+                    metrics.async_wait_time += started.elapsed();
+                    metrics.async_completions += usize::from(async_result.is_some());
+                }
+                if let Some(Err(err)) = async_result {
+                    self.clear();
+                    return Err(err);
+                }
+            } else {
+                future::yield_now().await;
+            }
         }
 
+        if let Some(started) = run_start {
+            self.metrics.borrow_mut().wall_time += started.elapsed();
+        }
         Ok(())
     }
 }

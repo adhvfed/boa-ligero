@@ -2,16 +2,117 @@ use std::{
     cell::{Cell, RefCell},
     pin::pin,
     rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    task::{Poll, Waker},
+    time::Duration,
 };
 
 use futures_lite::future;
 
 use crate::{
-    JsValue, TestAction,
+    Context, JsValue, Source, TestAction,
     context::{ContextBuilder, time::FixedClock},
-    job::{GenericJob, JobExecutor, NativeAsyncJob, SimpleJobExecutor},
+    job::{GenericJob, JobExecutor, JobExecutorMetrics, NativeAsyncJob, SimpleJobExecutor},
     run_test_actions_with,
 };
+
+#[test]
+fn default_executor_profiles_jobs_only_when_enabled_and_resets_snapshots() {
+    let mut context = Context::default();
+    assert!(context.take_job_executor_metrics().is_none());
+
+    context.set_job_executor_profiling(true);
+    context
+        .eval(Source::from_bytes(
+            "Promise.resolve(1).then(value => value + 1).then(() => undefined)",
+        ))
+        .expect("enqueue promise reactions");
+    context.run_jobs().expect("drain promise reactions");
+
+    let metrics = context
+        .take_job_executor_metrics()
+        .expect("default executor supports profiling");
+    assert_eq!(metrics.run_calls, 1);
+    assert!(metrics.scheduler_iterations > 0);
+    assert_eq!(metrics.promise_jobs, 2);
+    assert!(metrics.wall_time >= metrics.promise_time);
+
+    assert_eq!(
+        context
+            .take_job_executor_metrics()
+            .expect("profiling remains enabled"),
+        JobExecutorMetrics::default(),
+        "taking a snapshot resets the counters"
+    );
+    context.set_job_executor_profiling(false);
+    assert!(context.take_job_executor_metrics().is_none());
+}
+
+#[test]
+fn synchronous_executor_parks_instead_of_spinning_on_async_jobs() {
+    let mut context = Context::default();
+    context.set_job_executor_profiling(true);
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let waker = Arc::new(Mutex::new(None::<Waker>));
+    let worker = {
+        let ready = Arc::clone(&ready);
+        let waker = Arc::clone(&waker);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            ready.store(true, Ordering::Release);
+            if let Some(waker) = waker.lock().expect("delayed future waker").take() {
+                waker.wake();
+            }
+        })
+    };
+
+    context.enqueue_job(
+        NativeAsyncJob::new({
+            let ready = Arc::clone(&ready);
+            let polls = Arc::clone(&polls);
+            let waker = Arc::clone(&waker);
+            async move |_| {
+                std::future::poll_fn(move |cx| {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    if ready.load(Ordering::Acquire) {
+                        return Poll::Ready(());
+                    }
+                    *waker.lock().expect("delayed future waker") = Some(cx.waker().clone());
+                    if ready.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                Ok(JsValue::undefined())
+            }
+        })
+        .into(),
+    );
+    context.run_jobs().expect("complete delayed async job");
+    worker.join().expect("delayed future worker");
+
+    let metrics = context
+        .take_job_executor_metrics()
+        .expect("profiling snapshot");
+    assert_eq!(metrics.async_jobs, 1);
+    assert_eq!(metrics.async_completions, 1);
+    assert_eq!(metrics.async_waits, 1);
+    assert!(
+        metrics.scheduler_iterations <= 3,
+        "parked execution should not spin the scheduler: {metrics:?}"
+    );
+    assert!(
+        polls.load(Ordering::Relaxed) <= 3,
+        "the delayed future should be polled only around wakeup"
+    );
+}
 
 #[test]
 fn test_async_job_not_blocking_event_loop() {

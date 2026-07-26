@@ -22,7 +22,7 @@ use crate::vm::{CodeBlock, RuntimeLimits, create_function_object_fast};
 use crate::{
     HostDefined, JsNativeError, JsResult, JsString, JsValue, Source, builtins,
     class::{Class, ClassBuilder},
-    job::{JobExecutor, SimpleJobExecutor},
+    job::{JobExecutor, JobExecutorMetrics, SimpleJobExecutor},
     js_string,
     module::{IdleModuleLoader, ModuleLoader, SimpleModuleLoader},
     native_function::NativeFunction,
@@ -527,6 +527,25 @@ impl Context {
     #[inline]
     pub fn run_jobs(&mut self) -> JsResult<()> {
         self.job_executor().run_jobs(self)
+    }
+
+    /// Enable or disable opt-in measurements in the active job executor.
+    ///
+    /// The default executor avoids clock reads while this is disabled. Custom
+    /// executors may ignore the request.
+    #[inline]
+    pub fn set_job_executor_profiling(&self, enabled: bool) {
+        self.job_executor().set_profiling_enabled(enabled);
+    }
+
+    /// Return and reset accumulated measurements from the active job executor.
+    ///
+    /// Returns `None` when profiling is disabled or unsupported by a custom
+    /// executor.
+    #[inline]
+    #[must_use]
+    pub fn take_job_executor_metrics(&self) -> Option<JobExecutorMetrics> {
+        self.job_executor().take_metrics()
     }
 
     /// Abstract operation [`ClearKeptObjects`][clear].
