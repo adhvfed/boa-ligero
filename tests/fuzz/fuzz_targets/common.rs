@@ -26,11 +26,10 @@ impl<'a> Arbitrary<'a> for FuzzData {
 
         let mut ast = StatementList::arbitrary(u)?;
 
-        struct FuzzReplacer<'a, 's, 'u> {
+        struct FuzzReplacer<'s> {
             syms: &'s [Sym],
-            u: &'u mut Unstructured<'a>,
         }
-        impl<'a, 's, 'u, 'ast> VisitorMut<'ast> for FuzzReplacer<'a, 's, 'u> {
+        impl<'s, 'ast> VisitorMut<'ast> for FuzzReplacer<'s> {
             type BreakTy = arbitrary::Error;
 
             // TODO arbitrary strings literals?
@@ -50,7 +49,6 @@ impl<'a> Arbitrary<'a> for FuzzData {
 
         let mut replacer = FuzzReplacer {
             syms: &syms_available,
-            u,
         };
         if let ControlFlow::Break(e) = replacer.visit_statement_list_mut(&mut ast) {
             Err(e)

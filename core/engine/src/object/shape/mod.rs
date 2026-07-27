@@ -269,7 +269,7 @@ impl WeakShape {
     /// The inline cache stores a cached shape's raw heap address alongside a
     /// [`WeakShape`] for liveness verification, and on the hit path performs
     /// the address compare and this liveness check as a single fused step
-    /// (see [`crate::vm::inline_cache::CacheEntry::matches`]). For that to be
+    /// (see `CacheEntry::matches`). For that to be
     /// sound, the GC must clear this ephemeron's `data` slot *before* sweep
     /// frees the strong allocation it points at. If sweep ran first, the
     /// allocator could hand the freed address out to a fresh shape; an IC

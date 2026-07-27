@@ -359,7 +359,7 @@ impl JsValue {
     /// traffic is pure waste.
     ///
     /// The returned [`JsObjectBorrow`] wraps the inner `JsObject` in a
-    /// [`ManuallyDrop`] so the bit-stolen copy doesn't decrement on drop,
+    /// [`std::mem::ManuallyDrop`] so the bit-stolen copy doesn't decrement on drop,
     /// and ties its lifetime to `self` so the borrow can't outlive the
     /// owning `JsValue` (whose `Drop` is what keeps the underlying GC
     /// allocation alive for the duration of the borrow).

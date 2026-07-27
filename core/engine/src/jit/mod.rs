@@ -171,7 +171,7 @@ impl JitBackend {
     /// The emitted `extern "C" fn(*mut Context) -> u64` runs the function's
     /// bytecode by calling each opcode's `extern "C"` shim in program order.
     /// After each op it inspects the returned status:
-    /// - high bit set ([`JIT_BREAK_BIT`]) → the op broke; return it (the caller
+    /// - high bit set (`JIT_BREAK_BIT`) → the op broke; return it (the caller
     ///   reads `vm.jit_pending`);
     /// - else the low bits are the new `frame.pc`: if it equals the statically
     ///   known linear-next pc, fall through to the next op; otherwise a jump was

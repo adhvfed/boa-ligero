@@ -1057,9 +1057,9 @@ impl<'ctx> ByteCompiler<'ctx> {
         );
     }
 
-    /// Operand-level variant of [`emit_get_property_by_name`]. Useful when
+    /// Operand-level variant of [`Self::emit_get_property_by_name`]. Useful when
     /// the caller has a `RegisterOperand` directly (e.g. via
-    /// [`compile_expr_operand`]) and wants to avoid materialising it into a
+    /// [`Self::compile_expr_operand`]) and wants to avoid materialising it into a
     /// temporary `Register` + `Move` pair.
     fn emit_get_property_by_name_op(
         &mut self,
@@ -1107,8 +1107,8 @@ impl<'ctx> ByteCompiler<'ctx> {
         );
     }
 
-    /// Operand-level variant of [`emit_set_property_by_name`]. Pairs with
-    /// [`compile_expr_operand`] so identifier-as-receiver patterns skip the
+    /// Operand-level variant of [`Self::emit_set_property_by_name`]. Pairs with
+    /// [`Self::compile_expr_operand`] so identifier-as-receiver patterns skip the
     /// temp register + Move.
     fn emit_set_property_by_name_op(
         &mut self,

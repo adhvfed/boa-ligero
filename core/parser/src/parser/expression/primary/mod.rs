@@ -480,9 +480,11 @@ where
                     "multiple expressions in parenthesized expression",
                 ));
             }
-            if let InnerExpression::Expression(expression) = &expressions[0] {
+            if let InnerExpression::Expression(expression) =
+                expressions.pop().expect("one expression checked above")
+            {
                 return Ok(ast::Expression::Parenthesized(Parenthesized::new(
-                    expression.clone(),
+                    expression,
                     Span::new(span_start.start(), span.end()),
                 ))
                 .into());

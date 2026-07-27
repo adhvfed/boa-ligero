@@ -167,10 +167,15 @@ fn issue_2609() {
 
 #[test]
 fn to_locale_string() {
+    #[cfg(feature = "intl")]
+    let negative_25 = js_str!("−25");
+    #[cfg(not(feature = "intl"))]
+    let negative_25 = js_str!("-25");
+
     run_test_actions([
         TestAction::assert_eq("Number().toLocaleString()", js_str!("0")),
         TestAction::assert_eq("Number(5).toLocaleString()", js_str!("5")),
-        TestAction::assert_eq("Number(-25).toLocaleString()", js_str!("-25")),
+        TestAction::assert_eq("Number(-25).toLocaleString()", negative_25),
         TestAction::assert_eq("NaN.toLocaleString()", js_str!("NaN")),
         TestAction::assert_eq("Infinity.toLocaleString()", js_str!("Infinity")),
         TestAction::assert_eq("(-Infinity).toLocaleString()", js_str!("-Infinity")),

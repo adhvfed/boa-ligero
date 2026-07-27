@@ -36,7 +36,12 @@ fn main() {
     println!("{str:?}");
 }
 
-/// Converts the value lossly
+/// Converts the value lossily.
+///
+/// The derive macro refers to this function through the string-valued
+/// `from_js_with` attribute, which is not visible to the compiler's dead-code
+/// analysis.
+#[allow(dead_code)]
 fn lossy_conversion(value: &JsValue, _context: &mut Context) -> JsResult<i16> {
     match value.variant() {
         JsVariant::Float64(r) => Ok(r.round() as i16),

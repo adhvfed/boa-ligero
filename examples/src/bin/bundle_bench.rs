@@ -1,12 +1,11 @@
 //! Measures repeated parse and compile time for a local JavaScript bundle.
 //!
 //! Run with:
-//! `cargo run --release --example bundle_bench -- path/to/bundle.js [iterations]`
+//! `cargo run --release -p boa_examples --bin bundle_bench -- path/to/bundle.js [iterations]`
 
 use std::{
     env, fs,
     path::PathBuf,
-    process,
     time::{Duration, Instant},
 };
 
@@ -21,7 +20,7 @@ fn main() {
     let mut args = env::args_os().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
         eprintln!("usage: bundle_bench <bundle.js> [iterations]");
-        process::exit(2);
+        return;
     };
     let iterations = args
         .next()
