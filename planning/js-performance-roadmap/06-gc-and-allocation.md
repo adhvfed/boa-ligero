@@ -1,8 +1,8 @@
 # 06 — GC & allocation (lever #4)
 
 High potential, but high effort and high risk (write barriers touch every
-mutation path), so it sits mid-roadmap. Two distinct sub-problems: *how much we
-allocate* (cheap wins) and *how we collect* (expensive, structural).
+mutation path), so it sits mid-roadmap. Two distinct sub-problems: _how much we
+allocate_ (cheap wins) and _how we collect_ (expensive, structural).
 
 ## Current state (grounded)
 
@@ -11,7 +11,7 @@ allocate* (cheap wins) and *how we collect* (expensive, structural).
 - **Mark-sweep, stop-the-world, non-generational.** Four phases: mark → finalize
   → mark again (resurrection) → sweep (`lib.rs:228`+).
 - **Threshold-triggered** at 1 MB default (`lib.rs:68`), growing dynamically when
-  >70% live after a collection.
+  > 70% live after a collection.
 - **No write barriers.** Allocation is `Box::new` recorded in a `strongs` vector
   (`alloc_gc`, `lib.rs:131`); tracking is purely via `Trace::trace` at mark time.
 - Thread-local (`BOA_GC: RefCell<BoaGc>`).
@@ -36,6 +36,7 @@ Per-operation allocation pressure: object literals allocate a
 ## Plan — cheap wins first
 
 ### 6a. Cut per-call allocation (cheap, do first)
+
 Calls are the hot path ([02](02-call-path.md)); each allocating a
 `Gc<Environment>` is allocation pressure on the most frequent operation.
 Investigate environment reuse / stack allocation for environments that don't
@@ -43,13 +44,15 @@ escape (no closure captures them). This compounds with the call-path work and is
 far cheaper than touching the collector.
 
 ### 6b. Allocation accounting (measurement, do before 6c)
+
 Add a per-site / per-kind allocation counter to `alloc_gc` (`lib.rs:131`),
-gated by env var. Run Octane. This tells you *where* the bytes come from and
+gated by env var. Run Octane. This tells you _where_ the bytes come from and
 whether the GC is even on the critical path for our benchmarks before committing
 to the (large) generational rewrite. Per
 [01-measurement](01-measurement-methodology.md): size the lever first.
 
 ### 6c. Generational nursery + write barrier (structural, expensive)
+
 If 6b shows allocation/collection is a real cost, add a young generation:
 bump-pointer nursery, scavenge on nursery-full, promote survivors, write barrier
 on stores into old-gen objects. This is the big structural win but it's a
@@ -57,9 +60,10 @@ multi-week change that touches every `Gc` store site, and a buggy write barrier
 is a use-after-free. Stage it behind solid GC stress tests.
 
 ### 6d. Incremental / concurrent marking (latency, optional)
+
 The current STW pause scales with live-set size. Incremental marking (process
 the mark queue in slices between interpreter ticks) cuts pause time. This is a
-*latency* win, not throughput — relevant for the browser embedding (smooth
+_latency_ win, not throughput — relevant for the browser embedding (smooth
 frames) more than for the throughput benchmarks. Prioritize per the embedding's
 needs, not the microbenchmark geomean.
 

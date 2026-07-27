@@ -5,7 +5,7 @@ V8," and that has a price tag the interpreter chapters can't pay.
 
 ## The ceiling of Phase 1
 
-Everything in chapters 02–07 is *interpreter-tier* work. Its ceiling is roughly
+Everything in chapters 02–07 is _interpreter-tier_ work. Its ceiling is roughly
 `node --jitless` (Ignition). Phase 1 is worth doing — we're 3.43× away from that
 ceiling and most programs spend their time in the interpreter — but it cannot,
 by construction, match a JIT.
@@ -22,8 +22,8 @@ Concretely (from the literature):
 
 ## Phase 2 — a baseline compiler (only after Phase 1 saturates)
 
-A template/baseline JIT (Sparkplug-style) is the natural next step *once the
-interpreter is saturated*, because:
+A template/baseline JIT (Sparkplug-style) is the natural next step _once the
+interpreter is saturated_, because:
 
 - It reuses Phase 1's inline caches and feedback verbatim — same ICs, just
   emitted as native code instead of interpreted.
@@ -44,7 +44,7 @@ year commitment: an optimizing IR (sea-of-nodes or similar), speculative type
 specialization driven by feedback, inlining, escape analysis, a register
 allocator, and — the hard part — **deoptimization / on-stack replacement** to
 fall back to the interpreter when speculation fails (Hölzle/Ungar; the
-interpreter must be able to *resume* mid-function from JIT state).
+interpreter must be able to _resume_ mid-function from JIT state).
 
 Alternatives that change the calculus:
 

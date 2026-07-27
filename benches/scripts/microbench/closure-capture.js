@@ -3,7 +3,7 @@
 
 function makeAdder(base) {
   let shift = 0;
-  return function(x) {
+  return function (x) {
     shift = shift + 1;
     return x + base + shift;
   };

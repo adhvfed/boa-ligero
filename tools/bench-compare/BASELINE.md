@@ -11,12 +11,12 @@ Captured on 2026-05-19 against Node v25.2.1, Bun (latest), and Boa at commit
 
 ## Headline numbers
 
-| metric                                            | value    |
-|---------------------------------------------------|----------|
-| Boa vs Node `--jitless` — geomean (fair subset)   | **3.43×** slower |
-| Boa vs Node `--jitless` — worst (fair subset)     | 6.55× (method-call-mono) |
-| Boa vs Node `--jitless` — geomean (all 15)        | 6.68× slower (inflated by DCE-suspect benches) |
-| Boa vs Node (full JIT) — geomean (fair subset)    | ~150× slower (expected — that's the JIT gap, not the interpreter gap) |
+| metric                                          | value                                                                 |
+| ----------------------------------------------- | --------------------------------------------------------------------- |
+| Boa vs Node `--jitless` — geomean (fair subset) | **3.43×** slower                                                      |
+| Boa vs Node `--jitless` — worst (fair subset)   | 6.55× (method-call-mono)                                              |
+| Boa vs Node `--jitless` — geomean (all 15)      | 6.68× slower (inflated by DCE-suspect benches)                        |
+| Boa vs Node (full JIT) — geomean (fair subset)  | ~150× slower (expected — that's the JIT gap, not the interpreter gap) |
 
 ## Ignition-parity target
 
@@ -25,6 +25,7 @@ Captured on 2026-05-19 against Node v25.2.1, Bun (latest), and Boa at commit
 > than 2.5×**.
 
 Rationale:
+
 - Node `--jitless` runs only Ignition (the interpreter tier). It is the right
   comparison point — V8 with JIT is a different problem (Phase 2).
 - 1.5× geomean is achievable: we're at 3.43× now, and the remaining
@@ -38,23 +39,23 @@ Rationale:
 
 ## Per-benchmark results
 
-| script                  | boa/jitless | boa/node  | DCE-suspect |
-|-------------------------|------------:|----------:|:-----------:|
-| array-numeric-sum       |       4.41× |    721.9× |             |
-| closure-capture         |       4.31× |    149.9× |             |
-| float-arith             |       1.93× |     12.1× |             |
-| fn-call-flat            |       4.01× |    255.1× |             |
-| global-counter          |       4.87× |    430.2× |             |
-| int-arith               |       1.19× |     49.4× |             |
-| method-call-mono        |       6.55× |    210.3× |             |
-| object-create-literal   |      23.58× |    142.2× |     ✓       |
-| property-mega           |      12.56× |     53.1× |     ✓       |
-| property-mono           |       6.31× |    809.2× |             |
-| property-poly2          |      26.57× |   1591.4× |     ✓       |
-| property-poly4          |       1.76× |     87.1× |             |
-| property-set-mono       |       3.62× |    124.2× |             |
-| recursion-fib           |      25.54× |    426.2× |     ✓       |
-| string-concat           |      52.24× |     25.2× |     ✓       |
+| script                | boa/jitless | boa/node | DCE-suspect |
+| --------------------- | ----------: | -------: | :---------: |
+| array-numeric-sum     |       4.41× |   721.9× |             |
+| closure-capture       |       4.31× |   149.9× |             |
+| float-arith           |       1.93× |    12.1× |             |
+| fn-call-flat          |       4.01× |   255.1× |             |
+| global-counter        |       4.87× |   430.2× |             |
+| int-arith             |       1.19× |    49.4× |             |
+| method-call-mono      |       6.55× |   210.3× |             |
+| object-create-literal |      23.58× |   142.2× |      ✓      |
+| property-mega         |      12.56× |    53.1× |      ✓      |
+| property-mono         |       6.31× |   809.2× |             |
+| property-poly2        |      26.57× |  1591.4× |      ✓      |
+| property-poly4        |       1.76× |    87.1× |             |
+| property-set-mono     |       3.62× |   124.2× |             |
+| recursion-fib         |      25.54× |   426.2× |      ✓      |
+| string-concat         |      52.24× |    25.2× |      ✓      |
 
 ## DCE-suspect benchmarks
 
@@ -69,7 +70,7 @@ inside `main()` despite the harness's XOR-on-return guard.
   than its own jitless mode. The full JIT is clearly eliding the read.
 - `recursion-fib` — jitless 21.3M ns for a meaningfully-sized fib is too fast.
   Possibly Node has a recursion intrinsic, possibly DCE.
-- `string-concat` — jitless 137k ns vs node 283k ns (jitless *faster* than
+- `string-concat` — jitless 137k ns vs node 283k ns (jitless _faster_ than
   full JIT). Almost certainly DCE.
 
 **Action**: these benchmarks need a real sink (e.g., write to a global

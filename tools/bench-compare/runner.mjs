@@ -28,7 +28,9 @@ const code = readFileSync(scriptPath, "utf8");
 (0, eval)(code);
 
 if (typeof main !== "function") {
-  console.error(`script ${scriptPath} did not define a global \`main\` function`);
+  console.error(
+    `script ${scriptPath} did not define a global \`main\` function`,
+  );
   process.exit(3);
 }
 
@@ -44,4 +46,6 @@ for (let i = 0; i < runs; i++) {
 }
 const elapsedNs = Number(hr() - start);
 
-console.log(`elapsed_ns=${elapsedNs} runs=${runs} ns_per_run=${(elapsedNs / runs).toFixed(0)} acc=${acc}`);
+console.log(
+  `elapsed_ns=${elapsedNs} runs=${runs} ns_per_run=${(elapsedNs / runs).toFixed(0)} acc=${acc}`,
+);

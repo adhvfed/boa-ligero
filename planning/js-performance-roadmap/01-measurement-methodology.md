@@ -18,7 +18,7 @@ discipline that every other chapter assumes.
 
 1. **Run at `RUNS=200 WARMUP=30`, not the default.** At RUNS=30–50, individual
    microbenchmarks swing ±15–40% between runs — enough to fake an improvement or
-   hide a regression. We once measured the *same* property-read change as both
+   hide a regression. We once measured the _same_ property-read change as both
    +11% and −5% at low N. At RUNS=200 variance tightens enough to trust a result.
 
    ```
@@ -27,7 +27,7 @@ discipline that every other chapter assumes.
    ```
 
 2. **A/B by binary swap, not by faith.** Build, run 3×; `git stash`; rebuild; run
-   3×; compare *per-script geomeans*. Never trust a single run. A release build
+   3×; compare _per-script geomeans_. Never trust a single run. A release build
    is ~4–5 min, so batch your reps.
 
 3. **Beware dead-code elimination.** Five baseline benchmarks are flagged
@@ -37,20 +37,20 @@ discipline that every other chapter assumes.
    excluded from the parity geomean. Any new benchmark needs a **real sink**
    (XOR the result into an accumulator that's returned/printed).
 
-4. **Don't commit a wash.** If a change doesn't show a *clear* win at high N,
+4. **Don't commit a wash.** If a change doesn't show a _clear_ win at high N,
    revert it — the added complexity isn't worth a tie, and a tie today is a
    maintenance cost forever.
 
 ## Measure the opportunity before paying for the A/B
 
 The expensive part is the release build + timing loop. Before that, ask the
-cheap question: *does this optimization even have work to do on real code?*
+cheap question: _does this optimization even have work to do on real code?_
 
 This is the Move-elision lesson. Instead of two ~5-minute release builds and a
 timing harness, we added a one-line counter to the pass and ran the Octane suite
 once: **19 elision sites across 1017 CodeBlocks.** That number alone killed the
 idea — 19 static sites cannot move a runtime geomean, and the pass adds a
-full-bytecode decode to *every* CodeBlock at compile time. No timing run needed.
+full-bytecode decode to _every_ CodeBlock at compile time. No timing run needed.
 
 Generalize this. For any specialization/cache/rewrite lever:
 
@@ -63,7 +63,7 @@ Generalize this. For any specialization/cache/rewrite lever:
 
 ## Profiling, not just timing
 
-Wall-clock tells you *whether*; a profiler tells you *why* and sizes the lever
+Wall-clock tells you _whether_; a profiler tells you _why_ and sizes the lever
 before you build it.
 
 - **`cargo flamegraph`** / `perf record` on a release `bench-compare-runner` to

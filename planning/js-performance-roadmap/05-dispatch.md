@@ -34,11 +34,11 @@ is wrapped in an `execute_one` closure layer.
 ## Why there may still be something here
 
 Ertl & Gregg (JILP 2003): indirect branches can cost >50% of interpreter
-runtime, and the mispredict rate depends on *how many distinct dispatch sites*
+runtime, and the mispredict rate depends on _how many distinct dispatch sites_
 the predictor sees. A single central indirect call (Boa today) gives the branch
-predictor one site to predict the *next* opcode from — it mispredicts on most
+predictor one site to predict the _next_ opcode from — it mispredicts on most
 opcode→opcode transitions. **Threaded code** replicates the dispatch at the end
-of *each* handler, so the predictor learns pairwise opcode correlations; Berndl
+of _each_ handler, so the predictor learns pairwise opcode correlations; Berndl
 et al.'s context threading (CGO 2005) eliminated ~95% of mispredicts for 30–40%
 runtime. So Boa's central-site design is closer to `switch`'s prediction
 behavior than to true threading — there is a real, but bounded, opportunity.
@@ -46,6 +46,7 @@ behavior than to true threading — there is a real, but bounded, opportunity.
 ## Plan — measure first, then the hard part
 
 ### 5a. Size the lever (do this before anything else)
+
 `perf stat -e branches,branch-misses` (Linux) or Instruments (macOS) on a
 release `bench-compare-runner` running a hot loop. If branch-misses are a small
 fraction of cycles, **stop** — the central indirect call predicts well enough on
@@ -53,6 +54,7 @@ this workload mix and threading isn't worth the friction. If mispredicts are
 significant, proceed.
 
 ### 5b. Reduce per-dispatch overhead (cheap, do regardless)
+
 - The `execute_one` closure wrapper (line 1036) adds a layer around every
   dispatch. Audit what it does (budget/trace/limits) and ensure the
   non-instrumented build path is zero-cost or hoisted out of the loop.
@@ -60,18 +62,21 @@ significant, proceed.
   closure). With the cached `current_frame_ptr`, ensure this is a single load.
 
 ### 5c. Threaded / tail-call dispatch (high friction in Rust)
-True threading wants each handler to *tail-call* the next handler through the
+
+True threading wants each handler to _tail-call_ the next handler through the
 table, removing the central site. Rust's guaranteed tail call (`become`) is
 **unstable**; `#[inline(never)]` + a manual trampoline doesn't get the predictor
 benefit. Realistic paths:
+
 - Wait for / gate behind `become` (explicit tail calls) and structure handlers
   to `become OPCODE_HANDLERS[next](...)`.
 - Or a `musttail`-style approach via a nightly feature, accepting a nightly
   dependency for the perf build.
-This is the genuinely hard, possibly-not-worth-it part. Only attempt if 5a says
-mispredicts are large.
+  This is the genuinely hard, possibly-not-worth-it part. Only attempt if 5a says
+  mispredicts are large.
 
 ### 5d. Superinstructions for hot opcode pairs (optional polish)
+
 Proebsting (POPL 1995): fuse common adjacent opcode sequences (e.g.
 `GetName;Call`, `LdaSmi;Add`) into one handler to amortize dispatch. Ertl/Gregg's
 follow-ups warn the gain is often <2× and sometimes negative from I-cache

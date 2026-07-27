@@ -3,11 +3,11 @@
 > **UPDATE — superseded by `03b`.** The quickening lever this GO recommended was
 > implemented in full and measured an **8% regression** (see
 > `03b-arith-quickening-negative-result.md`). The opportunity below is real, but
-> the PEP-659 *mechanism* doesn't fit Boa's already-inlined interpreter — the
+> the PEP-659 _mechanism_ doesn't fit Boa's already-inlined interpreter — the
 > residual per-op cost is opcode dispatch, not type dispatch. Read 03b first.
 
 **Status:** measurement complete. **Verdict: GO** — the opportunity is large,
-hot, and overwhelmingly monomorphic on real workloads. This is the *opposite* of
+hot, and overwhelmingly monomorphic on real workloads. This is the _opposite_ of
 the move-elision case (19 sites / 1017 blocks → reverted).
 
 This is the cheap "does the lever have work to do?" pass mandated by
@@ -68,8 +68,8 @@ done
 
 ### Microbenches
 
-| workload          | sites | exec      | mono%  | ovf%  | f64%   | other% | int-typed% |
-|-------------------|------:|----------:|-------:|------:|-------:|-------:|-----------:|
+| workload          | sites |      exec |  mono% |  ovf% |   f64% | other% | int-typed% |
+| ----------------- | ----: | --------: | -----: | ----: | -----: | -----: | ---------: |
 | global-counter    |     1 |   200,000 | 100.00 |  0.00 |   0.00 |   0.00 |     100.00 |
 | array-numeric-sum |     4 | 2,000,200 | 100.00 |  0.00 |   0.00 |   0.00 |     100.00 |
 | int-arith         |     6 | 6,000,000 |  77.76 | 11.12 |  11.12 |   0.00 |      88.88 |
@@ -77,25 +77,25 @@ done
 
 ### Octane / V8 benches (real workloads)
 
-| workload      | sites | exec        | mono%  | ovf% | f64%   | other% | int-typed% |
-|---------------|------:|------------:|-------:|-----:|-------:|-------:|-----------:|
-| crypto        |   487 | 462,017,179 |  99.22 | 0.00 |   0.75 |   0.04 |      99.22 |
-| navier-stokes |   189 | 204,329,408 |   8.61 | 0.00 |  91.39 |   0.00 |       8.61 |
-| raytrace      |   152 |  11,461,990 |   1.63 | 0.00 |  95.19 |   3.18 |       1.63 |
-| richards      |    56 |   8,391,784 |  62.76 | 0.00 |   0.00 |  37.24 |      62.76 |
-| deltablue     |    63 |   3,645,045 |  89.06 | 0.00 |   2.14 |   8.80 |      89.06 |
-| splay         |    64 |   6,177,133 |  48.70 | 0.68 |  27.33 |  23.29 |      49.38 |
+| workload      | sites |        exec | mono% | ovf% |  f64% | other% | int-typed% |
+| ------------- | ----: | ----------: | ----: | ---: | ----: | -----: | ---------: |
+| crypto        |   487 | 462,017,179 | 99.22 | 0.00 |  0.75 |   0.04 |      99.22 |
+| navier-stokes |   189 | 204,329,408 |  8.61 | 0.00 | 91.39 |   0.00 |       8.61 |
+| raytrace      |   152 |  11,461,990 |  1.63 | 0.00 | 95.19 |   3.18 |       1.63 |
+| richards      |    56 |   8,391,784 | 62.76 | 0.00 |  0.00 |  37.24 |      62.76 |
+| deltablue     |    63 |   3,645,045 | 89.06 | 0.00 |  2.14 |   8.80 |      89.06 |
+| splay         |    64 |   6,177,133 | 48.70 | 0.68 | 27.33 |  23.29 |      49.38 |
 
 ### Hot-site concentration (real workloads)
 
-| workload      | top-1 | top-5  | top-10 | top-20 |
-|---------------|------:|-------:|-------:|-------:|
-| crypto        |  5.56 |  27.79 |  55.58 |  95.64 |
-| navier-stokes | 10.91 |  54.53 |  68.75 |  76.93 |
-| raytrace      |  6.15 |  30.77 |  48.25 |  68.49 |
-| richards      | 11.95 |  54.55 |  68.09 |  87.68 |
-| deltablue     | 31.63 |  74.63 |  88.63 |  96.15 |
-| splay         | 22.36 |  67.07 |  88.64 |  92.19 |
+| workload      | top-1 | top-5 | top-10 | top-20 |
+| ------------- | ----: | ----: | -----: | -----: |
+| crypto        |  5.56 | 27.79 |  55.58 |  95.64 |
+| navier-stokes | 10.91 | 54.53 |  68.75 |  76.93 |
+| raytrace      |  6.15 | 30.77 |  48.25 |  68.49 |
+| richards      | 11.95 | 54.55 |  68.09 |  87.68 |
+| deltablue     | 31.63 | 74.63 |  88.63 |  96.15 |
+| splay         | 22.36 | 67.07 |  88.64 |  92.19 |
 
 Concentration is high everywhere: **top-20 static sites cover 68–96%** of all
 arith executions. crypto alone has 17 sites each executing 25.7M times at 100%
@@ -115,7 +115,7 @@ Three distinct regimes show up, and that itself is the important finding:
    the single hottest path in the engine.
 
 2. **Float-dominated.** navier-stokes (91% f64), raytrace (95% f64), float-arith.
-   An *i32-only* specialization does nothing for these. But the data argues for a
+   An _i32-only_ specialization does nothing for these. But the data argues for a
    **monomorphic-f64 specialization as well** — these sites are just as hot and
    just as monomorphic (100% f64 at the top sites), they're simply f64 not i32. A
    PEP-659-style design with both `Add_Int` and `Add_F64` quickened forms captures
@@ -124,9 +124,9 @@ Three distinct regimes show up, and that itself is the important finding:
 
 3. **Polymorphic "other".** The `other` bucket is small and explained, not random:
    richards' 37% is `Eq`/`NotEq` against `null`/objects (OO null-checks, not
-   arithmetic), splay's 23% similar. These sites would simply *not quicken* (or
+   arithmetic), splay's 23% similar. These sites would simply _not quicken_ (or
    quicken then deopt once and stay generic) — they don't poison the lever, they're
-   just outside its scope. Critically, almost no site is *mixed* int/f64 churn:
+   just outside its scope. Critically, almost no site is _mixed_ int/f64 churn:
    sites are monomorphic per-PC (the top-site tables show ~100% in a single column),
    which is the precondition that makes PC-keyed quickening work.
 
@@ -147,13 +147,13 @@ move-elision:
   reverted.
 - **adaptive arithmetic:** 50–490 hot static sites per workload, **hundreds of
   millions** of executions, top-20 sites covering 68–96%, and 88–99% monomorphic
-  (i32 *or* f64) on the integer/float-heavy workloads. crypto alone executes 462M
+  (i32 _or_ f64) on the integer/float-heavy workloads. crypto alone executes 462M
   arith ops at 99.2% mono_i32.
 
 There is a real, large, concentrated, monomorphic opportunity. Build the lever.
 
 **Design note (load-bearing):** do **not** ship an i32-only specialization. The
-opportunity splits cleanly into mono-i32 *and* mono-f64 regimes, and the f64 half
+opportunity splits cleanly into mono-i32 _and_ mono-f64 regimes, and the f64 half
 is the entire numeric-heavy Octane suite (navier-stokes, raytrace). A PEP-659
 quickening with at least `{Int, F64}` specialized forms per arith opcode (deopt to
 the generic handler on type mismatch / i32 overflow) captures both. An i32-only

@@ -11,13 +11,14 @@ Boa has good property ICs already; this lever closes the gaps around them.
   (`vm/opcode/get/property.rs:77`, `set/property.rs:73`). 5th distinct shape →
   megamorphic, caching stops. This is solid, modern IC design.
 - **Element access** (`obj[i]`, `GetByValue`/`SetByValue`,
-  `vm/opcode/get/property.rs:130`+): has *ad hoc* fast paths for dense arrays and
+  `vm/opcode/get/property.rs:130`+): has _ad hoc_ fast paths for dense arrays and
   string length, but **no shape-guarded IC**.
 - **Calls**: no IC (covered in [02-call-path](02-call-path.md)).
 
 ## Plan
 
 ### 4a. Element-access inline cache
+
 Give `GetByValue`/`SetByValue` an IC analogous to the by-name PIC: guard on
 (receiver shape, "is dense i32/f64-indexed array"), cache the storage kind, and
 on hit go straight to the backing `Vec` with a bounds check. On miss (sparse,
@@ -26,9 +27,10 @@ prototype-chain hit, proxy, string), fall back. Targets `array-numeric-sum`
 
 This overlaps with [03](03-bytecode-specialization.md)'s adaptive opcodes —
 implement it as a specialized `GetByValueDenseSMIIndex` variant that deopts, so
-the IC *is* the specialization. Pick one framing and reuse the storage.
+the IC _is_ the specialization. Pick one framing and reuse the storage.
 
 ### 4b. Megamorphic handling
+
 Today the 5th shape disables caching for the site. A global megamorphic shape
 cache (keyed by shape→slot across sites) can still serve megamorphic sites
 without per-site storage — V8 does this. Lower priority; only worth it if
@@ -36,8 +38,9 @@ profiling shows hot megamorphic property sites in real workloads (measure with a
 "megamorphic transition" counter on the PIC).
 
 ### 4c. Prototype-chain caching
+
 Method access (`obj.toString`) resolves up the prototype chain. Cache the
-*holder* (where the property was found) and the holder's shape, not just the
+_holder_ (where the property was found) and the holder's shape, not just the
 receiver's, so prototype-method loads hit. This is the substrate the
 [call-path](02-call-path.md) fusion (2d) sits on for `obj.method()`.
 

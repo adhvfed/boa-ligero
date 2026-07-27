@@ -2,7 +2,7 @@
 
 **Why first:** `method-call-mono` is the worst fair benchmark at **6.55×**
 `node --jitless`, and `fn-call-flat` is 4.01×. Unlike a single arithmetic
-opcode, *calls are everywhere* — every method, every closure, every callback —
+opcode, _calls are everywhere_ — every method, every closure, every callback —
 so a win here moves the whole geomean. And the call path today has **no
 specialization at all**.
 
@@ -50,8 +50,7 @@ This is exactly the BASELINE's listed levers "CallFrame restructure",
 
 ## What the literature says
 
-Call sites are the original home of inline caching: Deutsch & Schiffman (POPL
-1984) cached the looked-up method at the call site; Hölzle, Chambers & Ungar
+Call sites are the original home of inline caching: Deutsch & Schiffman (POPL 1984) cached the looked-up method at the call site; Hölzle, Chambers & Ungar
 (ECOOP 1991) generalized to polymorphic inline caches recording multiple
 receiver classes. Every production JS engine has call ICs. The interpreter-tier
 version (no native codegen) is to cache the resolved callee + a guard in the
@@ -65,14 +64,17 @@ each has a cheap opportunity-count check (see
 [01](01-measurement-methodology.md)) before the A/B.
 
 ### 2a. Call-site inline cache for `OrdinaryFunction`
+
 Add an IC slot to the `Call` opcode (mirroring the property PIC in
 `vm/inline_cache/`). Cache: callee object identity (or shape) → its `CodeBlock`
-+ `register_count` + arity. On a hit where the callee is an ordinary function and
-non-proxy/non-bound, **skip `__call__`, the not-callable guard, and the
-`CallValue` resolve**, and jump straight to frame setup. Fall back to the generic
-path on miss/megamorphic.
+
+- `register_count` + arity. On a hit where the callee is an ordinary function and
+  non-proxy/non-bound, **skip `__call__`, the not-callable guard, and the
+  `CallValue` resolve**, and jump straight to frame setup. Fall back to the generic
+  path on miss/megamorphic.
 
 ### 2b. Specialized frame push (`MaybeUninit`, no zero-fill)
+
 The `resize(.., JsValue::undefined())` zero-fills `register_count` slots every
 call. Registers are written before read in well-formed bytecode, so the fill is
 dead work. Options: `MaybeUninit` register window (BASELINE's "`MaybeUninit`
@@ -81,6 +83,7 @@ hot recursion reuses the same backing store. Measure register-fill cost with a
 counter first.
 
 ### 2c. Skip redundant clones in `function_call`
+
 `function_call` clones realm/code/environments (`Gc::clone` = refcount
 inc/dec) on every call. On the IC-hit path these are derivable from the cached
 callee; mirror the "borrowed fast path" pattern already used on IC-hit property
@@ -88,6 +91,7 @@ reads (`as_object_borrowed`) to avoid the refcount traffic. This is the same win
 that landed for property reads, applied to calls.
 
 ### 2d. Fuse `GetProperty` + `Call` for method calls
+
 `obj.m(...)` compiles to a property-get (one IC lookup) followed by a `Call`
 (another dispatch) with intermediate value movement. A fused
 `GetPropertyAndCall` opcode does the method-load IC and the call in one handler,

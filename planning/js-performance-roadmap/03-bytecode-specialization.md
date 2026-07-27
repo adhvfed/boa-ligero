@@ -8,7 +8,7 @@ arithmetic benches.
 
 ## Current state (grounded)
 
-Boa already has *value-level* fast paths but **no per-site type feedback**.
+Boa already has _value-level_ fast paths but **no per-site type feedback**.
 `add_fast`/`sub_fast`/`mul_fast` and the comparison `*_fast` helpers
 (`core/engine/src/value/operations.rs:693` onward) check "are both operands
 i32?" and fall through to f64, then to the fully generic coercion. The binary-op
@@ -21,12 +21,12 @@ string? …" decision a million times, even though the answer never changes.
 ## What the literature says
 
 - **Quickening** — Brunthaler, "Efficient Interpretation using Quickening" (DLS
-  2010): after first execution, rewrite a generic bytecode *in place* to a
+  2010): after first execution, rewrite a generic bytecode _in place_ to a
   type-specialized variant. Pure interpretation, no native codegen.
 - **Inline caching meets quickening** — Brunthaler (ECOOP 2010): cache type info
   in the rewritten bytecode; reported up to ~1.71× on CPython.
 - **CPython 3.11 specializing adaptive interpreter** — Shannon, PEP 659: hot
-  bytecodes carry a counter and specialize into a *family* (`BINARY_OP` →
+  bytecodes carry a counter and specialize into a _family_ (`BINARY_OP` →
   int/float/str variants; `LOAD_ATTR` → cached-shape variant), de-specializing on
   type change. ~half of CPython's ~25% 3.10→3.11 gain is attributed to this.
 
@@ -43,6 +43,7 @@ implement and cheaper to reason about.
 ## Plan
 
 ### 3a. Adaptive arithmetic opcodes
+
 For `Add`/`Sub`/`Mul`/`Div`/`Mod` and the relational/equality ops:
 
 1. Start each site as a generic `Add`.
@@ -57,7 +58,9 @@ Specialized handlers skip the type-dispatch ladder entirely — for `AddSMI`,
 two `as_integer32()` reads, a checked add, overflow → deopt to generic.
 
 ### 3b. Where to store the feedback
+
 Two options, pick after a spike:
+
 - **In-bytecode counter**: a small counter in an inline-data slot adjacent to the
   opcode (CPython's approach). No separate table; cache-local.
 - **Side feedback vector** keyed by PC (V8 Ignition's approach), kept on the
@@ -68,8 +71,10 @@ Boa already maintains per-CodeBlock inline-cache storage for properties
 than inventing a new one.
 
 ### 3c. Extend to name access and element access
+
 `global-counter` (4.87×) is dominated by global name reads/writes;
 `array-numeric-sum` (4.41×) by element reads. Specialize:
+
 - name access to a cached-slot variant (some of this exists —
   `SetNameGlobal` already has an inline-cached write path, commit `5342515c`);
 - element access to a "dense-array, in-bounds, i32 index" variant (see

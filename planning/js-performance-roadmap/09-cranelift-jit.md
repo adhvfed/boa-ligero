@@ -4,7 +4,7 @@
 the ceiling honestly:
 
 - The call-dispatch fast path (lever #1) gave **−7% on `fn-call-flat` but 0% on
-  richards** — call *dispatch* is negligible in real code.
+  richards** — call _dispatch_ is negligible in real code.
 - `method-call-mono` profiling: cost is frame teardown + property ops, **not** the
   register zero-fill (lever 2b would be a wash — `push_frame` was ~54 samples).
 - Arithmetic (lever #2) is near-parity already (`int-arith` 1.19×; i32 `_fast` paths
@@ -14,7 +14,7 @@ the ceiling honestly:
   for throughput.
 
 The conclusion is structural: **the 3.43× real-workload gap is the cost of
-*interpreting* itself** — opcode dispatch, operand decode, per-op `Context`
+_interpreting_ itself** — opcode dispatch, operand decode, per-op `Context`
 threading, frame machinery. You don't close that with more interpreter fast paths;
 you close it by **not interpreting hot code**. That means a JIT.
 
@@ -28,7 +28,7 @@ Hand-writing a multi-arch machine-code backend is the multi-year part. **Craneli
 (the Rust-native codegen backend behind Wasmtime) does register allocation,
 instruction selection, and aarch64/x86-64 for us. We lower Boa bytecode → Cranelift
 IR → native. It even has an optimizing tier, so the same backend serves the baseline
-*and* the specialized tier. This is the force-multiplier that makes a JIT feasible
+_and_ the specialized tier. This is the force-multiplier that makes a JIT feasible
 for a small team.
 
 ## The architecture (grounded in Boa as it exists)
@@ -42,14 +42,14 @@ for a small team.
   stays interpreted; this keeps compile cost off the critical path.
 - **VM-state calling convention (the GC-soundness keystone)**: the JIT'd function has
   signature `extern "C" fn(*mut Context) -> u32` (a status/control word). **It
-  operates on the *same* `vm.stack` register window the interpreter uses** (via
+  operates on the _same_ `vm.stack` register window the interpreter uses** (via
   `fp`/`rp`). Because the GC already traces `vm.stack`, JIT frames need **no new root
   management** — the single biggest integration risk dissolves. Registers are
   read/written through the existing stack, not Cranelift SSA values (except inlined
   fast paths).
 - **Baseline lowering = call-threading**: each bytecode op lowers to a direct native
   call to its existing Rust handler (`Operation::operation`) with operands threaded
-  in. This *reuses every correct slow path* and removes exactly what the interpreter
+  in. This _reuses every correct slow path_ and removes exactly what the interpreter
   pays per op: the central indirect dispatch (`OPCODE_HANDLERS[op]`), the `pc`
   decode/advance, and the `frame()` reload. This is the Sparkplug model.
 - **Control flow**: build a CFG from the bytecode (leaders at jump targets); bytecode
@@ -63,16 +63,16 @@ for a small team.
 
 - **Stage 0 — spike (de-risk).** Cranelift compiles + runs a trivial native fn inside
   Boa's build; then a fn that takes `*mut Context` and calls one real handler.
-  Validates toolchain, platform, and the calling convention. *(task JIT-0)*
+  Validates toolchain, platform, and the calling convention. _(task JIT-0)_
 - **Stage 1 — baseline call-threading JIT + tiering.** Compile a `CodeBlock`, install
   it, run it on the shared stack. A/B vs interpreter on `fn-call-flat` + a loop bench.
-  Target: clearly beat the interpreter; reach ~`--jitless` neighbourhood. *(JIT-1)*
+  Target: clearly beat the interpreter; reach ~`--jitless` neighbourhood. _(JIT-1)_
 
   **Safe-by-construction lowering (decided after the shim layer landed):** do NOT
   classify opcodes as "JIT-safe" via a denylist — missing one control-flow op is a
-  *miscompile*, the worst failure. Instead, emit a linear sequence of shim calls and,
-  after each, check whether `frame.pc` advanced to the *compile-time-known linear
-  next pc*. Three outcomes per op: (a) break → return the stashed `CompletionRecord`;
+  _miscompile_, the worst failure. Instead, emit a linear sequence of shim calls and,
+  after each, check whether `frame.pc` advanced to the _compile-time-known linear
+  next pc_. Three outcomes per op: (a) break → return the stashed `CompletionRecord`;
   (b) continue & pc == linear-next → fall through to the next op; (c) continue & pc
   changed (a jump was taken, or a `Call`/`New` pushed a frame) → **deopt**: return a
   "resume in interpreter" status and let the caller run `Context::run()` (which
@@ -81,14 +81,15 @@ for a small team.
   back to the interpreter. Straight-line leaf code runs entirely in JIT; everything
   else deopts correctly. The shim should return `(break_flag, new_pc)` (e.g. packed in
   a `u64`) so the JIT can do the pc check without re-decoding. Generalize to in-JIT
-  jump/call handling (real CFG, inlined calls) only *after* this safe baseline lands
+  jump/call handling (real CFG, inlined calls) only _after_ this safe baseline lands
   and measures a win. Each JIT-compiled op still needs a test proving the deopt path
   runs for excluded cases (cross-ref the operator-snapshot regression tests).
+
 - **Stage 2 — inline simple ops + IC-fed specialization.** Inline register moves and
   i32 arithmetic as native IR with type guards + deopt (OSR-out to the interpreter at
   the right `pc`). Then use Boa's inline caches (shape→slot, observed types) to emit
   specialized property access, arithmetic, and monomorphic call inlining. **This is
-  where the multiples are.** *(JIT-2)*
+  where the multiples are.** _(JIT-2)_
 - **Stage 3+ — the long tail toward V8.** Inlining heuristics, escape analysis,
   range/representation analysis, on-stack replacement for hot loops. Open-ended.
 
@@ -110,6 +111,6 @@ for a small team.
 ## Validation
 
 Same harness and rigor as the interpreter levers (`tools/bench-compare`, RUNS=200,
-A/B by binary swap, real-workload Octane confirmation). The JIT must show a *real*
+A/B by binary swap, real-workload Octane confirmation). The JIT must show a _real_
 win on real workloads — the bar the interpreter call-path lever failed (richards 0%)
 is exactly the bar the JIT must clear.

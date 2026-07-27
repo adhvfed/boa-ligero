@@ -15,7 +15,7 @@ quadratic, common in real code, and the fix is well-understood and low-risk.
   UTF-16 on the fly. So `s += x` in a loop is **O(n²)** in total length — N
   allocations, each copying the whole accumulated prefix.
 - **Identifier interning** via `Sym` and ~300 static well-known strings
-  (`core/interner/`, `core/string/src/common.rs`). No *runtime* property-key
+  (`core/interner/`, `core/string/src/common.rs`). No _runtime_ property-key
   interning table beyond the static set.
 
 ## What the literature says
@@ -29,6 +29,7 @@ quadratic, common in real code, and the fix is well-understood and low-risk.
 ## Plan
 
 ### 7a. `ConsString` variant for `+`
+
 Add a lazy concatenation node to `JsStringKind`: instead of copying, `+` builds a
 `Cons(left, right)` holding `Gc` handles to the operands and the total length.
 Flatten (materialize a flat Latin1/UTF-16 buffer) lazily on the first operation
@@ -39,12 +40,14 @@ There is already a `Slice` (borrowed-slice) variant in `JsStringKind`
 (`lib.rs:112`) — the lazy-node machinery is a natural sibling.
 
 ### 7b. Keep Latin1 fast paths honest
+
 When flattening or operating, ensure the all-Latin1 case never silently widens to
 UTF-16 (which doubles memory and halves scan throughput). The upgrade in
 `concat_array` (`lib.rs:683`) is correct but should only fire on genuinely
 mixed/non-Latin1 input.
 
 ### 7c. (Optional) runtime property-key interning
+
 If profiling shows dynamic property keys (`obj[computedKey]`) hot, a runtime
 intern table makes key comparison pointer-equality. Lower priority — most
 property access is by static name (already `Sym`-interned).
