@@ -805,9 +805,14 @@ fn using_no_destructuring_object() {
 }
 
 /// Checks that destructuring patterns are rejected for `using` declarations.
+///
+/// Note that `using [a, b] = resource;` is *not* a valid example of the restriction: because
+/// `using` is a contextual keyword, that source is the perfectly legal element access
+/// `using[(a, b)] = resource`, and V8 accepts it. Only bracket sequences that cannot be a member
+/// access — such as the empty `using []` used by test262 — are rejected.
 #[test]
 fn using_no_destructuring_array() {
-    check_invalid_script("using [a, b] = resource;");
+    check_invalid_script("using [] = resource;");
 }
 
 /// Checks that destructuring patterns are rejected for `await using` declarations.
@@ -898,4 +903,96 @@ fn await_using_valid_identifiers() {
         "Failed to parse await using with multiple bindings: {:?}",
         result.err()
     );
+}
+
+/// Asserts that every one of `sources` parses as a script without error.
+#[track_caller]
+fn check_valid_scripts(sources: &[&str]) {
+    for src in sources {
+        let result = Parser::new(Source::from_bytes(src)).parse_script(
+            &boa_ast::scope::Scope::new_global(),
+            &mut Interner::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "expected `{src}` to parse, got {:?}",
+            result.err()
+        );
+    }
+}
+
+/// `using` is a *contextual* keyword, not a reserved word: it is absent from the `ReservedWord`
+/// production, so it must stay usable as an ordinary identifier in every position.
+///
+/// Regression test: `Keyword::Using` was added to the lexer without being added to the
+/// contextual-keyword sets that let `let`/`of`/`async` appear in identifier position, which made
+/// `using` behave as a fully reserved word and rejected ordinary scripts with
+/// `SyntaxError: unexpected token 'using', primary expression`.
+///
+/// More information:
+///  - [ECMAScript specification][spec]
+///
+/// [spec]: https://tc39.es/ecma262/#prod-ReservedWord
+#[test]
+fn using_is_a_contextual_keyword() {
+    check_valid_scripts(&[
+        // Identifier reference in primary-expression position.
+        "var using = 1; using;",
+        "var using = 1; f(using);",
+        "var using = 1; var x = using;",
+        "var using = 1; var a = [using];",
+        "var using = 1; var y = using + 1;",
+        "typeof using;",
+        "var using = 0; using++;",
+        "var using; using = 1;",
+        "function f() { var using = 1; return using; }",
+        // Binding position.
+        "let using = 1; using;",
+        "const using = 1; using;",
+        "function f(using) { return using; }",
+        "try {} catch (using) {}",
+        "for (var using = 0; ; ) { break; }",
+        // Function names.
+        "function using(a) { return a; } using(1);",
+        "var f = function using() {};",
+        "var f = function* using() {};",
+        "var f = async function using() {};",
+        "var f = async function* using() {};",
+        "function using() {} new using();",
+        // Property and method names.
+        "var o = { using: 1 }; o.using;",
+        "var using = 1; var o = { using };",
+        "class C { using() { return 1; } }",
+    ]);
+}
+
+/// A `using` declaration requires its `BindingList` to start on the same line, so `using` alone on
+/// a line is an expression statement naming the identifier `using`.
+///
+/// Mirrors test262 `language/statements/using/syntax/using-declaring-let-split-across-two-lines.js`.
+#[test]
+fn using_declaration_requires_binding_on_same_line() {
+    check_valid_scripts(&["var using, let; { using\nlet = \"s\"; }"]);
+}
+
+/// `using` followed by `[` or `{` is never a declaration: the `BindingList` of a `using`
+/// declaration is parameterized `~Pattern`, so destructuring is not allowed there and the tokens
+/// must be read as an element access / the start of a new statement instead.
+///
+/// Mirrors test262
+/// `language/statements/using/syntax/using-invalid-arraybindingpattern-does-not-break-element-access.js`.
+#[test]
+fn using_element_access_is_not_a_declaration() {
+    check_valid_scripts(&["var using = [], x = 0; { using[x] = null; }"]);
+    // Destructuring patterns stay rejected.
+    check_invalid_script("{ using [] = null; }");
+    check_invalid_script("{ using {} = null; }");
+}
+
+/// In a `for`-`of` head, `using` followed by `of` is always the identifier `using`.
+///
+/// Mirrors test262 `language/statements/using/syntax/using-for-using-of-of.js`.
+#[test]
+fn using_of_of_is_identifier_not_declaration() {
+    check_valid_scripts(&["var using, of = [[9], [8], [7]]; for (using of of [0, 1, 2]) {}"]);
 }

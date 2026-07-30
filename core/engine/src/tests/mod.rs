@@ -28,6 +28,35 @@ fn empty_let_decl_undefined() {
     run_test_actions([TestAction::assert_eq("let a; a", JsValue::undefined())]);
 }
 
+/// `using` declarations are currently lowered as plain lexical bindings (the disposal stack is
+/// still a TODO in the bytecompiler). The declaration-instantiation passes did not create those
+/// bindings at all, so executing a `using` declaration outside a plain block made
+/// `PutLexicalValue` index an empty environment and panicked the whole engine with
+/// `index out of bounds: the len is 0 but the index is 0`.
+#[test]
+fn using_declaration_does_not_panic() {
+    run_test_actions([
+        // Function body.
+        TestAction::assert_eq("(function () { using a = null; return 1; })()", 1),
+        // Script top level.
+        TestAction::assert_eq("using b = null; b", JsValue::null()),
+        // Plain block (already worked, kept as a guard).
+        TestAction::assert_eq("{ using c = null; } 2", 2),
+        // Direct eval.
+        TestAction::assert_eq("eval('using d = null; 3')", 3),
+        // The binding is readable and the initializer's value reaches it.
+        TestAction::assert_eq(
+            "(function () { const r = { x: 7 }; using e = r; return e.x; })()",
+            7,
+        ),
+        // `await using` in an async function body.
+        TestAction::assert_eq(
+            "(async function () { await using f = null; return 4; })() instanceof Promise",
+            true,
+        ),
+    ]);
+}
+
 #[test]
 fn deeply_nested_expression_does_not_overflow_stack() {
     // Regression: deeply nested expressions used to overflow the native stack

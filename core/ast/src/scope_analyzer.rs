@@ -1804,7 +1804,15 @@ fn global_declaration_instantiation(
                         drop(env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
+                // `using`/`await using` are bound here exactly like `let`. Boa's bytecompiler
+                // currently lowers them as plain lexical bindings without a disposal stack, and
+                // omitting them here left the declaration with no binding at all, which made
+                // `PutLexicalValue` index an empty environment and panic.
+                Declaration::Lexical(
+                    LexicalDeclaration::Let(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(env.create_mutable_binding(name, false));
@@ -2228,7 +2236,13 @@ fn function_declaration_instantiation(
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
+                // `using`/`await using` bind like `let`; see the note in
+                // `global_declaration_instantiation`.
+                Declaration::Lexical(
+                    LexicalDeclaration::Let(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(lex_env.create_mutable_binding(name, false));
@@ -2546,7 +2560,13 @@ pub(crate) fn eval_declaration_instantiation_scope(
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
+                // `using`/`await using` bind like `let`; see the note in
+                // `global_declaration_instantiation`.
+                Declaration::Lexical(
+                    LexicalDeclaration::Let(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(lex_env.create_mutable_binding(name, false));

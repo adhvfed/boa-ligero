@@ -185,10 +185,45 @@ pub(crate) fn allowed_token_after_let(token: Option<&Token>) -> bool {
         Some(
             TokenKind::IdentifierName(_)
                 | TokenKind::Keyword((
-                    Keyword::Await | Keyword::Yield | Keyword::Let | Keyword::Async | Keyword::Of,
+                    Keyword::Await
+                        | Keyword::Yield
+                        | Keyword::Let
+                        | Keyword::Async
+                        | Keyword::Of
+                        | Keyword::Using,
                     _
                 ))
                 | TokenKind::Punctuator(Punctuator::OpenBlock | Punctuator::OpenBracket),
+        )
+    )
+}
+
+/// Check if the given token can start the `BindingList` of a `using` declaration.
+///
+/// `using` is a contextual keyword: it only begins a declaration when the next token can start a
+/// `BindingIdentifier`. Unlike `let`, a `using` declaration cannot bind a destructuring pattern
+/// (the `BindingList` is parameterized `~Pattern`), so `{` and `[` are deliberately excluded --
+/// that is what keeps `using[x] = null` an element access and makes `using {} = null` a syntax
+/// error.
+///
+/// More information:
+///  - [ECMAScript specification][spec]
+///
+/// [spec]: https://tc39.es/proposal-explicit-resource-management/#prod-UsingDeclaration
+pub(crate) fn allowed_token_after_using(token: Option<&Token>) -> bool {
+    matches!(
+        token.map(Token::kind),
+        Some(
+            TokenKind::IdentifierName(_)
+                | TokenKind::Keyword((
+                    Keyword::Await
+                        | Keyword::Yield
+                        | Keyword::Let
+                        | Keyword::Async
+                        | Keyword::Of
+                        | Keyword::Using,
+                    _
+                )),
         )
     )
 }

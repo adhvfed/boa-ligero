@@ -138,7 +138,10 @@ where
                                 peek_1,
                                 TokenKind::IdentifierName(_)
                                     | TokenKind::Keyword((
-                                        Keyword::Yield | Keyword::Await | Keyword::Of,
+                                        Keyword::Yield
+                                            | Keyword::Await
+                                            | Keyword::Of
+                                            | Keyword::Using,
                                         _
                                     ))
                             ) && matches!(

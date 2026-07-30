@@ -26,7 +26,10 @@ use self::{
     block::BlockStatement,
     break_stm::BreakStatement,
     continue_stm::ContinueStatement,
-    declaration::{Declaration, ExportDeclaration, ImportDeclaration, allowed_token_after_let},
+    declaration::{
+        Declaration, ExportDeclaration, ImportDeclaration, allowed_token_after_let,
+        allowed_token_after_using,
+    },
     expression::ExpressionStatement,
     if_stm::IfStatement,
     iteration::{DoWhileStatement, ForStatement, WhileStatement},
@@ -426,12 +429,29 @@ where
         let tok = cursor.peek(0, interner).or_abrupt()?;
 
         match tok.kind().clone() {
-            TokenKind::Keyword((
-                Keyword::Function | Keyword::Class | Keyword::Const | Keyword::Using,
-                _,
-            )) => Declaration::new(self.allow_yield, self.allow_await)
-                .parse(cursor, interner)
-                .map(ast::StatementListItem::from),
+            TokenKind::Keyword((Keyword::Function | Keyword::Class | Keyword::Const, _)) => {
+                Declaration::new(self.allow_yield, self.allow_await)
+                    .parse(cursor, interner)
+                    .map(ast::StatementListItem::from)
+            }
+            // `using` is a contextual keyword, not a reserved word. It only starts a
+            // `UsingDeclaration` when it is followed, with no `LineTerminator` in between, by a
+            // token that can begin a `BindingIdentifier`. In every other position it is an
+            // ordinary identifier, so it must fall through to `Statement`.
+            //
+            // Per spec: <https://tc39.es/proposal-explicit-resource-management/#prod-UsingDeclaration>
+            TokenKind::Keyword((Keyword::Using, false))
+                if cursor
+                    .peek_no_skip_line_term(1, interner)?
+                    .is_some_and(|tok| {
+                        tok.kind() != &TokenKind::LineTerminator
+                            && allowed_token_after_using(Some(tok))
+                    }) =>
+            {
+                Declaration::new(self.allow_yield, self.allow_await)
+                    .parse(cursor, interner)
+                    .map(ast::StatementListItem::from)
+            }
             TokenKind::Keyword((Keyword::Let, false))
                 if allowed_token_after_let(cursor.peek(1, interner)?) =>
             {
