@@ -1013,8 +1013,9 @@ fn unwrap_date_time_format(
 
 /// Shared helper used by Date.prototype.toLocaleString,
 /// Date.prototype.toLocaleDateString, and Date.prototype.toLocaleTimeString.
-/// Applies `ToDateTimeOptions` defaults, calls [`create_date_time_format`], and formats
-/// the timestamp via [`format_timestamp_with_dtf`] without allocating a JS object.
+/// Calls [`create_date_time_format`] with the method's required/default component
+/// sets, then formats the timestamp via [`format_timestamp_with_dtf`] without
+/// allocating a JavaScript formatter object.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn format_date_time_locale(
     locales: &JsValue,
@@ -1024,27 +1025,7 @@ pub(crate) fn format_date_time_locale(
     timestamp: f64,
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let options = coerce_options_to_object(options, context)?;
-    if format_type != FormatType::Time
-        && get_option::<DateStyle>(&options, js_string!("dateStyle"), context)?.is_none()
-    {
-        options.create_data_property_or_throw(
-            js_string!("dateStyle"),
-            JsValue::from(js_string!("long")),
-            context,
-        )?;
-    }
-    if format_type != FormatType::Date
-        && get_option::<TimeStyle>(&options, js_string!("timeStyle"), context)?.is_none()
-    {
-        options.create_data_property_or_throw(
-            js_string!("timeStyle"),
-            JsValue::from(js_string!("long")),
-            context,
-        )?;
-    }
-    let options_value = options.into();
-    let dtf = create_date_time_format(locales, &options_value, format_type, defaults, context)?;
+    let dtf = create_date_time_format(locales, options, format_type, defaults, context)?;
     // FormatDateTime steps 1–2: TimeClip and NaN check (format_timestamp_with_dtf does ToLocalTime + format only).
     let x = time_clip(timestamp);
     if x.is_nan() {

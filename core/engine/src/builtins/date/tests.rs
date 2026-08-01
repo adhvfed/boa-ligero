@@ -990,5 +990,57 @@ fn date_proto_to_locale_string_intl() {
         TestAction::assert(
             "new Date(0).toLocaleDateString('en-US', { dateStyle: 'short' }).length > 0",
         ),
+        // Component options are already a complete format request. The Date
+        // methods must not synthesize dateStyle/timeStyle and turn them into an
+        // invalid style-plus-component combination.
+        TestAction::assert(
+            "typeof new Date(Date.UTC(2020, 0, 2, 3, 4, 5)).toLocaleDateString(\
+                'en-US', { timeZone: 'UTC', year: 'numeric', month: 'short', day: 'numeric' }\
+            ) === 'string'",
+        ),
+        TestAction::assert(
+            "typeof new Date(Date.UTC(2020, 0, 2, 3, 4, 5)).toLocaleTimeString(\
+                'en-US', { timeZone: 'UTC', hour: 'numeric', minute: '2-digit' }\
+            ) === 'string'",
+        ),
+        TestAction::assert(
+            "typeof new Date(Date.UTC(2020, 0, 2, 3, 4, 5)).toLocaleString(\
+                'en-US', { timeZone: 'UTC', year: 'numeric', month: 'short', day: 'numeric', \
+                           hour: 'numeric', minute: '2-digit' }\
+            ) === 'string'",
+        ),
+        // Empty option bags use the numeric component defaults required by
+        // each Date method, rather than synthesizing long style options.
+        TestAction::assert(
+            "(() => {\
+                const date = new Date(Date.UTC(2020, 0, 2, 3, 4, 5));\
+                return date.toLocaleDateString('en-US', { timeZone: 'UTC' }) ===\
+                    new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', year: 'numeric', \
+                        month: 'numeric', day: 'numeric' }).format(date);\
+            })()",
+        ),
+        TestAction::assert(
+            "(() => {\
+                const date = new Date(Date.UTC(2020, 0, 2, 3, 4, 5));\
+                return date.toLocaleTimeString('en-US', { timeZone: 'UTC' }) ===\
+                    new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', hour: 'numeric', \
+                        minute: 'numeric', second: 'numeric' }).format(date);\
+            })()",
+        ),
+        TestAction::assert(
+            "(() => {\
+                const date = new Date(Date.UTC(2020, 0, 2, 3, 4, 5));\
+                return date.toLocaleString('en-US', { timeZone: 'UTC' }) ===\
+                    new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', year: 'numeric', \
+                        month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', \
+                        second: 'numeric' }).format(date);\
+            })()",
+        ),
+        // An actually invalid authored combination must continue to throw.
+        TestAction::assert_native_error(
+            "new Date(0).toLocaleDateString('en-US', { dateStyle: 'short', year: 'numeric' })",
+            JsNativeErrorKind::Type,
+            "cannot have explicit format components when timeStyle or dateStyle is defined",
+        ),
     ]);
 }
