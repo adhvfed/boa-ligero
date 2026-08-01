@@ -482,6 +482,24 @@ impl JsObject {
         self.is::<OrdinaryObject>()
     }
 
+    /// Whether this object's property reads use the ordinary internal methods.
+    ///
+    /// Native host data objects commonly use the ordinary vtable without being
+    /// represented by [`OrdinaryObject`]. This narrower predicate lets guarded
+    /// builtin fast paths include them while still excluding proxies and other
+    /// exotic objects.
+    #[inline]
+    #[must_use]
+    pub(crate) fn uses_ordinary_property_reads(&self) -> bool {
+        fn_addr_eq(
+            self.vtable().__get_own_property__,
+            ORDINARY_INTERNAL_METHODS.__get_own_property__,
+        ) && fn_addr_eq(
+            self.vtable().__try_get__,
+            ORDINARY_INTERNAL_METHODS.__try_get__,
+        )
+    }
+
     /// Checks if it's an `Array` object.
     ///
     /// # Examples

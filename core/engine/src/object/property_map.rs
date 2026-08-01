@@ -717,18 +717,87 @@ impl PropertyMap {
         self.indexed_properties = IndexedProperties::DenseElement(properties);
     }
 
-    pub(crate) fn get_dense_property(&self, index: u32) -> Option<JsValue> {
-        let index = index as usize;
+    /// Get an own indexed data property's value without materializing its full
+    /// descriptor. Returns `None` for holes and accessor properties so callers
+    /// can fall back to ordinary lookup and preserve observable behavior.
+    pub(crate) fn get_indexed_data_property(&self, index: u32) -> Option<JsValue> {
         match &self.indexed_properties {
             IndexedProperties::DenseI32(properties) => {
-                properties.get(index).copied().map(JsValue::from)
+                properties.get(index as usize).copied().map(JsValue::from)
             }
             IndexedProperties::DenseF64(properties) => {
-                properties.get(index).copied().map(JsValue::from)
+                properties.get(index as usize).copied().map(JsValue::from)
             }
-            IndexedProperties::DenseElement(properties) => properties.get(index).cloned(),
-            IndexedProperties::SparseProperty(_) | IndexedProperties::SparseElement(_) => None,
+            IndexedProperties::DenseElement(properties) => properties.get(index as usize).cloned(),
+            IndexedProperties::SparseElement(properties) => properties.get(&index).cloned(),
+            IndexedProperties::SparseProperty(properties) => {
+                let descriptor = properties.get(&index)?;
+                if descriptor.is_accessor_descriptor() {
+                    None
+                } else {
+                    Some(descriptor.value().cloned().unwrap_or_default())
+                }
+            }
         }
+    }
+
+    /// Search a contiguous range of own indexed data properties without going
+    /// through the generic internal-method machinery for every element.
+    ///
+    /// Returns `Err((index, scanned))` when the range contains a hole or an
+    /// accessor descriptor. Callers must then resume at `index` through the
+    /// observable generic path so prototype getters and accessors retain their
+    /// exact semantics. A match before a later hole/accessor is final because
+    /// `indexOf` would return before observing that later property too.
+    pub(crate) fn index_of_contiguous_own_data(
+        &self,
+        start: u32,
+        end: u32,
+        search: &JsValue,
+    ) -> Result<(Option<u32>, u64), (u32, u64)> {
+        let mut scanned = 0u64;
+        for index in start..end {
+            let value = match &self.indexed_properties {
+                IndexedProperties::DenseI32(values) => {
+                    let Some(value) = values.get(index as usize) else {
+                        return Err((index, scanned));
+                    };
+                    JsValue::from(*value)
+                }
+                IndexedProperties::DenseF64(values) => {
+                    let Some(value) = values.get(index as usize) else {
+                        return Err((index, scanned));
+                    };
+                    JsValue::from(*value)
+                }
+                IndexedProperties::DenseElement(values) => {
+                    let Some(value) = values.get(index as usize) else {
+                        return Err((index, scanned));
+                    };
+                    value.clone()
+                }
+                IndexedProperties::SparseElement(values) => {
+                    let Some(value) = values.get(&index) else {
+                        return Err((index, scanned));
+                    };
+                    value.clone()
+                }
+                IndexedProperties::SparseProperty(properties) => {
+                    let Some(descriptor) = properties.get(&index) else {
+                        return Err((index, scanned));
+                    };
+                    if descriptor.is_accessor_descriptor() {
+                        return Err((index, scanned));
+                    }
+                    descriptor.value().cloned().unwrap_or_default()
+                }
+            };
+            scanned += 1;
+            if search.strict_equals(&value) {
+                return Ok((Some(index), scanned));
+            }
+        }
+        Ok((None, scanned))
     }
 
     pub(crate) fn set_dense_property(&mut self, index: u32, value: &JsValue) -> bool {

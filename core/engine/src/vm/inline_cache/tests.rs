@@ -567,8 +567,7 @@ fn element_ic_get_shape_miss_falls_back_to_slow_path() -> JsResult<()> {
     Ok(())
 }
 
-/// Non-array receiver: the IC fast path must not fire (receiver is a plain
-/// object, not an array), and the property access must still work correctly.
+/// Ordinary non-array receivers participate in the indexed-data fast path.
 #[test]
 fn element_ic_get_non_array_receiver_works() -> JsResult<()> {
     let context = &mut Context::default();
@@ -587,6 +586,51 @@ fn element_ic_get_non_array_receiver_works() -> JsResult<()> {
         context,
     )?;
     assert_eq!(r.as_string().unwrap(), js_string!("hello"));
+
+    Ok(())
+}
+
+/// Readonly indexed data uses sparse descriptor storage. It can seed the read
+/// IC, but replacing an index with an accessor must still deopt and call it.
+#[test]
+fn element_ic_get_sparse_data_deopts_for_accessor() -> JsResult<()> {
+    let context = &mut Context::default();
+    let function = context.eval(Source::from_bytes("(function (obj, i) { return obj[i]; })"))?;
+    let (function, code) = get_codeblock(&function).unwrap();
+    let object = context.eval(Source::from_bytes(
+        "Object.defineProperties({}, {\
+           0: { value: 10, configurable: true },\
+           1: { value: 20, configurable: true }\
+         })",
+    ))?;
+
+    let first = function.call(
+        &JsValue::undefined(),
+        &[object.clone(), JsValue::from(0_i32)],
+        context,
+    )?;
+    assert_eq!(first, JsValue::from(10_i32));
+    assert_eq!(code.element_ic[0].dense_kind(), Some(DenseKind::SparseData));
+
+    context
+        .global_object()
+        .set(js_string!("sparseTarget"), object.clone(), false, context)?;
+    context.eval(Source::from_bytes(
+        "globalThis.accessorReads = 0;\
+         Object.defineProperty(sparseTarget, 1, { configurable: true,\
+           get() { accessorReads++; return 30; }\
+         });",
+    ))?;
+    let second = function.call(
+        &JsValue::undefined(),
+        &[object, JsValue::from(1_i32)],
+        context,
+    )?;
+    assert_eq!(second, JsValue::from(30_i32));
+    assert_eq!(
+        context.eval(Source::from_bytes("accessorReads"))?,
+        JsValue::from(1_i32)
+    );
 
     Ok(())
 }

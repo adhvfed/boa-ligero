@@ -130,15 +130,16 @@ fn get_by_name<const LENGTH: bool>(
     Ok(())
 }
 
-/// Map the current `IndexedProperties` kind to a [`DenseKind`] discriminant,
-/// or `None` if the storage is sparse (no IC seeding for sparse sites).
+/// Map the current indexed storage to the element-read IC's discriminant.
 #[inline]
-fn indexed_properties_dense_kind(props: &IndexedProperties) -> Option<DenseKind> {
+fn indexed_properties_read_kind(props: &IndexedProperties) -> DenseKind {
     match props {
-        IndexedProperties::DenseI32(_) => Some(DenseKind::DenseI32),
-        IndexedProperties::DenseF64(_) => Some(DenseKind::DenseF64),
-        IndexedProperties::DenseElement(_) => Some(DenseKind::DenseElement),
-        IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => None,
+        IndexedProperties::DenseI32(_) => DenseKind::DenseI32,
+        IndexedProperties::DenseF64(_) => DenseKind::DenseF64,
+        IndexedProperties::DenseElement(_) => DenseKind::DenseElement,
+        IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => {
+            DenseKind::SparseData
+        }
     }
 }
 
@@ -156,12 +157,11 @@ fn get_by_value<const PUSH_KEY: bool>(
     //
     // When the key register already holds a non-negative integer and the
     // object register holds an object whose shape matches the element IC,
-    // call `get_dense_property` directly — skipping `is_array()` (vtable
-    // load), `base_class()` (potential Gc refcount), and `to_property_key`.
+    // read the own indexed data directly — skipping internal-method dispatch,
+    // `base_class()` (potential Gc refcount), and `to_property_key`.
     //
-    // Safety of the deopt: if `get_dense_property` returns `None` (the
-    // index is out-of-bounds, or the storage transitioned to sparse since
-    // the IC was seeded) we simply fall through to the slow path, which
+    // Safety of the deopt: if the property is absent or became an accessor
+    // since the IC was seeded, we simply fall through to the slow path, which
     // produces the correct result. A false-positive IC hit (same shape but
     // now sparse storage) is a performance miss, not a correctness bug.
     {
@@ -177,8 +177,9 @@ fn get_by_value<const PUSH_KEY: bool>(
                 let ic = &context.vm.frame().code_block().element_ic[usize::from(ic_index)];
                 // Shape guard: fused address-equality + liveness check.
                 if ic.matches(obj_borrow.shape()).is_some()
-                    && let Some(element) =
-                        obj_borrow.properties().get_dense_property(raw_key as u32)
+                    && let Some(element) = obj_borrow
+                        .properties()
+                        .get_indexed_data_property(raw_key as u32)
                 {
                     drop(obj_borrow);
                     // For `GetPropertyByValuePush` we must also store
@@ -205,20 +206,21 @@ fn get_by_value<const PUSH_KEY: bool>(
     //       string exotic internal methods.
     match &key_value {
         PropertyKey::Index(index) => {
-            if object.is_array() {
+            if object.uses_ordinary_property_reads() {
                 let object_borrowed = object.borrow();
-                if let Some(element) = object_borrowed.properties().get_dense_property(index.get())
+                if let Some(element) = object_borrowed
+                    .properties()
+                    .get_indexed_data_property(index.get())
                 {
                     // Seed the element IC so the next execution of this site
                     // can hit the fast path above, skipping base_class/to_property_key.
-                    let kind = indexed_properties_dense_kind(
+                    let kind = indexed_properties_read_kind(
                         &object_borrowed.properties().indexed_properties,
                     );
+                    let shape = object_borrowed.shape().clone();
                     drop(object_borrowed);
-                    if let Some(kind) = kind {
-                        let ic = &context.vm.frame().code_block().element_ic[usize::from(ic_index)];
-                        ic.seed(object.borrow().shape(), kind);
-                    }
+                    let ic = &context.vm.frame().code_block().element_ic[usize::from(ic_index)];
+                    ic.seed(&shape, kind);
 
                     if PUSH_KEY {
                         context.vm.set_register(key.into(), key_value.into());

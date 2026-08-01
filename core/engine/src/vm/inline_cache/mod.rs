@@ -19,7 +19,7 @@ pub(crate) const PIC_CAPACITY: usize = 4;
 // Element-access inline cache
 // ---------------------------------------------------------------------------
 
-/// The kind of dense indexed storage observed at an element-access site.
+/// The kind of indexed storage observed at an element-access site.
 ///
 /// Stored in [`ElementIC`] as feedback for both the interpreter fast path
 /// and the JIT Stage 2 specialiser. Knowing that a site always sees
@@ -32,6 +32,8 @@ pub(crate) enum DenseKind {
     DenseF64,
     /// Elements are arbitrary `JsValue`s (stored as `ThinVec<JsValue>`).
     DenseElement,
+    /// Sparse storage whose observed indexed property was a data descriptor.
+    SparseData,
 }
 
 /// The seeded payload of an [`ElementIC`]. Bundled into its own struct so
@@ -48,7 +50,7 @@ struct ElementICEntry {
     /// Weak liveness guard for the cached shape.
     shape: WeakShape,
 
-    /// The kind of dense storage observed when this entry was created.
+    /// The kind of indexed storage observed when this entry was created.
     /// `DenseKind` contains no GC-managed pointers.
     #[unsafe_ignore_trace]
     dense_kind: DenseKind,

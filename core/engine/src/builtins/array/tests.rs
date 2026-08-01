@@ -304,6 +304,48 @@ fn index_of() {
 }
 
 #[test]
+fn index_of_contiguous_own_data_fast_path_preserves_observable_fallbacks() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            const readonly = { length: 3 };
+            Object.defineProperties(readonly, {
+                0: { value: "a", enumerable: true, configurable: true },
+                1: { value: "b", enumerable: true, configurable: true },
+                2: { value: "c", enumerable: true, configurable: true },
+            });
+
+            let accessorReads = 0;
+            const accessor = {
+                length: 3,
+                0: "a",
+                get 1() { accessorReads++; return "b"; },
+                2: "c",
+            };
+
+            const inherited = Object.create({ 1: "b" });
+            inherited.length = 3;
+            inherited[0] = "a";
+            inherited[2] = "c";
+
+            let proxyReads = 0;
+            const proxy = new Proxy({ length: 2, 0: "a", 1: "b" }, {
+                get(target, key, receiver) {
+                    if (key === "1") proxyReads++;
+                    return Reflect.get(target, key, receiver);
+                }
+            });
+        "#}),
+        TestAction::assert_eq("Array.prototype.indexOf.call(readonly, 'b')", 1),
+        TestAction::assert_eq("Array.prototype.indexOf.call(readonly, 'x')", -1),
+        TestAction::assert_eq("Array.prototype.indexOf.call(accessor, 'b')", 1),
+        TestAction::assert_eq("accessorReads", 1),
+        TestAction::assert_eq("Array.prototype.indexOf.call(inherited, 'b')", 1),
+        TestAction::assert_eq("Array.prototype.indexOf.call(proxy, 'b')", 1),
+        TestAction::assert_eq("proxyReads", 1),
+    ]);
+}
+
+#[test]
 fn last_index_of() {
     run_test_actions([
         TestAction::run(indoc! {r#"
@@ -430,6 +472,20 @@ fn search_methods_respect_loop_iteration_limit() {
         ),
         TestAction::assert_runtime_limit_error(
             "Array.prototype.includes.call({ length: 4 }, 'missing')",
+            RuntimeLimitError::LoopIteration,
+        ),
+        TestAction::run(indoc! {r#"
+            const readonlySearchTarget = { length: 4 };
+            Object.defineProperties(readonlySearchTarget, {
+                0: { value: "a" },
+                1: { value: "b" },
+                2: { value: "c" },
+                3: { value: "d" },
+            });
+        "#}),
+        TestAction::assert_eq("Array.prototype.indexOf.call(readonlySearchTarget, 'c')", 2),
+        TestAction::assert_runtime_limit_error(
+            "Array.prototype.indexOf.call(readonlySearchTarget, 'missing')",
             RuntimeLimitError::LoopIteration,
         ),
     ]);

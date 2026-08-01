@@ -1504,6 +1504,48 @@ impl Array {
 
         let search_element = args.get_or_undefined(0);
 
+        // Ordinary objects with a contiguous run of own indexed data can be
+        // scanned directly. This includes Web IDL collection snapshots whose
+        // getter-only indexed properties are correctly stored as readonly
+        // sparse descriptors. Bail out on the first hole or accessor so the
+        // generic path below preserves prototype and user-code observability.
+        // Arrays use an exotic define-own-property method but ordinary indexed
+        // reads, so they are safe under the same guard.
+        if o.uses_ordinary_property_reads()
+            && let (Ok(mut cursor), Ok(end)) = (u32::try_from(k), u32::try_from(len))
+        {
+            // Keep resource-limit enforcement close to the native work. The
+            // bounded chunk allows exact accounting (including early matches)
+            // without permitting a hostile array-like length to trigger an
+            // effectively uninterruptible Rust loop.
+            const SCAN_CHUNK: u32 = 1_024;
+            while cursor < end {
+                let chunk_end = cursor.saturating_add(SCAN_CHUNK).min(end);
+                match o.borrow().properties().index_of_contiguous_own_data(
+                    cursor,
+                    chunk_end,
+                    search_element,
+                ) {
+                    Ok((Some(found), scanned)) => {
+                        context.consume_loop_iterations(scanned)?;
+                        return Ok(JsValue::from(found));
+                    }
+                    Ok((None, scanned)) => {
+                        context.consume_loop_iterations(scanned)?;
+                        cursor = chunk_end;
+                    }
+                    Err((fallback_index, scanned)) => {
+                        context.consume_loop_iterations(scanned)?;
+                        k = i64::from(fallback_index);
+                        break;
+                    }
+                }
+            }
+            if cursor == end {
+                return Ok(JsValue::new(-1));
+            }
+        }
+
         // 10. Repeat, while k < len,
         while k < len {
             // Charge native scans against the same loop limit as ECMAScript loops.
