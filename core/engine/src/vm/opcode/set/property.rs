@@ -10,7 +10,7 @@ use crate::{
         shape::slot::SlotAttributes,
     },
     property::{PropertyDescriptor, PropertyKey},
-    vm::{DenseKind, opcode::Operation},
+    vm::{IndexedKind, opcode::Operation},
 };
 use boa_macros::js_str;
 
@@ -249,14 +249,14 @@ impl Operation for SetPropertyByName {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SetPropertyByValue;
 
-/// Map the current `IndexedProperties` kind to a [`DenseKind`] discriminant,
+/// Map the current `IndexedProperties` kind to an [`IndexedKind`] discriminant,
 /// or `None` if the storage is sparse.
 #[inline]
-fn indexed_properties_dense_kind(props: &IndexedProperties) -> Option<DenseKind> {
+fn indexed_properties_write_kind(props: &IndexedProperties) -> Option<IndexedKind> {
     match props {
-        IndexedProperties::DenseI32(_) => Some(DenseKind::DenseI32),
-        IndexedProperties::DenseF64(_) => Some(DenseKind::DenseF64),
-        IndexedProperties::DenseElement(_) => Some(DenseKind::DenseElement),
+        IndexedProperties::DenseI32(_) => Some(IndexedKind::DenseI32),
+        IndexedProperties::DenseF64(_) => Some(IndexedKind::DenseF64),
+        IndexedProperties::DenseElement(_) => Some(IndexedKind::DenseElement),
         IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => None,
     }
 }
@@ -338,7 +338,7 @@ impl SetPropertyByValue {
                 {
                     // Seed the IC so future same-site same-shape writes can
                     // hit the fast path above without calling to_object.
-                    let kind = indexed_properties_dense_kind(
+                    let kind = indexed_properties_write_kind(
                         &object_borrowed.properties().indexed_properties,
                     );
                     drop(object_borrowed);

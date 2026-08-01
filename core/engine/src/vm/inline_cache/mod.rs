@@ -25,7 +25,7 @@ pub(crate) const PIC_CAPACITY: usize = 4;
 /// and the JIT Stage 2 specialiser. Knowing that a site always sees
 /// `DenseI32` lets the JIT emit a direct `i32` load without a tag check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DenseKind {
+pub(crate) enum IndexedKind {
     /// All elements are `i32` (stored as `ThinVec<i32>`).
     DenseI32,
     /// All elements fit in `f64` (stored as `ThinVec<f64>`).
@@ -51,9 +51,9 @@ struct ElementICEntry {
     shape: WeakShape,
 
     /// The kind of indexed storage observed when this entry was created.
-    /// `DenseKind` contains no GC-managed pointers.
+    /// `IndexedKind` contains no GC-managed pointers.
     #[unsafe_ignore_trace]
-    dense_kind: DenseKind,
+    indexed_kind: IndexedKind,
 }
 
 /// A single-entry inline cache for `GetPropertyByValue` /
@@ -62,7 +62,7 @@ struct ElementICEntry {
 /// ## Design
 ///
 /// Unlike the named-property PIC, element-access ICs are monomorphic: a
-/// site that iterates over one dense array is the overwhelming common case.
+/// site that iterates over one indexed receiver is the overwhelming common case.
 /// When a second (different) receiver shape is observed we overwrite the
 /// entry with the new shape, betting that the most-recent winner is the
 /// future winner too (last-write-wins eviction).
@@ -85,7 +85,7 @@ struct ElementICEntry {
 ///
 /// ## JIT fuel
 ///
-/// [`ElementIC::dense_kind`] exposes the observed storage kind so that JIT
+/// [`ElementIC::indexed_kind`] exposes the observed storage kind so that JIT
 /// Stage 2 can emit a specialised load (e.g. a direct `i32` array read)
 /// without re-profiling element accesses from scratch.
 #[derive(Clone, Debug, Trace, Finalize)]
@@ -114,39 +114,39 @@ impl ElementIC {
     /// the cold (unseeded) case; the address compare short-circuits before
     /// `is_upgradable()` for the wrong-shape case.
     #[inline]
-    pub(crate) fn matches(&self, shape: &Shape) -> Option<DenseKind> {
+    pub(crate) fn matches(&self, shape: &Shape) -> Option<IndexedKind> {
         let entry_ref = self.entry.borrow();
         let entry = entry_ref.as_ref()?;
         if entry.shape_addr == shape.to_addr_usize() && entry.shape.is_upgradable() {
-            Some(entry.dense_kind)
+            Some(entry.indexed_kind)
         } else {
             None
         }
     }
 
-    /// Seed (or overwrite) the IC with the observed `(shape, dense_kind)`.
+    /// Seed (or overwrite) the IC with the observed `(shape, indexed_kind)`.
     ///
-    /// Called on the slow path when the receiver is a dense array. On the
+    /// Called on the slow path when the receiver exposes cacheable indexed data. On the
     /// next execution with the same receiver shape, [`matches`] returns
-    /// `Some(kind)` and the fast path skips the `is_array` vtable check
-    /// and the `base_class` clone.
+    /// `Some(kind)` and the fast path skips generic internal-method dispatch
+    /// and property-key conversion.
     ///
     /// [`matches`]: ElementIC::matches
-    pub(crate) fn seed(&self, shape: &Shape, kind: DenseKind) {
+    pub(crate) fn seed(&self, shape: &Shape, kind: IndexedKind) {
         *self.entry.borrow_mut() = Some(ElementICEntry {
             shape_addr: shape.to_addr_usize(),
             shape: shape.into(),
-            dense_kind: kind,
+            indexed_kind: kind,
         });
     }
 
-    /// Expose the cached dense-storage kind for JIT feedback queries.
+    /// Expose the cached indexed-storage kind for JIT feedback queries.
     ///
     /// Returns `None` when the IC is unseeded.
     #[inline]
     #[allow(dead_code)] // consumed by JIT Stage 2
-    pub(crate) fn dense_kind(&self) -> Option<DenseKind> {
-        self.entry.borrow().as_ref().map(|e| e.dense_kind)
+    pub(crate) fn indexed_kind(&self) -> Option<IndexedKind> {
+        self.entry.borrow().as_ref().map(|e| e.indexed_kind)
     }
 }
 

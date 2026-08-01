@@ -8,7 +8,7 @@ use crate::{
     },
     property::PropertyKey,
     vm::{
-        DenseKind,
+        IndexedKind,
         opcode::{IndexOperand, Operation, RegisterOperand},
     },
 };
@@ -132,13 +132,13 @@ fn get_by_name<const LENGTH: bool>(
 
 /// Map the current indexed storage to the element-read IC's discriminant.
 #[inline]
-fn indexed_properties_read_kind(props: &IndexedProperties) -> DenseKind {
+fn indexed_properties_read_kind(props: &IndexedProperties) -> IndexedKind {
     match props {
-        IndexedProperties::DenseI32(_) => DenseKind::DenseI32,
-        IndexedProperties::DenseF64(_) => DenseKind::DenseF64,
-        IndexedProperties::DenseElement(_) => DenseKind::DenseElement,
+        IndexedProperties::DenseI32(_) => IndexedKind::DenseI32,
+        IndexedProperties::DenseF64(_) => IndexedKind::DenseF64,
+        IndexedProperties::DenseElement(_) => IndexedKind::DenseElement,
         IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => {
-            DenseKind::SparseData
+            IndexedKind::SparseData
         }
     }
 }

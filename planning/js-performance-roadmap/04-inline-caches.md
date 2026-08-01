@@ -10,24 +10,34 @@ Boa has good property ICs already; this lever closes the gaps around them.
   does an address-equality + liveness check with no `Gc` refcount traffic
   (`vm/opcode/get/property.rs:77`, `set/property.rs:73`). 5th distinct shape →
   megamorphic, caching stops. This is solid, modern IC design.
-- **Element access** (`obj[i]`, `GetByValue`/`SetByValue`,
-  `vm/opcode/get/property.rs:130`+): has _ad hoc_ fast paths for dense arrays and
-  string length, but **no shape-guarded IC**.
+- **Element access** (`obj[i]`, `GetByValue`/`SetByValue`): has a monomorphic,
+  shape-guarded `ElementIC`. Reads cover dense i32/f64/value storage and ordinary
+  sparse data descriptors; a missing property or accessor deoptimizes to the
+  generic internal-method path. Writes deliberately seed only dense storage.
+  The cached storage discriminant is named `IndexedKind` because readonly Web IDL
+  collection indices correctly live in sparse descriptor storage.
 - **Calls**: no IC (covered in [02-call-path](02-call-path.md)).
+- **Native array scans**: `Array.prototype.indexOf` has a related guarded fast
+  path for contiguous own indexed data. It excludes proxies and exotic reads,
+  resumes generic lookup at the first hole/accessor, and charges work to the
+  runtime loop limit in bounded chunks (`30cacb9f`).
 
 ## Plan
 
-### 4a. Element-access inline cache
+### 4a. Element-access inline cache — shipped
 
-Give `GetByValue`/`SetByValue` an IC analogous to the by-name PIC: guard on
-(receiver shape, "is dense i32/f64-indexed array"), cache the storage kind, and
-on hit go straight to the backing `Vec` with a bounds check. On miss (sparse,
-prototype-chain hit, proxy, string), fall back. Targets `array-numeric-sum`
-(4.41×) and array-heavy real workloads (raytrace, navier-stokes).
+`GetByValue`/`SetByValue` now have an IC analogous to the by-name PIC: guard on
+receiver shape, cache the indexed-storage kind, and on hit read the backing
+storage directly. Ordinary readonly sparse data participates in the read path;
+prototype-chain hits, proxies, strings, holes, and accessors fall back. Tests pin
+shape changes, out-of-bounds reads, sparse arrays, ordinary non-array receivers,
+and replacement of a cached sparse data property by an accessor.
 
-This overlaps with [03](03-bytecode-specialization.md)'s adaptive opcodes —
-implement it as a specialized `GetByValueDenseSMIIndex` variant that deopts, so
-the IC _is_ the specialization. Pick one framing and reuse the storage.
+The next bounded refactor is measurement, not more receiver classes: add hit,
+miss, and storage-kind counters to the existing benchmark harness, then decide
+from real workloads whether monomorphic last-write-wins remains sufficient or
+whether element sites need the by-name PIC's small polymorphic table. Keep the
+feedback reusable by [03](03-bytecode-specialization.md) and the JIT tier.
 
 ### 4b. Megamorphic handling
 
@@ -48,9 +58,17 @@ receiver's, so prototype-method loads hit. This is the substrate the
 
 - Medium and well-bounded: the by-name PIC already proved the pattern works in
   Boa; this extends its surface.
-- Metrics: `array-numeric-sum`, plus Octane raytrace/navier-stokes (array+float).
+- Metrics: `array-numeric-sum`, plus Octane raytrace/navier-stokes (array+float),
+  `readonly-indexed-scan`, and Ligero's six static-NodeList tampering WPTs.
 - Opportunity check: count element-access sites in Octane that are monomorphic
-  dense-array — if most are (they will be), 4a pays.
+  by observed storage kind; do not assume dense arrays dominate before the
+  counters exist.
+- Current Web IDL result (2026-08-01): the dedicated release microbenchmark runs
+  5,000 `indexOf` scans of 100 readonly entries in 3.72 ms. Ligero's three
+  `indexOf` NodeList WPTs pass in 2.51–2.55 s. The three manual-loop variants
+  reach the unchanged 200-million-instruction budget in about 1.20 s; their
+  remaining problem is bytecode volume/hot-loop tiering, not indexed-property
+  dispatch. Do not raise the limit to turn this performance gap green.
 
 ## Risks
 

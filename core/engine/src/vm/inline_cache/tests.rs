@@ -10,7 +10,7 @@ use crate::{
         shape::slot::SlotAttributes,
     },
     property::{Attribute, PropertyDescriptor, PropertyKey},
-    vm::{CodeBlock, DenseKind},
+    vm::{CodeBlock, IndexedKind},
 };
 
 #[test]
@@ -481,7 +481,7 @@ fn element_ic_get_dense_array_seeds_and_hits() -> JsResult<()> {
 
     assert_eq!(code.element_ic.len(), 1);
     // Before any call: IC is unseeded.
-    assert!(code.element_ic[0].dense_kind().is_none());
+    assert!(code.element_ic[0].indexed_kind().is_none());
 
     // First call: slow path seeds the IC.
     let arr: JsValue = context.eval(Source::from_bytes("[1, 2, 3]"))?;
@@ -492,7 +492,10 @@ fn element_ic_get_dense_array_seeds_and_hits() -> JsResult<()> {
     )?;
     assert_eq!(result, JsValue::from(2_i32));
     // IC should now be seeded with DenseI32 (small integer array).
-    assert_eq!(code.element_ic[0].dense_kind(), Some(DenseKind::DenseI32));
+    assert_eq!(
+        code.element_ic[0].indexed_kind(),
+        Some(IndexedKind::DenseI32)
+    );
 
     // Second call (IC fast path): must return the correct value.
     let result = function.call(
@@ -520,7 +523,7 @@ fn element_ic_get_out_of_bounds_returns_undefined() -> JsResult<()> {
         &[arr.clone(), JsValue::from(0_i32)],
         context,
     )?);
-    assert!(code.element_ic[0].dense_kind().is_some());
+    assert!(code.element_ic[0].indexed_kind().is_some());
 
     // Out-of-bounds: IC hit check passes (same shape), but `get_dense_property`
     // returns `None` → slow path → `undefined`.
@@ -610,7 +613,10 @@ fn element_ic_get_sparse_data_deopts_for_accessor() -> JsResult<()> {
         context,
     )?;
     assert_eq!(first, JsValue::from(10_i32));
-    assert_eq!(code.element_ic[0].dense_kind(), Some(DenseKind::SparseData));
+    assert_eq!(
+        code.element_ic[0].indexed_kind(),
+        Some(IndexedKind::SparseData)
+    );
 
     context
         .global_object()

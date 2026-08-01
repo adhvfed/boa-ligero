@@ -31,7 +31,7 @@ pub(crate) use {
         CodeBlockFlags, Constant, Handler, create_function_object, create_function_object_fast,
     },
     completion_record::CompletionRecord,
-    inline_cache::{DenseKind, ElementIC, InlineCache},
+    inline_cache::{ElementIC, IndexedKind, InlineCache},
 };
 
 pub use runtime_limits::RuntimeLimits;
