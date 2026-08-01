@@ -114,16 +114,29 @@ fn get_by_name<const LENGTH: bool>(
 
     let key: PropertyKey = ic.name.clone().into();
 
+    // Once a site is megamorphic `InlineCache::set` is a no-op. Avoid
+    // retaining the lookup shape in that case so highly polymorphic reads do
+    // not acquire a new slow-path cost.
+    let should_seed_cache = !ic.megamorphic.get();
+
+    // A getter may reconfigure its own property (the common lazy-property
+    // pattern), changing the receiver's shape before `__get__` returns. The
+    // slot reported by the internal method describes the shape at lookup
+    // time, so seed the IC with that shape rather than the post-getter shape.
+    // This clone is confined to cacheable misses; the hit and megamorphic
+    // paths above are unchanged.
+    let lookup_shape = should_seed_cache.then(|| object.borrow().shape().clone());
+
     let context = &mut InternalMethodPropertyContext::new(context);
     let result = object.__get__(&key, receiver.clone(), context)?;
 
     // Cache the property.
     let slot = *context.slot();
-    if slot.is_cacheable() {
+    if slot.is_cacheable()
+        && let Some(lookup_shape) = lookup_shape
+    {
         let ic = &context.vm.frame().code_block.ic[usize::from(index)];
-        let object_borrowed = object.borrow();
-        let shape = object_borrowed.shape();
-        ic.set(shape, slot);
+        ic.set(&lookup_shape, slot);
     }
 
     context.vm.set_register(dst.into(), result);

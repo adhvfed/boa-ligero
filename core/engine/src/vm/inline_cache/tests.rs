@@ -382,6 +382,53 @@ fn get_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
 }
 
 #[test]
+fn getter_that_redefines_itself_seeds_cache_with_lookup_shape() -> JsResult<()> {
+    let context = &mut Context::default();
+    let result = context.eval(Source::from_bytes(
+        r#"
+        function defineLazy(object, key, getter) {
+            Object.defineProperty(object, key, {
+                get() {
+                    const value = getter();
+                    object[key] = value;
+                    return value;
+                },
+                set(value) {
+                    Object.defineProperty(object, key, { value });
+                },
+                configurable: true,
+            });
+        }
+
+        function schema(shape) {
+            const definition = {
+                get shape() {
+                    Object.defineProperty(this, "shape", {
+                        value: { ...shape },
+                        enumerable: true,
+                        configurable: true,
+                    });
+                    return this.shape;
+                },
+            };
+            const instance = { definition };
+            defineLazy(instance, "shape", () => definition.shape);
+            instance.clone = () => ({ ...definition });
+            return instance;
+        }
+
+        const params = schema({ value: "string" });
+        const notification = schema({ params: params.clone() });
+        Object.keys(notification.shape).join(",") + "|" +
+            Object.keys(params.shape).join(",");
+        "#,
+    ))?;
+
+    assert_eq!(result, js_string!("params|value").into());
+    Ok(())
+}
+
+#[test]
 fn test_polymorphic_inline_cache() -> JsResult<()> {
     let context = &mut Context::default();
     let function = context.eval(Source::from_bytes("(function (o) { return o.test; })"))?;
