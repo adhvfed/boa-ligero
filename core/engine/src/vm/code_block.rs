@@ -524,6 +524,12 @@ impl CodeBlock {
             Instruction::DefVar { binding_index } | Instruction::GetLocator { binding_index } => {
                 format!("binding_index:{binding_index}")
             }
+            Instruction::GetLocatorGlobal {
+                binding_index,
+                ic_index,
+            } => {
+                format!("binding_index:{binding_index}, ic_index:{ic_index}")
+            }
             Instruction::DefInitVar { src, binding_index }
             | Instruction::PutLexicalValue { src, binding_index }
             | Instruction::SetName { src, binding_index } => {
@@ -536,6 +542,13 @@ impl CodeBlock {
                 format!("dst:{dst}, binding_index:{binding_index}")
             }
             Instruction::GetNameGlobal {
+                dst,
+                binding_index,
+                ic_index,
+            } => {
+                format!("dst:{dst}, binding_index:{binding_index}, ic_index:{ic_index}")
+            }
+            Instruction::GetNameGlobalAndLocator {
                 dst,
                 binding_index,
                 ic_index,
@@ -951,9 +964,7 @@ impl CodeBlock {
             | Instruction::Reserved54
             | Instruction::Reserved55
             | Instruction::Reserved56
-            | Instruction::Reserved57
-            | Instruction::Reserved58
-            | Instruction::Reserved59 => unreachable!("Reserved opcodes are unreachable"),
+            | Instruction::Reserved57 => unreachable!("Reserved opcodes are unreachable"),
         }
     }
 }

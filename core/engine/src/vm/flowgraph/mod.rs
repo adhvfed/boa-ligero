@@ -190,7 +190,9 @@ impl CodeBlock {
                 | Instruction::PutLexicalValue { .. }
                 | Instruction::GetName { .. }
                 | Instruction::GetNameGlobal { .. }
+                | Instruction::GetNameGlobalAndLocator { .. }
                 | Instruction::GetLocator { .. }
+                | Instruction::GetLocatorGlobal { .. }
                 | Instruction::GetNameAndLocator { .. }
                 | Instruction::GetNameOrUndefined { .. }
                 | Instruction::SetName { .. }

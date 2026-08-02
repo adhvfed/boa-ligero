@@ -43,6 +43,17 @@ pub struct CallFrameLocation {
     pub position: Option<Position>,
 }
 
+/// A binding captured before evaluating an assignment's right-hand side.
+///
+/// Global references can use the inline cache associated with the bytecode
+/// site. Dynamic references retain the resolved locator because a `with` or
+/// direct `eval` may have changed the active environment chain.
+#[derive(Clone, Debug)]
+pub(crate) enum BindingReference {
+    Global { ic_index: u32 },
+    Locator(BindingLocator),
+}
+
 /// A `CallFrame` holds the state of a function call.
 #[derive(Clone, Debug, Finalize, Trace)]
 pub struct CallFrame {
@@ -61,9 +72,10 @@ pub struct CallFrame {
     pub(crate) iterators: ThinVec<IteratorRecord>,
 
     // The stack of bindings being updated.
-    // SAFETY: Nothing in `BindingLocator` requires tracing, so this is safe.
+    // SAFETY: BindingReference only contains BindingLocator data, which does
+    // not require tracing.
     #[unsafe_ignore_trace]
-    pub(crate) binding_stack: ThinVec<BindingLocator>,
+    pub(crate) binding_stack: ThinVec<BindingReference>,
 
     /// How many iterations a loop has done.
     pub(crate) loop_iteration_count: u64,

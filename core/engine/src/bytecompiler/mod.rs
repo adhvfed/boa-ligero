@@ -916,7 +916,13 @@ impl<'ctx> ByteCompiler<'ctx> {
                         ic_index.into(),
                     );
                 }
-                BindingAccessOpcode::GetLocator => self.bytecode.emit_get_locator((*index).into()),
+                BindingAccessOpcode::GetLocator => {
+                    let ic_index = self.ic.len() as u32;
+                    let name = self.bindings[*index as usize].name().clone();
+                    self.ic.push(InlineCache::new(name));
+                    self.bytecode
+                        .emit_get_locator_global((*index).into(), ic_index.into());
+                }
                 BindingAccessOpcode::DefVar => self.bytecode.emit_def_var((*index).into()),
                 BindingAccessOpcode::PutLexicalValue => self
                     .bytecode
@@ -934,9 +940,16 @@ impl<'ctx> ByteCompiler<'ctx> {
                         ic_index.into(),
                     );
                 }
-                BindingAccessOpcode::GetNameAndLocator => self
-                    .bytecode
-                    .emit_get_name_and_locator(value.variable(), (*index).into()),
+                BindingAccessOpcode::GetNameAndLocator => {
+                    let ic_index = self.ic.len() as u32;
+                    let name = self.bindings[*index as usize].name().clone();
+                    self.ic.push(InlineCache::new(name));
+                    self.bytecode.emit_get_name_global_and_locator(
+                        value.variable(),
+                        (*index).into(),
+                        ic_index.into(),
+                    );
+                }
                 BindingAccessOpcode::GetNameOrUndefined => self
                     .bytecode
                     .emit_get_name_or_undefined(value.variable(), (*index).into()),

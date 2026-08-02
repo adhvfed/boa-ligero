@@ -41,6 +41,8 @@ pub use {
     source_info::{NativeSourceInfo, SourcePath},
 };
 
+pub(crate) use call_frame::BindingReference;
+
 pub(crate) use code_block::GlobalFunctionBinding;
 
 mod call_frame;

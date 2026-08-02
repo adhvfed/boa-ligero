@@ -1122,11 +1122,32 @@ generate_opcodes! {
     ///   - Output: dst
     GetNameGlobal { dst: RegisterOperand, binding_index: IndexOperand, ic_index: IndexOperand },
 
+    /// Find a binding in the global object, store its value in dst, and save
+    /// the global reference for the matching assignment.
+    ///
+    /// - Operands:
+    ///   - binding_index: `IndexOperand`
+    ///   - ic_index: `IndexOperand`
+    /// - Registers:
+    ///   - Output: dst
+    GetNameGlobalAndLocator {
+        dst: RegisterOperand,
+        binding_index: IndexOperand,
+        ic_index: IndexOperand
+    },
+
     /// Find a binding on the environment and set the `current_binding` of the current frame.
     ///
     /// - Operands:
     ///   - binding_index: `IndexOperand`
     GetLocator { binding_index: IndexOperand },
+
+    /// Save a global-object binding reference using an inline cache.
+    ///
+    /// - Operands:
+    ///   - binding_index: `IndexOperand`
+    ///   - ic_index: `IndexOperand`
+    GetLocatorGlobal { binding_index: IndexOperand, ic_index: IndexOperand },
 
     /// Find a binding on the environment chain and store its value in dst, and push its
     /// `BindingLocator` to the `bindings_stack`.
@@ -2344,8 +2365,4 @@ generate_opcodes! {
     Reserved56 => Reserved,
     /// Reserved [`Opcode`].
     Reserved57 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved58 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved59 => Reserved,
 }

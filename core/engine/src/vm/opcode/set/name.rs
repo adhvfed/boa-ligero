@@ -5,7 +5,10 @@ use crate::{
     environments::Environment,
     object::{internal_methods::InternalMethodPropertyContext, shape::slot::SlotAttributes},
     property::PropertyKey,
-    vm::opcode::{IndexOperand, Operation, RegisterOperand},
+    vm::{
+        BindingReference,
+        opcode::{IndexOperand, Operation, RegisterOperand},
+    },
 };
 
 /// Try to write `value` into the binding at `binding_index_in_code_block`
@@ -178,7 +181,7 @@ impl SetNameGlobal {
 
     /// Write a binding known to resolve to the global object.
     #[inline(always)]
-    fn set_global(
+    pub(super) fn set_global(
         value: RegisterOperand,
         ic_index: IndexOperand,
         context: &mut Context,
@@ -249,19 +252,27 @@ pub(crate) struct SetNameByLocator;
 impl SetNameByLocator {
     #[inline(always)]
     pub(crate) fn operation(value: RegisterOperand, context: &mut Context) -> JsResult<()> {
-        let frame = context.vm.frame_mut();
-        let strict = frame.code_block.strict();
-        let binding_locator = frame
+        let binding = context
+            .vm
+            .frame_mut()
             .binding_stack
             .pop()
             .js_expect("locator should have been popped before")?;
-        let value = context.vm.get_register(value.into()).clone();
 
-        verify_initialized(&binding_locator, context)?;
+        match binding {
+            BindingReference::Global { ic_index } => {
+                SetNameGlobal::set_global(value, ic_index.into(), context)
+            }
+            BindingReference::Locator(binding_locator) => {
+                let strict = context.vm.frame().code_block.strict();
+                let value = context.vm.get_register(value.into()).clone();
 
-        context.set_binding(&binding_locator, value.clone(), strict)?;
+                verify_initialized(&binding_locator, context)?;
+                context.set_binding(&binding_locator, value, strict)?;
 
-        Ok(())
+                Ok(())
+            }
+        }
     }
 }
 

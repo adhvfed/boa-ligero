@@ -6,7 +6,10 @@ use crate::{
     error::JsNativeError,
     object::{internal_methods::InternalMethodPropertyContext, shape::slot::SlotAttributes},
     property::PropertyKey,
-    vm::opcode::{IndexOperand, Operation, RegisterOperand},
+    vm::{
+        BindingReference,
+        opcode::{IndexOperand, Operation, RegisterOperand},
+    },
 };
 
 /// `GetName` implements the Opcode Operation for `Opcode::GetName`
@@ -185,6 +188,56 @@ impl Operation for GetNameGlobal {
     const COST: u8 = 4;
 }
 
+/// `GetNameGlobalAndLocator` is the global-object version of
+/// [`GetNameAndLocator`]. It keeps the reference in compact form so the
+/// matching `SetNameByLocator` can use the same global property IC.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GetNameGlobalAndLocator;
+
+impl GetNameGlobalAndLocator {
+    #[inline(always)]
+    pub(crate) fn operation(
+        (dst, index, ic_index): (RegisterOperand, IndexOperand, IndexOperand),
+        context: &mut Context,
+    ) -> JsResult<()> {
+        let binding_index = usize::from(index);
+        let ic_index = u32::from(ic_index);
+
+        if context.binding_locator_stable()
+            && context.vm.frame().code_block.bindings[binding_index].is_global()
+        {
+            GetNameGlobal::get_global(dst, ic_index.into(), context)?;
+            context
+                .vm
+                .frame_mut()
+                .binding_stack
+                .push(BindingReference::Global { ic_index });
+            return Ok(());
+        }
+
+        let mut binding_locator = context.vm.frame().code_block.bindings[binding_index].clone();
+        context.find_runtime_binding(&mut binding_locator)?;
+        let result = context.get_binding(&binding_locator)?.ok_or_else(|| {
+            let name = binding_locator.name().to_std_string_escaped();
+            JsNativeError::reference().with_message(format!("{name} is not defined"))
+        })?;
+
+        context
+            .vm
+            .frame_mut()
+            .binding_stack
+            .push(BindingReference::Locator(binding_locator));
+        context.vm.set_register(dst.into(), result);
+        Ok(())
+    }
+}
+
+impl Operation for GetNameGlobalAndLocator {
+    const NAME: &'static str = "GetNameGlobalAndLocator";
+    const INSTRUCTION: &'static str = "INST - GetNameGlobalAndLocator";
+    const COST: u8 = 4;
+}
+
 /// `GetLocator` implements the Opcode Operation for `Opcode::GetLocator`
 ///
 /// Operation:
@@ -199,10 +252,56 @@ impl GetLocator {
             context.vm.frame().code_block.bindings[usize::from(index)].clone();
         context.find_runtime_binding(&mut binding_locator)?;
 
-        context.vm.frame_mut().binding_stack.push(binding_locator);
+        context
+            .vm
+            .frame_mut()
+            .binding_stack
+            .push(BindingReference::Locator(binding_locator));
 
         Ok(())
     }
+}
+
+/// `GetLocatorGlobal` captures a global-object binding for an assignment whose
+/// right-hand side may mutate the environment chain.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GetLocatorGlobal;
+
+impl GetLocatorGlobal {
+    #[inline(always)]
+    pub(crate) fn operation(
+        (index, ic_index): (IndexOperand, IndexOperand),
+        context: &mut Context,
+    ) -> JsResult<()> {
+        let binding_index = usize::from(index);
+        let ic_index = u32::from(ic_index);
+
+        if context.binding_locator_stable()
+            && context.vm.frame().code_block.bindings[binding_index].is_global()
+        {
+            context
+                .vm
+                .frame_mut()
+                .binding_stack
+                .push(BindingReference::Global { ic_index });
+            return Ok(());
+        }
+
+        let mut binding_locator = context.vm.frame().code_block.bindings[binding_index].clone();
+        context.find_runtime_binding(&mut binding_locator)?;
+        context
+            .vm
+            .frame_mut()
+            .binding_stack
+            .push(BindingReference::Locator(binding_locator));
+        Ok(())
+    }
+}
+
+impl Operation for GetLocatorGlobal {
+    const NAME: &'static str = "GetLocatorGlobal";
+    const INSTRUCTION: &'static str = "INST - GetLocatorGlobal";
+    const COST: u8 = 4;
 }
 
 impl Operation for GetLocator {
@@ -233,7 +332,11 @@ impl GetNameAndLocator {
             JsNativeError::reference().with_message(format!("{name} is not defined"))
         })?;
 
-        context.vm.frame_mut().binding_stack.push(binding_locator);
+        context
+            .vm
+            .frame_mut()
+            .binding_stack
+            .push(BindingReference::Locator(binding_locator));
         context.vm.set_register(value.into(), result);
         Ok(())
     }
