@@ -183,8 +183,9 @@ impl Script {
     }
 
     /// Like [`Script::evaluate`], but runs the script through the experimental
-    /// Cranelift JIT tier (`jit` feature). The JIT deopts to the interpreter on
-    /// any control flow, so the result is identical to [`Script::evaluate`].
+    /// Cranelift JIT tier (`jit` feature). Native baseline lowering is used
+    /// when the code block is eligible; the complete shim/interpreter path
+    /// remains the fallback, so the result is identical to [`Script::evaluate`].
     #[cfg(feature = "jit")]
     pub fn evaluate_jit(
         &self,

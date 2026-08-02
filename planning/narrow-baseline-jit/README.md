@@ -1,8 +1,25 @@
 # Narrow baseline JIT
 
-Status: planning. This is the implementation plan for turning Boa's
-experimental Cranelift integration into a small, safe, measurable hot-code
-tier.
+Status: baseline tier implemented; hardening and workload integration remain.
+This directory is the implementation plan and verification contract for
+turning Boa's experimental Cranelift integration into a small, safe,
+measurable hot-code tier.
+
+## Implementation checkpoint — 2026-08-02
+
+The first native baseline slices are now landed behind the opt-in `jit`
+feature. Hot ordinary functions can lower primitive `i32`/`f64` arithmetic and
+comparisons, backward loops, dense integer/floating indexed reads,
+monomorphic data-property reads, and guarded direct calls to ordinary
+JavaScript functions. Native values are materialized at helper, call, and
+deoptimization boundaries; unsupported operations use the existing shim or
+interpreter fallback.
+
+The release warm-loop probe (`jit_loop_perf`) measured 7.62 ms with the native
+baseline versus 54.54 ms in the interpreter on the same machine (0.140 ratio,
+including a separate ~4 ms compile phase during warm-up). This is a synthetic
+signal, not a workload gate; the remaining work is differential hardening,
+guard observability, and browser-shaped cold/warm measurements.
 
 The goal is not to compile all JavaScript immediately. The goal is to compile
 the small set of operations that dominate hot, ordinary functions and loops,
@@ -88,4 +105,3 @@ These decisions are binding for the first implementation sequence:
 The broader rationale remains in the [Cranelift roadmap](../js-performance-roadmap/09-cranelift-jit.md).
 This directory is the more concrete implementation plan for the narrow first
 tier.
-

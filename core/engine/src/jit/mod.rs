@@ -2,14 +2,14 @@
 //!
 //! Staged plan: `planning/js-performance-roadmap/09-cranelift-jit.md`.
 //!
-//! Status: **integration milestone**. The standalone spike (`core/jit`) proved
-//! Cranelift can emit native code and call a host helper through a threaded
-//! opaque pointer. This module proves the next keystone: a JIT-compiled function
-//! can call into `boa_engine` and drive a *real* [`Context`] / VM state — the
-//! foundation the baseline call-threading compiler (JIT-1) builds on.
+//! Status: **narrow baseline tier**. The legacy per-opcode shim remains the
+//! complete fallback, while eligible hot ordinary functions can execute
+//! primitive arithmetic, dense numeric reads, monomorphic data loads, and
+//! guarded ordinary calls as native Cranelift code.
 //!
-//! Nothing here is on the interpreter's hot path yet; it is exercised only by
-//! tests and is gated behind the `jit` feature.
+//! The tier is opt-in through [`Context::enable_jit`] and is gated behind the
+//! `jit` feature. Unsupported operations and failed guards resume at an exact
+//! interpreter bytecode boundary.
 
 use crate::Context;
 use crate::vm::CodeBlock;
@@ -977,34 +977,32 @@ mod tests {
         assert_jit_matches_interp("let n = 0, t = 0; while (n < 100) { t += n; n++; } t", 4950);
     }
 
-    /// Honest first JIT perf measurement on a call-free loop (runs entirely in
-    /// native code — no deopt). Run with:
+    /// Honest first JIT perf measurement on a hot ordinary-function loop. Run with:
     /// `cargo test -p boa_engine --features jit --release jit_loop_perf -- --ignored --nocapture`
     #[test]
     #[ignore = "perf measurement; run manually with --release --nocapture"]
     fn jit_loop_perf() {
-        let src = "let s = 0; for (let i = 0; i < 2000000; i++) { s = s + i; } s";
+        let src = "function sum(n) { var total = 0; for (var i = 0; i < n; i++) { total = total + i; } return total; } var answer = 0; for (var j = 0; j < 1000; j++) { answer = answer + sum(1000); } answer";
 
-        let time = |jit: bool| -> (i32, std::time::Duration) {
+        let time = |jit: bool| -> (i32, std::time::Duration, Option<JitStats>) {
             let mut c = Context::default();
             let script =
                 crate::Script::parse(crate::Source::from_bytes(src), None, &mut c).unwrap();
+            if jit {
+                c.enable_jit();
+            }
             // Warm up compilation/caches by evaluating once via the chosen path.
+            drop(script.evaluate(&mut c).unwrap());
             let start = Instant::now();
-            let v = if jit {
-                let mut backend = JitBackend::new();
-                script.evaluate_jit(&mut c, &mut backend).unwrap()
-            } else {
-                script.evaluate(&mut c).unwrap()
-            };
-            (v.as_i32().unwrap_or(0), start.elapsed())
+            let v = script.evaluate(&mut c).unwrap();
+            (v.as_i32().unwrap_or(0), start.elapsed(), c.jit_stats())
         };
 
-        let (vi, ti) = time(false);
-        let (vj, tj) = time(true);
+        let (vi, ti, _) = time(false);
+        let (vj, tj, stats) = time(true);
         assert_eq!(vi, vj, "jit and interpreter must agree");
         eprintln!(
-            "jit_loop_perf: interpreter={:?} jit={:?} ratio={:.3} (result={vi})",
+            "jit_loop_perf: interpreter={:?} jit={:?} ratio={:.3} stats={stats:?} (result={vi})",
             ti,
             tj,
             tj.as_secs_f64() / ti.as_secs_f64()

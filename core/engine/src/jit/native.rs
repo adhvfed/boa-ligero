@@ -130,7 +130,7 @@ struct RegisterAnalysis {
 fn analyze_registers(
     instructions: &DecodedInstructions,
     register_count: usize,
-) -> RegisterAnalysis {
+) -> Option<RegisterAnalysis> {
     // Register numbers are reused by the bytecode allocator. Track the
     // current definition instead of assigning one type to the whole register
     // number; otherwise an object argument can incorrectly poison a later
@@ -150,17 +150,22 @@ fn analyze_registers(
         before_ids.push(current.clone());
 
         for register in object_operands(instruction) {
-            mark_definition(current[register], &mut definitions);
+            let definition = current.get(register).copied()?;
+            mark_definition(definition, &mut definitions);
         }
         if call_pushes.contains(&index)
             && let Instruction::PushFromRegister { src } = instruction
         {
-            mark_definition(current[usize::from(*src)], &mut definitions);
+            let definition = current.get(usize::from(*src)).copied()?;
+            mark_definition(definition, &mut definitions);
         }
 
         if let Some((register, source, kind)) =
             output_definition(instruction, &current, &definitions)
         {
+            if register >= current.len() {
+                return None;
+            }
             let definition = definitions.len();
             definitions.push(RegisterDefinition { source, kind });
             if let Some(current_definition) = current.get_mut(register) {
@@ -181,10 +186,10 @@ fn analyze_registers(
             .collect()
     };
 
-    RegisterAnalysis {
+    Some(RegisterAnalysis {
         before: before_ids.iter().map(|ids| kinds(ids)).collect(),
         after: after_ids.iter().map(|ids| kinds(ids)).collect(),
-    }
+    })
 }
 
 fn mark_definition(definition: usize, definitions: &mut [RegisterDefinition]) {
@@ -414,7 +419,7 @@ impl<'a> NativeCompiler<'a> {
         instructions: DecodedInstructions,
         mode: NativeMode,
     ) -> Option<Self> {
-        let analysis = analyze_registers(&instructions, code.register_count as usize);
+        let analysis = analyze_registers(&instructions, code.register_count as usize)?;
         Some(Self {
             backend,
             code,
