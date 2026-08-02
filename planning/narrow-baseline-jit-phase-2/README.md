@@ -1,8 +1,10 @@
 # Narrow baseline JIT — Phase 2
 
-Status: proposed implementation plan. Phase 1 is landed behind the opt-in
-`jit` feature; this phase is not an implementation commitment until its
-workload profile and ABI sketches have been reviewed.
+Status: reviewed implementation program, scheduled 2026-08-03. Phase 1 is
+landed behind the opt-in `jit` feature and its first publisher-neutral Ligero
+workload gate has passed. Phase 2 implementation has not started; detailed
+profiling is the next authorized slice, and each new ABI still requires its
+own design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -25,21 +27,44 @@ loop, and guarded ordinary call in native execution for as long as its
 assumptions hold, while retaining exact interpreter fallback at every boundary.
 This is a baseline-tier phase, not an optimizing compiler project.
 
-## Recommended order
+## Evidence already available
 
-1. Add opt-in fallback/coverage observability and profile the actual
-   `ligero-browser` workload plus the existing Boa benchmarks.
-2. Lower the small set of environment, conversion, bitwise, and control-flow
-   operations that prevent real numeric loops from becoming native regions.
-3. Add loop-header OSR for a conservative class of ordinary loops.
-4. Replace native-to-interpreter call transitions with a guarded
-   compiled-to-compiled call/return ABI, without inlining.
-5. Only then move helper-backed element/property reads to direct guarded loads.
-6. Tune tiering, code-cache admission, and cold-start policy using the
-   workload measurements rather than synthetic thresholds.
+The first browser-shaped gate is a useful baseline, not a feature-selection
+profile. Five interleaved fresh-process pairs on 2026-08-02 measured a 44.04 ms
+median interpreter load and 32.24 ms median JIT load, including 1.95 ms median
+compilation. The numeric/DOM fixture produced the same visible checksum and
+paint structure with 999 native entries and zero deoptimizations per JIT run.
+That proves the opt-in integration and cold accounting path; it does not tell
+us whether real bundles are primarily blocked by unsupported bytecode, late
+loop hotness, scheduler call transitions, or helper-backed storage.
 
-The first slice is deliberately measurement-only. It should tell us which of
-steps 2–4 is the largest blocker before any new native ABI is added.
+The finite instruction-budget contract tightened after the first browser
+attempt: budgeted and unbudgeted entries are distinct cache variants, each
+budgeted native bytecode is charged exactly once, and only an audited
+pre-effect guard exit may refund the instruction the interpreter will replay.
+Every Phase 2 entry and exit ABI inherits that rule.
+
+## Evidence-driven order
+
+1. Add bounded, opt-in fallback/coverage observability and profile micro,
+   engine, and actual `ligero-browser` workloads.
+2. Lower only the smallest measured blocker batch needed to expose useful
+   native regions, first deciding whether the current whole-CodeBlock compiler
+   can express the result or explicit region metadata is required.
+3. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
+   helper-backed storage by measured lost time and transition count.
+4. Implement the highest-ranked boundary behind its own ABI review; re-profile
+   before selecting the next boundary rather than assuming the original order.
+5. Apply admission, cache bounds, failure suppression, and cold-start
+   guardrails throughout the program, then tune thresholds after the entry
+   kinds are stable.
+6. Keep direct storage last unless helper attribution proves it dominates and
+   a GC/layout-lifetime review approves the snapshot contract.
+
+The first slice is deliberately measurement-only. OSR and compiled calls are
+alternative evidence-selected branches, not a pre-approved sequence. Both
+remain Phase 2 targets, but either may be deferred with a checked-in profile
+showing that another boundary dominates.
 
 ## Document map
 
@@ -66,4 +91,3 @@ Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
 [verification](../narrow-baseline-jit/05-verification-and-benchmarks.md) are
 normative unless this phase explicitly tightens them.
-

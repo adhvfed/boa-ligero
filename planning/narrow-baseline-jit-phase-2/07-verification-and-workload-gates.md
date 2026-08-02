@@ -111,6 +111,15 @@ At least one browser-shaped workload improves after compilation cost is
 included. The JIT remains opt-in until repeated measurements establish a
 stable cold/warm result.
 
+The 2026-08-02 numeric/DOM fixture satisfies **W0, integration baseline**:
+five interleaved fresh-process pairs improved median cold load by 26.8%, with
+the same sink and paint structure. It does not satisfy **W1, selection
+profile**, because it was deliberately shaped to compile natively and cannot
+rank unsupported bytecode, OSR, call, or storage costs. Before default
+enablement, **W2, representative breadth** requires stable wins or a documented
+neutral result across the agreed bundle/site set, with diagnostics disabled in
+headline timings.
+
 ## Platform matrix
 
 Keep the Phase 1 matrix green:
@@ -127,3 +136,12 @@ Run native JIT tests on supported x86-64 and AArch64 environments. Do not
 assume that function-pointer width, code placement, calling convention, or
 object layout is host-specific only because development runs use Apple
 Silicon.
+
+## Quality and refactoring gate
+
+After every two behavior slices, reserve a refactoring checkpoint for duplicated
+entry/exit metadata, helper ABIs, cache-key construction, and diagnostic reason
+mapping discovered in the preceding work. Refactoring commits must be behavior
+neutral and separately revertible. Formatting plus warning-denying Clippy on
+affected JIT/VM targets is required for each slice; pre-existing wider warnings
+must be recorded rather than silently normalized into a growing baseline.

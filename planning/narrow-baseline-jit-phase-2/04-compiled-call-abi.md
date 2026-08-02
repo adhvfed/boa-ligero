@@ -8,6 +8,11 @@ and useful as a bridge; it is not the steady-state path for tiny functions or
 method-heavy browser code. Phase 2 should remove the interpreter scheduler
 from a matching compiled-callee call without inlining the callee body.
 
+Schedule this ABI only after diagnostics show scheduler call/return round
+trips are a leading cost and report a useful monomorphic hit rate to an already
+compiled target. Call-heavy source alone is not evidence that the compiled
+transition is the bottleneck.
+
 ## Recommended shape
 
 Keep the existing public `extern "C" fn(*mut Context) -> u64` entry contract
@@ -28,6 +33,15 @@ The exact helper signature is an implementation decision, but it must pass a
 stable compiled-entry handle or function pointer plus metadata, not an
 unvalidated `CodeBlock` or raw object pointer. The backend must outlive every
 entry pointer it publishes.
+
+Before implementation, check in an ownership/lifetime sketch for the current
+context-owned backend. The caller currently enters generated code while the
+runtime has the backend mutably borrowed; nested cache lookup or compilation
+cannot reborrow it implicitly. The reviewed design must specify how an entry
+handle is resolved, how backend ownership is temporarily transferred or
+otherwise made re-entrant, and how teardown waits for active native frames. No
+mutable backend borrow may cross generated callee execution, a helper that can
+re-enter the VM, or GC.
 
 The helper may initially perform the frame push/pop and call the entry itself;
 what matters is that it does not return to the general interpreter scheduler
@@ -107,4 +121,3 @@ the interpreter loop.
 
 The call gate requires a warm win on `fn-call-flat` and a method-shaped test,
 with the interpreter result and visible frame behavior unchanged.
-

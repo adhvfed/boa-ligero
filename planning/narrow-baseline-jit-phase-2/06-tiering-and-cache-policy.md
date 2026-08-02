@@ -4,6 +4,12 @@ Phase 2 adds more entry kinds and more assumptions. Without admission and
 lifetime policy, the runtime can spend more time compiling or retaining code
 than it saves executing it.
 
+This is cross-cutting work, not a final cleanup slice. Before adding nonzero-PC
+entries, establish explicit entry kinds, bounded diagnostic cardinality,
+duplicate/failure suppression, and a conservative cache count/byte guard. The
+final slice tunes policy from workload data; it must not be the first time a
+long-lived browser context receives a bound.
+
 ## Entry kinds and keys
 
 Keep one runtime-owned cache, but distinguish entry kinds explicitly:
@@ -92,3 +98,8 @@ suppression, rejected-code suppression, variant replacement, backend drop,
 threshold overrides, cache limits, and cold-start accounting. The policy gate
 is met when the selected threshold wins on the complete workload, not only on
 the hottest inner loop.
+
+The existing `(code debug ID, budget mode)` key is sufficient only for Phase 1
+PC-zero entries. The first Phase 2 artifact with a different entry PC or
+assumption signature must replace that implicit key with a typed runtime-owned
+key and demonstrate that bounded and unbounded budget variants cannot alias.

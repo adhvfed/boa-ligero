@@ -3,7 +3,13 @@
 Keep Phase 2 in small, independently revertible commits. A later ABI slice
 must not be used to hide an earlier measurement or correctness gap.
 
-## Slice 0 — profile before lowering
+## Slice 0 — integration baseline (landed)
+
+The 2026-08-02 Ligero gate established opt-in feature/runtime plumbing, exact
+finite-budget execution, an observable browser sink, and interleaved cold
+measurements. It is W0 evidence only; it must not select the next native ABI.
+
+## Slice 1 — profile before lowering
 
 Add fallback reasons, native coverage, exit/transition counters, and a fixed
 stats snapshot. Run the microbench and the agreed browser-shaped workload.
@@ -17,11 +23,13 @@ Suggested commit:
 test(jit): add native coverage and fallback diagnostics
 ```
 
-## Slice 1 — unblock measured primitive regions
+## Slice 2 — unblock one measured primitive region
 
-Lower the smallest measured batch of environment/constant, integer
-bitwise/conversion, and loop-edge operations. Add exact guards and differential
-tests before adding more opcodes.
+Lower the smallest measured blocker batch. Environment/constant,
+bitwise/conversion, and loop-edge operations are candidates, not a checklist.
+First record whether the current PC-zero whole-CodeBlock compiler can express
+the useful result or whether explicit region identity is required. Add exact
+guards and differential tests before adding more opcodes.
 
 **Stop/go:** the selected primitive benchmark must execute a real native loop;
 if native coverage remains low, inspect the next blocker instead of starting
@@ -34,7 +42,7 @@ perf(jit): lower guarded binding and constant reads
 perf(jit): lower guarded integer conversion and bitwise operations
 ```
 
-## Slice 2 — region stitching
+## Slice 3 — region stitching, only if selected
 
 Represent native regions and unsupported exits explicitly. Make supported
 forward/backward edges stay in Cranelift while preserving exact PC and
@@ -50,11 +58,28 @@ Suggested commit:
 perf(jit): stitch native regions across supported control flow
 ```
 
-## Slice 3 — loop-header OSR
+## Decision checkpoint A — choose the next boundary
+
+Re-run the fixed matrix after Slice 2 or 3 and rank attributable lost time:
+
+1. interpreted one-shot loop work after the PC-zero opportunity;
+2. scheduler round trips to already-compiled monomorphic callees;
+3. property/element helper and guard cost;
+4. compilation, cache, or admission overhead.
+
+Check in the profile and select exactly one of Slices 4A–4C. Do not begin two
+new VM ABIs in parallel. A branch that is not selected remains planned, not
+implicitly approved or rejected.
+
+## Slice 4A — loop-header OSR
 
 Add conservative loop-region keys, safe backedge compile requests, OSR entry
 guards, and exact deoptimization. Prove budget/exception/GC behavior before
 allowing property or call operations in an OSR region.
+
+Before implementation, review the nonzero-PC cache key, materialization map,
+backend ownership at the safe compile boundary, and exact finite-budget charge
+interval.
 
 **Stop/go:** a one-shot hot loop must show OSR execution and pass the full OSR
 test set; otherwise leave OSR disabled and diagnose the materialization gap.
@@ -65,11 +90,12 @@ Suggested commit:
 perf(jit): enter hot loop regions with guarded OSR
 ```
 
-## Slice 4 — compiled ordinary calls
+## Slice 4B — compiled ordinary calls
 
-Implement the VM-owned compiled-call trampoline, target entry metadata, direct
-return continuation, and all fallback paths. Start with one ordinary target
-and no inlining.
+First check in the backend ownership/re-entrancy and active-entry lifetime
+design. Then implement the VM-owned compiled-call trampoline, target entry
+metadata, direct return continuation, and all fallback paths. Start with one
+ordinary target and no inlining.
 
 **Stop/go:** matching calls must reduce scheduler round trips and show a warm
 win; any stack-trace, recursion, exception, or GC discrepancy blocks further
@@ -82,7 +108,7 @@ perf(jit): add compiled ordinary call transition
 test(jit): cover compiled call frames and fallback paths
 ```
 
-## Slice 5 — direct guarded storage loads
+## Slice 4C — direct guarded storage loads
 
 Measure helper cost, then implement direct dense-element or named-data loads
 only for the highest-impact stable snapshot. Keep the helper path as the miss
@@ -97,11 +123,20 @@ Suggested commit:
 perf(jit): inline the measured guarded storage load
 ```
 
-## Slice 6 — admission and workload policy
+## Decision checkpoint B — re-profile
 
-Add region/call entry cache keys, coverage-based admission, repeated-failure
-suppression, cache bounds, and threshold tuning. Run repeated cold/warm
-browser measurements with the sibling workload owner.
+Repeat the same interleaved matrix with diagnostics disabled for headline
+timings and enabled in a separate diagnostic run. Proceed to another 4x branch
+only if its remaining attributable cost exceeds the agreed threshold and the
+first ABI has passed the complete correctness gate.
+
+## Slice 5 — admission and workload policy
+
+Finish coverage-based admission, cache-byte policy, variant retirement, and
+threshold tuning. Typed entry keys, duplicate/failure suppression, and a
+conservative cache bound are prerequisites introduced with the first Phase 2
+entry kind, not deferred until here. Run repeated cold/warm browser
+measurements with the sibling workload owner.
 
 **Stop/go:** keep the JIT opt-in and revert any policy that wins only the hot
 loop while worsening complete workload time.
@@ -125,8 +160,11 @@ cargo test -p boa_engine --lib
 ```
 
 After each completed slice, run the cold/warm benchmark subset and inspect
-diagnostic coverage. After Slices 3–6, run the full Phase 1 feature matrix and
-`cargo test --workspace` before moving to the next ABI boundary.
+diagnostic coverage. After every two behavior slices, schedule a behavior-neutral
+refactoring commit for duplicated helper ABIs, cache-key construction, exit
+mapping, or profiling plumbing exposed by the work. After each 4x ABI branch
+and Slice 5, run the full Phase 1 feature matrix and `cargo test --workspace`
+before moving to the next ABI boundary.
 
 ## Decisions that require explicit review
 

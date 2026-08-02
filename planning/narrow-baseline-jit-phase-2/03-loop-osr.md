@@ -13,6 +13,11 @@ OSR is not a license to reconstruct arbitrary interpreter state. The first
 version should accept only loop headers for which the compiler can prove a
 complete materialization map and a stable frame/environment contract.
 
+Schedule this ABI only after the profile shows material hot work remaining in
+a one-shot frame after its PC-zero entry opportunity has passed. Repeatedly
+called hot functions that already enter through the normal cache do not, by
+themselves, justify OSR.
+
 ## Region identity
 
 An OSR entry is not the same artifact as a function entry. Key it by:
@@ -61,9 +66,11 @@ returns to the interpreter rather than being partially entered.
 At a safe interpreter backedge boundary:
 
 1. record the backedge and inspect the region cache;
-2. if no entry exists, request compilation without borrowing the backend from
-   inside a partially executed helper;
-3. after the current operation completes, compile and install the entry;
+2. if no entry exists, queue a compile request without borrowing the backend
+   from inside a partially executed helper;
+3. after the current operation completes and the VM owns a stable frame
+   boundary, take the backend, compile synchronously, restore ownership, and
+   install the entry;
 4. materialize the live frame state and set the header PC;
 5. run the entry guard against the current frame and feedback signature;
 6. enter native code or continue interpreting on a miss.
@@ -71,6 +78,11 @@ At a safe interpreter backedge boundary:
 The native entry must never assume that the interpreter's previous iteration
 left values in Cranelift registers. Every OSR value comes from the VM stack or
 an explicit helper and is guarded before use.
+
+The design review must show the concrete `Context`/backend ownership path. It
+must not hold a mutable `JitBackend` borrow across a helper, host callback, GC,
+or nested VM execution. Compilation and entry are separate states so a failed
+or over-budget compile cannot accidentally enter a partial artifact.
 
 ## Exit protocol
 
@@ -95,6 +107,12 @@ native span, not only when the loop exits. If a poll throws, stash the
 `CompletionRecord` in traced VM state and return the existing break/budget
 protocol.
 
+Budget accounting must name the charged bytecode interval at entry, each
+backedge, and every exit. A pre-effect guard may refund only the current
+instruction when the interpreter will replay it; completed loop work and
+backedges are never refunded. Differential tests must include exhaustion one
+instruction before, at, and one instruction after each OSR boundary.
+
 Do not OSR across host re-entry, nested `Context::run`, async suspension, or a
 frame whose identity has changed. Those cases remain interpreter boundaries.
 
@@ -112,5 +130,6 @@ Add tests for:
 
 The OSR gate is met only when a loop that cannot receive a second function
 entry shows native execution in stats and remains semantically identical to a
-pure interpreter run.
-
+pure interpreter run. Admission must also reject a loop when estimated
+remaining work cannot amortize synchronous compilation; the diagnostic record
+must distinguish that decision from unsupported compilation.

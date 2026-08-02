@@ -78,6 +78,14 @@ guarded helper or deopt.
 
 ## Region selection
 
+Before changing the compiler, record an architecture checkpoint: Phase 1
+currently caches and invokes a whole-CodeBlock entry beginning at PC zero. If
+the selected blocker batch can make that entry useful, extend the existing
+compiler first. If profitable work lies behind an unsupported prefix or needs
+nonzero entry PCs, approve explicit region identity, entry maps, and exit maps
+before lowering more opcodes. Do not smuggle a second compiler architecture in
+as an incidental opcode patch.
+
 Prefer a measured hot region over whole-function rejection:
 
 1. decode and validate the complete CodeBlock;
@@ -91,6 +99,12 @@ The first implementation may still compile a whole CodeBlock when it is
 simple, but its metadata should model regions so OSR and later variants do not
 need a second compiler architecture.
 
+Before adding binding specialization, identify the existing VM-owned binding
+identity and invalidation signal. If Boa has no suitable versioned contract,
+the slice must first design and test one with environment mutation, deletion,
+direct eval, and realm teardown. A JIT-only counter or raw environment pointer
+is not an acceptable substitute.
+
 ## Done criteria
 
 - `int-arith`, `float-arith`, and `array-numeric-sum` either show native
@@ -101,4 +115,3 @@ need a second compiler architecture.
   interpreter;
 - native coverage and first-blocker data are visible in the diagnostic stats;
 - JIT-off builds and Phase 1 tests are unchanged.
-

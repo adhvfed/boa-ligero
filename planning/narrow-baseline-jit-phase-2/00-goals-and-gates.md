@@ -16,21 +16,24 @@ the amount of hot work that executes natively and decreasing the number of
 native/interpreter transitions, while keeping the interpreter authoritative for
 all unsupported or invalidated behavior.
 
-Phase 2 is successful when it can demonstrate all of the following:
+Phase 2's core is successful when it can demonstrate all of the following:
 
 1. A workload profile identifies why code blocks fail native compilation or
    leave native execution, by opcode/region/PC and guard family.
 2. The common operations that block the selected hot loops lower to native IR
    or to reviewed helpers with exact deopt behavior; they no longer cause the
    entire useful region to become shim-only.
-3. A hot eligible loop can enter a compiled loop region from an already-running
-   frame at an exact bytecode boundary, including materialized state and
-   runtime-limit accounting.
-4. A guarded ordinary function can call an already-compiled ordinary callee
-   without returning through the interpreter scheduler for the normal hit
-   path; misses and all other call kinds retain the existing fallback.
+3. A measured decision record ranks OSR, compiled calls, and direct guarded
+   storage by attributable workload cost and names the next ABI slice.
+4. Every selected continuity boundary preserves exact PCs, visible frames,
+   finite instruction budgets, exceptions, GC roots, and interpreter replay.
 5. The resulting tier improves at least one browser-shaped workload after
    compilation cost is included, with no unacceptable cold-start regression.
+
+OSR and compiled calls retain independent gates below. Phase 2 may implement
+both, but neither is automatically a prerequisite for the other. A gate can be
+deferred only with a checked-in profile showing that it is not material to the
+agreed workload set; absence of evidence is not a deferral decision.
 
 ## In scope
 
@@ -99,7 +102,8 @@ Stop the current slice and investigate if:
 The gates are comparative and workload-based:
 
 - **Profile gate:** the top native blockers and transition costs are measured
-  on at least one browser-shaped workload before new lowering is selected.
+  across micro controls, an engine workload, and at least one browser-shaped
+  workload before new lowering is selected.
 - **Coverage gate:** the selected numeric/array/property workload executes a
   substantial hot region natively rather than merely compiling a shim entry;
   the exact coverage target is recorded with the profile, not guessed here.
@@ -109,7 +113,8 @@ The gates are comparative and workload-based:
   native hit path; mismatches, recursion, exceptions, and host calls remain
   correct.
 - **Workload gate:** at least one browser-shaped workload wins after compile
-  cost, and no agreed cold-start guardrail is violated.
+  cost, and no agreed cold-start guardrail is violated. The 2026-08-02 numeric
+  DOM fixture is the integration baseline; a broader bundle/site workload is
+  required before default enablement can be considered.
 - **Regression gate:** JIT-off behavior and all Phase 1 differential tests stay
   green.
-
