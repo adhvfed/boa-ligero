@@ -260,6 +260,21 @@ impl Stack {
         Some(value)
     }
 
+    /// Check whether the operand stack top is a JavaScript number without
+    /// consuming it. Native numeric lowering uses this as a pre-mutation guard.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_top_is_number(&self) -> bool {
+        self.stack.last().is_some_and(JsValue::is_number)
+    }
+
+    /// Pop a JavaScript number as an `f64`, preserving the stack on failure.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_pop_f64(&mut self) -> Option<f64> {
+        let value = self.stack.last().and_then(JsValue::as_number)?;
+        self.stack.pop();
+        Some(value)
+    }
+
     /// Pop the function arguments according to the calling convention.
     /// This will pop the last `argument_count` values from the stack.
     pub(crate) fn calling_convention_pop_arguments(

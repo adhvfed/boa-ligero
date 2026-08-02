@@ -11,17 +11,18 @@ use crate::{Context, JsValue};
 
 use super::{JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitExit, JitExitKind};
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module};
 
-/// Compile an ordinary integer code block to native code.
+/// Compile an ordinary numeric code block to native code.
 ///
 /// The current native subset is deliberately conservative: all register
-/// values are `i32`, object/boxed operations are rejected, and the VM stack is
-/// materialized only at helper/exit boundaries. Returning `None` is a normal
-/// eligibility result; the caller uses the legacy shim compiler.
+/// values are either `i32` or `f64` for a whole specialization, object/boxed
+/// operations are rejected, and the VM stack is materialized only at
+/// helper/exit boundaries. Returning `None` is a normal eligibility result;
+/// the caller uses the legacy shim compiler.
 pub(super) fn compile(
     backend: &mut JitBackend,
     code: &CodeBlock,
@@ -31,7 +32,8 @@ pub(super) fn compile(
     }
 
     let instructions = decode(code)?;
-    let mut compiler = NativeCompiler::new(backend, code, instructions)?;
+    let mode = select_mode(&instructions);
+    let mut compiler = NativeCompiler::new(backend, code, instructions, mode)?;
     compiler.compile()
 }
 
@@ -77,6 +79,34 @@ fn decode(code: &CodeBlock) -> Option<DecodedInstructions> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeMode {
+    I32,
+    F64,
+}
+
+impl NativeMode {
+    fn value_type(self) -> cranelift_codegen::ir::Type {
+        match self {
+            Self::I32 => types::I32,
+            Self::F64 => types::F64,
+        }
+    }
+}
+
+fn select_mode(instructions: &DecodedInstructions) -> NativeMode {
+    if instructions.instructions.iter().any(|(_, _, instruction)| {
+        matches!(
+            instruction,
+            Instruction::StoreFloat { .. } | Instruction::StoreDouble { .. }
+        )
+    }) {
+        NativeMode::F64
+    } else {
+        NativeMode::I32
+    }
+}
+
 fn eligible(code: &CodeBlock) -> bool {
     code.is_ordinary() && code.handlers.is_empty() && code.register_count <= 128
 }
@@ -93,9 +123,13 @@ fn is_supported(opcode: crate::vm::Opcode, instruction: &Instruction) -> bool {
         | (Opcode::StoreInt8, Instruction::StoreInt8 { .. })
         | (Opcode::StoreInt16, Instruction::StoreInt16 { .. })
         | (Opcode::StoreInt32, Instruction::StoreInt32 { .. })
+        | (Opcode::StoreFloat, Instruction::StoreFloat { .. })
+        | (Opcode::StoreDouble, Instruction::StoreDouble { .. })
         | (Opcode::Move, Instruction::Move { .. })
         | (Opcode::Add, Instruction::Add { .. })
         | (Opcode::Sub, Instruction::Sub { .. })
+        | (Opcode::Div, Instruction::Div { .. })
+        | (Opcode::Mul, Instruction::Mul { .. })
         | (Opcode::Inc, Instruction::Inc { .. })
         | (Opcode::Jump, Instruction::Jump { .. })
         | (Opcode::JumpIfNotLessThan, Instruction::JumpIfNotLessThan { .. })
@@ -152,12 +186,19 @@ struct Helper {
 struct Helpers {
     ptr: cranelift_codegen::ir::Type,
     guard: Helper,
+    guard_argument_number: Helper,
+    guard_stack_number: Helper,
     get_argument_i32: Helper,
+    get_argument_f64: Helper,
     set_pc: Helper,
     store_i32: Helper,
+    store_f64: Helper,
     push_i32: Helper,
+    push_f64: Helper,
     pop_i32: Helper,
+    pop_f64: Helper,
     set_return_i32: Helper,
+    set_return_f64: Helper,
     increment_loop: Helper,
     handle_return: Helper,
 }
@@ -166,6 +207,7 @@ struct NativeCompiler<'a> {
     backend: &'a mut JitBackend,
     code: &'a CodeBlock,
     instructions: DecodedInstructions,
+    mode: NativeMode,
     helpers: Option<Helpers>,
     variables: Vec<Variable>,
     dirty: BTreeSet<usize>,
@@ -176,11 +218,13 @@ impl<'a> NativeCompiler<'a> {
         backend: &'a mut JitBackend,
         code: &'a CodeBlock,
         instructions: DecodedInstructions,
+        mode: NativeMode,
     ) -> Option<Self> {
         Some(Self {
             backend,
             code,
             instructions,
+            mode,
             helpers: None,
             variables: Vec::new(),
             dirty: BTreeSet::new(),
@@ -197,7 +241,7 @@ impl<'a> NativeCompiler<'a> {
 
         let mut bcx = FunctionBuilder::new(&mut cctx.func, &mut fctx);
         self.variables = (0..self.code.register_count)
-            .map(|_| bcx.declare_var(types::I32))
+            .map(|_| bcx.declare_var(self.mode.value_type()))
             .collect();
 
         let code_blocks: Vec<Block> = self
@@ -298,12 +342,14 @@ impl<'a> NativeCompiler<'a> {
         bcx: &mut FunctionBuilder<'_>,
         ptr: cranelift_codegen::ir::Type,
     ) -> Helpers {
-        let mut make = |address: usize, params: &[cranelift_codegen::ir::Type]| {
+        let mut make = |address: usize,
+                        params: &[cranelift_codegen::ir::Type],
+                        result: cranelift_codegen::ir::Type| {
             let mut signature = self.backend.module.make_signature();
             for param in params {
                 signature.params.push(AbiParam::new(*param));
             }
-            signature.returns.push(AbiParam::new(types::I64));
+            signature.returns.push(AbiParam::new(result));
             Helper {
                 address,
                 signature: bcx.import_signature(signature),
@@ -312,21 +358,66 @@ impl<'a> NativeCompiler<'a> {
 
         Helpers {
             ptr,
-            guard: make(jit_guard as *const () as usize, &[ptr]),
+            guard: make(jit_guard as *const () as usize, &[ptr], types::I64),
+            guard_argument_number: make(
+                jit_guard_argument_number as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            guard_stack_number: make(
+                jit_guard_stack_number as *const () as usize,
+                &[ptr],
+                types::I64,
+            ),
             get_argument_i32: make(
                 jit_get_argument_i32 as *const () as usize,
                 &[ptr, types::I32],
+                types::I64,
             ),
-            set_pc: make(jit_set_pc as *const () as usize, &[ptr, types::I32]),
+            get_argument_f64: make(
+                jit_get_argument_f64 as *const () as usize,
+                &[ptr, types::I32],
+                types::F64,
+            ),
+            set_pc: make(
+                jit_set_pc as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             store_i32: make(
                 jit_store_i32 as *const () as usize,
                 &[ptr, types::I32, types::I32],
+                types::I64,
             ),
-            push_i32: make(jit_push_i32 as *const () as usize, &[ptr, types::I32]),
-            pop_i32: make(jit_pop_i32 as *const () as usize, &[ptr]),
-            set_return_i32: make(jit_set_return_i32 as *const () as usize, &[ptr, types::I32]),
-            increment_loop: make(jit_increment_loop as *const () as usize, &[ptr]),
-            handle_return: make(jit_handle_return as *const () as usize, &[ptr]),
+            store_f64: make(
+                jit_store_f64 as *const () as usize,
+                &[ptr, types::I32, types::F64],
+                types::I64,
+            ),
+            push_i32: make(
+                jit_push_i32 as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            push_f64: make(
+                jit_push_f64 as *const () as usize,
+                &[ptr, types::F64],
+                types::I64,
+            ),
+            pop_i32: make(jit_pop_i32 as *const () as usize, &[ptr], types::I64),
+            pop_f64: make(jit_pop_f64 as *const () as usize, &[ptr], types::F64),
+            set_return_i32: make(
+                jit_set_return_i32 as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            set_return_f64: make(
+                jit_set_return_f64 as *const () as usize,
+                &[ptr, types::F64],
+                types::I64,
+            ),
+            increment_loop: make(jit_increment_loop as *const () as usize, &[ptr], types::I64),
+            handle_return: make(jit_handle_return as *const () as usize, &[ptr], types::I64),
         }
     }
 
@@ -363,58 +454,111 @@ impl<'a> NativeCompiler<'a> {
 
         match instruction {
             Instruction::GetArgument { index, dst } => {
-                let helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.get_argument_i32.address as i64);
                 let index = bcx.ins().iconst(types::I32, u32::from(*index) as i64);
-                let result = bcx.ins().call_indirect(
-                    helpers.get_argument_i32.signature,
-                    helper,
-                    &[ctx, index],
-                );
-                let result = bcx.inst_results(result)[0];
-                let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
-                let failed = bcx.ins().band(result, fail_mask);
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
-                bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                    return false;
-                }
-                bcx.switch_to_block(cont);
-                let value = bcx.ins().ireduce(types::I32, result);
-                if !self.define_register(bcx, register(*dst), value) {
-                    return false;
+                match self.mode {
+                    NativeMode::I32 => {
+                        let helper = bcx
+                            .ins()
+                            .iconst(helpers.ptr, helpers.get_argument_i32.address as i64);
+                        let result = bcx.ins().call_indirect(
+                            helpers.get_argument_i32.signature,
+                            helper,
+                            &[ctx, index],
+                        );
+                        let result = bcx.inst_results(result)[0];
+                        let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                        let failed = bcx.ins().band(result, fail_mask);
+                        bcx.ins().brif(failed, deopt, &[], cont, &[]);
+
+                        bcx.switch_to_block(deopt);
+                        if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                            return false;
+                        }
+                        bcx.switch_to_block(cont);
+                        let value = bcx.ins().ireduce(types::I32, result);
+                        if !self.define_register(bcx, register(*dst), value) {
+                            return false;
+                        }
+                    }
+                    NativeMode::F64 => {
+                        let helper = bcx
+                            .ins()
+                            .iconst(helpers.ptr, helpers.guard_argument_number.address as i64);
+                        let guard = bcx.ins().call_indirect(
+                            helpers.guard_argument_number.signature,
+                            helper,
+                            &[ctx, index],
+                        );
+                        let guard = bcx.inst_results(guard)[0];
+                        bcx.ins().brif(guard, cont, &[], deopt, &[]);
+
+                        bcx.switch_to_block(deopt);
+                        if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                            return false;
+                        }
+                        bcx.switch_to_block(cont);
+                        let helper = bcx
+                            .ins()
+                            .iconst(helpers.ptr, helpers.get_argument_f64.address as i64);
+                        let result = bcx.ins().call_indirect(
+                            helpers.get_argument_f64.signature,
+                            helper,
+                            &[ctx, index],
+                        );
+                        let value = bcx.inst_results(result)[0];
+                        if !self.define_register(bcx, register(*dst), value) {
+                            return false;
+                        }
+                    }
                 }
             }
             Instruction::StoreZero { dst } => {
-                let value = bcx.ins().iconst(types::I32, 0);
+                let value = self.constant_f64_or_i32(bcx, 0.0, 0);
                 if !self.define_register(bcx, register(*dst), value) {
                     return false;
                 }
             }
             Instruction::StoreOne { dst } => {
-                let value = bcx.ins().iconst(types::I32, 1);
+                let value = self.constant_f64_or_i32(bcx, 1.0, 1);
                 if !self.define_register(bcx, register(*dst), value) {
                     return false;
                 }
             }
             Instruction::StoreInt8 { dst, value } => {
-                let value = bcx.ins().iconst(types::I32, i64::from(*value));
+                let value = self.constant_f64_or_i32(bcx, f64::from(*value), i64::from(*value));
                 if !self.define_register(bcx, register(*dst), value) {
                     return false;
                 }
             }
             Instruction::StoreInt16 { dst, value } => {
-                let value = bcx.ins().iconst(types::I32, i64::from(*value));
+                let value = self.constant_f64_or_i32(bcx, f64::from(*value), i64::from(*value));
                 if !self.define_register(bcx, register(*dst), value) {
                     return false;
                 }
             }
             Instruction::StoreInt32 { dst, value } => {
-                let value = bcx.ins().iconst(types::I32, i64::from(*value));
+                let value = self.constant_f64_or_i32(bcx, f64::from(*value), i64::from(*value));
+                if !self.define_register(bcx, register(*dst), value) {
+                    return false;
+                }
+            }
+            Instruction::StoreFloat { dst, value } => {
+                if self.mode != NativeMode::F64 {
+                    return false;
+                }
+                let value = bcx.ins().f64const(f64::from(*value));
+                if !self.define_register(bcx, register(*dst), value) {
+                    return false;
+                }
+            }
+            Instruction::StoreDouble { dst, value } => {
+                if self.mode != NativeMode::F64 {
+                    return false;
+                }
+                let value = bcx.ins().f64const(*value);
                 if !self.define_register(bcx, register(*dst), value) {
                     return false;
                 }
@@ -434,21 +578,26 @@ impl<'a> NativeCompiler<'a> {
                 let Some(rhs) = self.use_register(bcx, register(*rhs)) else {
                     return false;
                 };
-                let result = bcx.ins().iadd(lhs, rhs);
-                let lhs_sign = self.sign_bit(bcx, lhs);
-                let rhs_sign = self.sign_bit(bcx, rhs);
-                let result_sign = self.sign_bit(bcx, result);
-                let same_sign = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
-                let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                let overflow = bcx.ins().band(same_sign, changed_sign);
-                let deopt = bcx.create_block();
-                let cont = bcx.create_block();
-                bcx.ins().brif(overflow, deopt, &[], cont, &[]);
-                bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                    return false;
-                }
-                bcx.switch_to_block(cont);
+                let result = if self.mode == NativeMode::F64 {
+                    bcx.ins().fadd(lhs, rhs)
+                } else {
+                    let result = bcx.ins().iadd(lhs, rhs);
+                    let lhs_sign = self.sign_bit(bcx, lhs);
+                    let rhs_sign = self.sign_bit(bcx, rhs);
+                    let result_sign = self.sign_bit(bcx, result);
+                    let same_sign = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+                    let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
+                    let overflow = bcx.ins().band(same_sign, changed_sign);
+                    let deopt = bcx.create_block();
+                    let cont = bcx.create_block();
+                    bcx.ins().brif(overflow, deopt, &[], cont, &[]);
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    result
+                };
                 if !self.define_register(bcx, register(*dst), result) {
                     return false;
                 }
@@ -460,21 +609,71 @@ impl<'a> NativeCompiler<'a> {
                 let Some(rhs) = self.use_register(bcx, register(*rhs)) else {
                     return false;
                 };
-                let result = bcx.ins().isub(lhs, rhs);
-                let lhs_sign = self.sign_bit(bcx, lhs);
-                let rhs_sign = self.sign_bit(bcx, rhs);
-                let result_sign = self.sign_bit(bcx, result);
-                let different_sign = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
-                let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                let overflow = bcx.ins().band(different_sign, changed_sign);
-                let deopt = bcx.create_block();
-                let cont = bcx.create_block();
-                bcx.ins().brif(overflow, deopt, &[], cont, &[]);
-                bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                let result = if self.mode == NativeMode::F64 {
+                    bcx.ins().fsub(lhs, rhs)
+                } else {
+                    let result = bcx.ins().isub(lhs, rhs);
+                    let lhs_sign = self.sign_bit(bcx, lhs);
+                    let rhs_sign = self.sign_bit(bcx, rhs);
+                    let result_sign = self.sign_bit(bcx, result);
+                    let different_sign = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
+                    let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
+                    let overflow = bcx.ins().band(different_sign, changed_sign);
+                    let deopt = bcx.create_block();
+                    let cont = bcx.create_block();
+                    bcx.ins().brif(overflow, deopt, &[], cont, &[]);
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    result
+                };
+                if !self.define_register(bcx, register(*dst), result) {
                     return false;
                 }
-                bcx.switch_to_block(cont);
+            }
+            Instruction::Mul { dst, lhs, rhs } => {
+                let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
+                    return false;
+                };
+                let Some(rhs) = self.use_register(bcx, register(*rhs)) else {
+                    return false;
+                };
+                let result = if self.mode == NativeMode::F64 {
+                    bcx.ins().fmul(lhs, rhs)
+                } else {
+                    let lhs_wide = bcx.ins().sextend(types::I64, lhs);
+                    let rhs_wide = bcx.ins().sextend(types::I64, rhs);
+                    let wide_result = bcx.ins().imul(lhs_wide, rhs_wide);
+                    let result = bcx.ins().ireduce(types::I32, wide_result);
+                    let round_trip = bcx.ins().sextend(types::I64, result);
+                    let overflow = bcx.ins().icmp(IntCC::NotEqual, wide_result, round_trip);
+                    let deopt = bcx.create_block();
+                    let cont = bcx.create_block();
+                    bcx.ins().brif(overflow, deopt, &[], cont, &[]);
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    result
+                };
+                if !self.define_register(bcx, register(*dst), result) {
+                    return false;
+                }
+            }
+            Instruction::Div { dst, lhs, rhs } => {
+                if self.mode != NativeMode::F64 {
+                    return false;
+                }
+                let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
+                    return false;
+                };
+                let Some(rhs) = self.use_register(bcx, register(*rhs)) else {
+                    return false;
+                };
+                let result = bcx.ins().fdiv(lhs, rhs);
                 if !self.define_register(bcx, register(*dst), result) {
                     return false;
                 }
@@ -485,20 +684,26 @@ impl<'a> NativeCompiler<'a> {
                 let Some(old_value) = self.use_register(bcx, source) else {
                     return false;
                 };
-                let one = bcx.ins().iconst(types::I32, 1);
-                let new_value = bcx.ins().iadd(old_value, one);
-                let old_sign = self.sign_bit(bcx, old_value);
-                let new_sign = self.sign_bit(bcx, new_value);
-                let not_old_sign = bcx.ins().bnot(old_sign);
-                let max_overflow = bcx.ins().band(not_old_sign, new_sign);
-                let deopt = bcx.create_block();
-                let cont = bcx.create_block();
-                bcx.ins().brif(max_overflow, deopt, &[], cont, &[]);
-                bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                    return false;
-                }
-                bcx.switch_to_block(cont);
+                let new_value = if self.mode == NativeMode::F64 {
+                    let one = bcx.ins().f64const(1.0);
+                    bcx.ins().fadd(old_value, one)
+                } else {
+                    let one = bcx.ins().iconst(types::I32, 1);
+                    let new_value = bcx.ins().iadd(old_value, one);
+                    let old_sign = self.sign_bit(bcx, old_value);
+                    let new_sign = self.sign_bit(bcx, new_value);
+                    let not_old_sign = bcx.ins().bnot(old_sign);
+                    let max_overflow = bcx.ins().band(not_old_sign, new_sign);
+                    let deopt = bcx.create_block();
+                    let cont = bcx.create_block();
+                    bcx.ins().brif(max_overflow, deopt, &[], cont, &[]);
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    new_value
+                };
                 if !self.define_register(bcx, destination, new_value) {
                     return false;
                 }
@@ -515,6 +720,7 @@ impl<'a> NativeCompiler<'a> {
                     register(*lhs),
                     register(*rhs),
                     IntCC::SignedGreaterThanOrEqual,
+                    FloatCC::UnorderedOrGreaterThanOrEqual,
                     *address,
                     next_pc,
                     blocks,
@@ -528,6 +734,7 @@ impl<'a> NativeCompiler<'a> {
                     register(*lhs),
                     register(*rhs),
                     IntCC::SignedGreaterThan,
+                    FloatCC::UnorderedOrGreaterThan,
                     *address,
                     next_pc,
                     blocks,
@@ -541,6 +748,7 @@ impl<'a> NativeCompiler<'a> {
                     register(*lhs),
                     register(*rhs),
                     IntCC::SignedLessThanOrEqual,
+                    FloatCC::UnorderedOrLessThanOrEqual,
                     *address,
                     next_pc,
                     blocks,
@@ -554,6 +762,7 @@ impl<'a> NativeCompiler<'a> {
                     register(*lhs),
                     register(*rhs),
                     IntCC::SignedLessThan,
+                    FloatCC::UnorderedOrLessThan,
                     *address,
                     next_pc,
                     blocks,
@@ -567,6 +776,7 @@ impl<'a> NativeCompiler<'a> {
                     register(*lhs),
                     register(*rhs),
                     IntCC::NotEqual,
+                    FloatCC::NotEqual,
                     *address,
                     next_pc,
                     blocks,
@@ -597,34 +807,67 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 };
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.push_i32.address as i64);
+                let helper = if self.mode == NativeMode::F64 {
+                    helpers.push_f64
+                } else {
+                    helpers.push_i32
+                };
+                let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
                 bcx.ins()
-                    .call_indirect(helpers.push_i32.signature, helper, &[ctx, value]);
+                    .call_indirect(helper.signature, helper_address, &[ctx, value]);
             }
             Instruction::PopIntoRegister { dst } => {
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.pop_i32.address as i64);
-                let result = bcx
-                    .ins()
-                    .call_indirect(helpers.pop_i32.signature, helper, &[ctx]);
-                let result = bcx.inst_results(result)[0];
-                let guard_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
-                let failed = bcx.ins().band(result, guard_mask);
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                bcx.ins().brif(failed, deopt, &[], cont, &[]);
-                bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                    return false;
-                }
-                bcx.switch_to_block(cont);
-                let value = bcx.ins().ireduce(types::I32, result);
-                if !self.define_register(bcx, register(*dst), value) {
-                    return false;
+                if self.mode == NativeMode::F64 {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.guard_stack_number.address as i64);
+                    let guard = bcx.ins().call_indirect(
+                        helpers.guard_stack_number.signature,
+                        helper,
+                        &[ctx],
+                    );
+                    let guard = bcx.inst_results(guard)[0];
+                    bcx.ins().brif(guard, cont, &[], deopt, &[]);
+
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.pop_f64.address as i64);
+                    let result = bcx
+                        .ins()
+                        .call_indirect(helpers.pop_f64.signature, helper, &[ctx]);
+                    let value = bcx.inst_results(result)[0];
+                    if !self.define_register(bcx, register(*dst), value) {
+                        return false;
+                    }
+                } else {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.pop_i32.address as i64);
+                    let result = bcx
+                        .ins()
+                        .call_indirect(helpers.pop_i32.signature, helper, &[ctx]);
+                    let result = bcx.inst_results(result)[0];
+                    let guard_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let failed = bcx.ins().band(result, guard_mask);
+                    bcx.ins().brif(failed, deopt, &[], cont, &[]);
+
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                        return false;
+                    }
+                    bcx.switch_to_block(cont);
+                    let value = bcx.ins().ireduce(types::I32, result);
+                    if !self.define_register(bcx, register(*dst), value) {
+                        return false;
+                    }
                 }
             }
             Instruction::SetAccumulator { src } => {
@@ -632,11 +875,14 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 };
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.set_return_i32.address as i64);
+                let helper = if self.mode == NativeMode::F64 {
+                    helpers.set_return_f64
+                } else {
+                    helpers.set_return_i32
+                };
+                let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
                 bcx.ins()
-                    .call_indirect(helpers.set_return_i32.signature, helper, &[ctx, value]);
+                    .call_indirect(helper.signature, helper_address, &[ctx, value]);
             }
             Instruction::CheckReturn => {
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
@@ -682,6 +928,18 @@ impl<'a> NativeCompiler<'a> {
         true
     }
 
+    fn constant_f64_or_i32(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        f64_value: f64,
+        i32_value: i64,
+    ) -> cranelift_codegen::ir::Value {
+        match self.mode {
+            NativeMode::I32 => bcx.ins().iconst(types::I32, i32_value),
+            NativeMode::F64 => bcx.ins().f64const(f64_value),
+        }
+    }
+
     fn sign_bit(
         &self,
         bcx: &mut FunctionBuilder<'_>,
@@ -712,7 +970,8 @@ impl<'a> NativeCompiler<'a> {
         bcx: &mut FunctionBuilder<'_>,
         lhs_register: usize,
         rhs_register: usize,
-        condition: IntCC,
+        int_condition: IntCC,
+        float_condition: FloatCC,
         target: crate::vm::opcode::Address,
         next_pc: usize,
         blocks: &[Block],
@@ -729,7 +988,10 @@ impl<'a> NativeCompiler<'a> {
         let Some(next) = self.next_block(next_pc, blocks) else {
             return false;
         };
-        let condition = bcx.ins().icmp(condition, lhs, rhs);
+        let condition = match self.mode {
+            NativeMode::I32 => bcx.ins().icmp(int_condition, lhs, rhs),
+            NativeMode::F64 => bcx.ins().fcmp(float_condition, lhs, rhs),
+        };
         bcx.ins().brif(condition, target, &[], next, &[]);
         true
     }
@@ -748,13 +1010,16 @@ impl<'a> NativeCompiler<'a> {
             let Some(value) = self.use_register(bcx, *register) else {
                 return false;
             };
-            let helper = bcx
-                .ins()
-                .iconst(helpers.ptr, helpers.store_i32.address as i64);
+            let helper = if self.mode == NativeMode::F64 {
+                helpers.store_f64
+            } else {
+                helpers.store_i32
+            };
             let register_value = bcx.ins().iconst(types::I32, *register as i64);
+            let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
             bcx.ins().call_indirect(
-                helpers.store_i32.signature,
-                helper,
+                helper.signature,
+                helper_address,
                 &[ctx, register_value, value],
             );
         }
@@ -794,6 +1059,24 @@ extern "C" fn jit_guard(context: *mut Context) -> u64 {
     1
 }
 
+extern "C" fn jit_guard_argument_number(context: *mut Context, index: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    u64::from(
+        context
+            .vm
+            .stack
+            .get_argument(context.vm.frame(), index as usize)
+            .is_some_and(JsValue::is_number),
+    )
+}
+
+extern "C" fn jit_guard_stack_number(context: *mut Context) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    u64::from(context.vm.stack.jit_top_is_number())
+}
+
 extern "C" fn jit_get_argument_i32(context: *mut Context, index: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
@@ -806,6 +1089,17 @@ extern "C" fn jit_get_argument_i32(context: *mut Context, index: u32) -> u64 {
         return JIT_GUARD_FAIL_BIT;
     };
     u64::from(value as u32)
+}
+
+extern "C" fn jit_get_argument_f64(context: *mut Context, index: u32) -> f64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .stack
+        .get_argument(context.vm.frame(), index as usize)
+        .and_then(JsValue::as_number)
+        .unwrap_or(0.0)
 }
 
 extern "C" fn jit_set_pc(context: *mut Context, pc: u32) -> u64 {
@@ -824,7 +1118,23 @@ extern "C" fn jit_store_i32(context: *mut Context, register: u32, value: i32) ->
     0
 }
 
+extern "C" fn jit_store_f64(context: *mut Context, register: u32, value: f64) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .set_register(register as usize, JsValue::new(value));
+    0
+}
+
 extern "C" fn jit_push_i32(context: *mut Context, value: i32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.stack.push(JsValue::new(value));
+    0
+}
+
+extern "C" fn jit_push_f64(context: *mut Context, value: f64) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     context.vm.stack.push(JsValue::new(value));
@@ -840,7 +1150,20 @@ extern "C" fn jit_pop_i32(context: *mut Context) -> u64 {
     u64::from(value as u32)
 }
 
+extern "C" fn jit_pop_f64(context: *mut Context) -> f64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.stack.jit_pop_f64().unwrap_or(0.0)
+}
+
 extern "C" fn jit_set_return_i32(context: *mut Context, value: i32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.set_return_value(JsValue::new(value));
+    0
+}
+
+extern "C" fn jit_set_return_f64(context: *mut Context, value: f64) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     context.vm.set_return_value(JsValue::new(value));
