@@ -817,6 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_runs_native_monomorphic_property_load() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(object, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + object.value; } return total; } let object = { value: 3 }; let answer = 0; for (let j = 0; j < 80; j++) { answer = sum(object, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(30));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn jit_exit_round_trip() {
         for (kind, pc) in [
             (JitExitKind::Deopt, 0),
