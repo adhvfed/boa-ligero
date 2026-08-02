@@ -838,25 +838,6 @@ impl Context {
             return ControlFlow::Break(CompletionRecord::Throw(error));
         }
 
-        self.execute_one_without_budget(f, opcode)
-    }
-
-    /// Execute one opcode without instruction-budget accounting.
-    ///
-    /// The default context has no instruction budget, so keeping this path
-    /// separate removes the `Option`/decrement/error checks from every
-    /// interpreter dispatch. `run_without_instruction_budget` still watches
-    /// the budget epoch for host callbacks that enable accounting mid-run.
-    #[inline(always)]
-    #[allow(clippy::inline_always)]
-    fn execute_one_without_budget<F>(
-        &mut self,
-        f: F,
-        opcode: Opcode,
-    ) -> ControlFlow<CompletionRecord>
-    where
-        F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
-    {
         #[cfg(feature = "trace")]
         if self.vm.trace || self.vm.frame().code_block.traceable() {
             self.trace_execute_instruction(f, opcode)
@@ -1100,15 +1081,6 @@ impl Context {
     }
 
     pub(crate) fn run(&mut self) -> CompletionRecord {
-        if self.instruction_budget_remaining.is_some() {
-            self.run_with_instruction_budget()
-        } else {
-            self.run_without_instruction_budget()
-        }
-    }
-
-    /// Run with instruction accounting enabled.
-    fn run_with_instruction_budget(&mut self) -> CompletionRecord {
         while let Some(byte) = self
             .vm
             .frame()
@@ -1130,49 +1102,6 @@ impl Context {
             ) {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(value) => return value,
-            }
-        }
-
-        CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
-    }
-
-    /// Run the common unlimited path without budget decrement/error checks.
-    ///
-    /// The epoch comparison is almost always false. It exists for embedders
-    /// whose native callbacks enable a budget while this run is already in
-    /// progress; in that case the next opcode continues through the bounded
-    /// loop and observes the shared budget normally.
-    fn run_without_instruction_budget(&mut self) -> CompletionRecord {
-        let mut budget_epoch = self.instruction_budget_epoch;
-
-        while let Some(byte) = self
-            .vm
-            .frame()
-            .code_block
-            .bytecode
-            .bytes
-            .get(self.vm.frame().pc as usize)
-        {
-            let opcode = Opcode::decode(*byte);
-
-            match self.execute_one_without_budget(
-                |context, opcode| {
-                    let frame = context.vm.frame();
-                    let pc = frame.pc as usize;
-
-                    OPCODE_HANDLERS[opcode as usize](context, pc)
-                },
-                opcode,
-            ) {
-                ControlFlow::Continue(()) => {}
-                ControlFlow::Break(value) => return value,
-            }
-
-            if self.instruction_budget_epoch != budget_epoch {
-                budget_epoch = self.instruction_budget_epoch;
-                if self.instruction_budget_remaining.is_some() {
-                    return self.run_with_instruction_budget();
-                }
             }
         }
 
