@@ -838,6 +838,69 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_dispatches_native_ordinary_function_call() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = apply(add, 20, 22); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(42));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.native_entries >= 2, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_non_ordinary_call_to_interpreter() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = answer + apply(add, 20, 22); } answer = answer + apply(Math.max, 5, 4); answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(3365));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_property_shape_mismatch_to_interpreter() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(object, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + object.value; } return total; } let first = { value: 3 }; let second = { value: 4, extra: 1 }; let answer = 0; for (let i = 0; i < 40; i++) { answer = answer + sum(first, 10); } for (let i = 0; i < 40; i++) { answer = answer + sum(second, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(2800));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn jit_exit_round_trip() {
         for (kind, pc) in [
             (JitExitKind::Deopt, 0),

@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::builtins::function::OrdinaryFunction;
+use crate::object::internal_methods::InternalMethodCallContext;
 use crate::object::shape::slot::SlotAttributes;
 use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
 use crate::{Context, JsValue};
@@ -142,12 +144,18 @@ fn analyze_registers(
     let mut current: Vec<usize> = (0..register_count).collect();
     let mut before_ids = Vec::with_capacity(instructions.instructions.len());
     let mut after_ids = Vec::with_capacity(instructions.instructions.len());
+    let call_pushes = call_push_operands(instructions);
 
-    for (_, _, instruction) in &instructions.instructions {
+    for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
         before_ids.push(current.clone());
 
         for register in object_operands(instruction) {
             mark_definition(current[register], &mut definitions);
+        }
+        if call_pushes.contains(&index)
+            && let Instruction::PushFromRegister { src } = instruction
+        {
+            mark_definition(current[usize::from(*src)], &mut definitions);
         }
 
         if let Some((register, source, kind)) =
@@ -207,6 +215,26 @@ fn object_operands(instruction: &Instruction) -> Vec<usize> {
         } => vec![usize::from(*receiver), usize::from(*object)],
         _ => Vec::new(),
     }
+}
+
+fn call_push_operands(instructions: &DecodedInstructions) -> BTreeSet<usize> {
+    let mut call_pushes = BTreeSet::new();
+    for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
+        if !matches!(instruction, Instruction::Call { .. }) {
+            continue;
+        }
+
+        let mut previous = index;
+        while let Some(push_index) = previous.checked_sub(1) {
+            let Instruction::PushFromRegister { .. } = &instructions.instructions[push_index].2
+            else {
+                break;
+            };
+            call_pushes.insert(push_index);
+            previous = push_index;
+        }
+    }
+    call_pushes
 }
 
 fn output_definition(
@@ -273,6 +301,7 @@ fn is_supported(opcode: crate::vm::Opcode, instruction: &Instruction) -> bool {
         | (Opcode::GetPropertyByName, Instruction::GetPropertyByName { .. })
         | (Opcode::GetPropertyByNameWithThis, Instruction::GetPropertyByNameWithThis { .. })
         | (Opcode::GetPropertyByValue, Instruction::GetPropertyByValue { .. })
+        | (Opcode::Call, Instruction::Call { .. })
         | (Opcode::Add, Instruction::Add { .. })
         | (Opcode::Sub, Instruction::Sub { .. })
         | (Opcode::Div, Instruction::Div { .. })
@@ -307,7 +336,10 @@ fn branch_target(instruction: &Instruction) -> Option<usize> {
 }
 
 fn fallthrough(instruction: &Instruction) -> bool {
-    !matches!(instruction, Instruction::Jump { .. } | Instruction::Return)
+    !matches!(
+        instruction,
+        Instruction::Jump { .. } | Instruction::Call { .. } | Instruction::Return
+    )
 }
 
 fn has_explicit_edges(instruction: &Instruction) -> bool {
@@ -319,6 +351,7 @@ fn has_explicit_edges(instruction: &Instruction) -> bool {
             | Instruction::JumpIfNotGreaterThan { .. }
             | Instruction::JumpIfNotGreaterThanOrEqual { .. }
             | Instruction::JumpIfNotEqual { .. }
+            | Instruction::Call { .. }
             | Instruction::Return
     )
 }
@@ -346,6 +379,7 @@ struct Helpers {
     named_guard: Helper,
     named_i32: Helper,
     named_f64: Helper,
+    call_ordinary: Helper,
     set_pc: Helper,
     store_i32: Helper,
     store_f64: Helper,
@@ -585,6 +619,11 @@ impl<'a> NativeCompiler<'a> {
                 jit_named_property_f64 as *const () as usize,
                 &[ptr, types::I32, types::I32],
                 types::F64,
+            ),
+            call_ordinary: make(
+                jit_call_ordinary as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
             ),
             set_pc: make(
                 jit_set_pc as *const () as usize,
@@ -916,6 +955,50 @@ impl<'a> NativeCompiler<'a> {
                 if !self.define_register(bcx, dst, result) {
                     return false;
                 }
+            }
+            Instruction::Call { argument_count } => {
+                // The helper leaves the calling-convention stack untouched on
+                // a non-ordinary callee. That makes this a real guard exit:
+                // the interpreter can re-execute the Call opcode with its
+                // normal generic-call semantics.
+                self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.call_ordinary.address as i64);
+                let argument_count = bcx
+                    .ins()
+                    .iconst(types::I32, u32::from(*argument_count) as i64);
+                let status = bcx.ins().call_indirect(
+                    helpers.call_ordinary.signature,
+                    helper,
+                    &[ctx, argument_count],
+                );
+                let status = bcx.inst_results(status)[0];
+
+                let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+                let is_break = bcx.ins().band(status, break_mask);
+                let guard_check = bcx.create_block();
+                bcx.ins()
+                    .brif(is_break, break_block, &[status.into()], guard_check, &[]);
+
+                bcx.switch_to_block(guard_check);
+                let guard_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                let guard_failed = bcx.ins().band(status, guard_mask);
+                let deopt = bcx.create_block();
+                let called = bcx.create_block();
+                bcx.ins().brif(guard_failed, deopt, &[], called, &[]);
+
+                bcx.switch_to_block(deopt);
+                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    return false;
+                }
+
+                bcx.switch_to_block(called);
+                let status = bcx.ins().iconst(
+                    types::I64,
+                    JitExit::encode(JitExitKind::Call, next_pc as u32) as i64,
+                );
+                bcx.ins().return_(&[status]);
             }
             Instruction::Add { dst, lhs, rhs } => {
                 let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
@@ -1622,6 +1705,48 @@ extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_in
     named_property_value(context, register, ic_index)
         .and_then(|value| value.as_number())
         .unwrap_or(0.0)
+}
+
+extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let argument_count = argument_count as usize;
+    let function = context
+        .vm
+        .stack
+        .calling_convention_get_function(argument_count)
+        .clone();
+    let Some(object) = function.as_object() else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    if !object.is::<OrdinaryFunction>() {
+        return JIT_GUARD_FAIL_BIT;
+    }
+
+    let call = crate::builtins::function::function_call(
+        &object,
+        argument_count,
+        &mut InternalMethodCallContext::new(context),
+    );
+    let call = match call {
+        Ok(call) => call,
+        Err(error) => {
+            let mut error = crate::JsError::from(error);
+            context.capture_error_backtrace(&mut error);
+            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
+            return JIT_BREAK_BIT;
+        }
+    };
+
+    match call.resolve(context) {
+        Ok(_) => JitExit::encode(JitExitKind::Call, 0),
+        Err(error) => {
+            let mut error = crate::JsError::from(error);
+            context.capture_error_backtrace(&mut error);
+            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
+            JIT_BREAK_BIT
+        }
+    }
 }
 
 extern "C" fn jit_get_argument_i32(context: *mut Context, index: u32) -> u64 {
