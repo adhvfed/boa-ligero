@@ -22,11 +22,132 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use rustc_hash::FxHashMap;
+use std::time::Instant;
 
 /// High bit of a shim's `u64` return value: set means the op broke (a
-/// `CompletionRecord` was stashed in `vm.jit_pending`); clear means continue,
+/// [`CompletionRecord`] was stashed in `vm.jit_pending`); clear means continue,
 /// with the low bits holding the new `frame.pc`.
 pub(crate) const JIT_BREAK_BIT: u64 = 1 << 63;
+
+/// Marker used by the native entry ABI. Legacy shim statuses are untagged
+/// bytecode PCs, so a tagged status can be decoded without changing the shim
+/// table while the native compiler is being introduced.
+pub(crate) const JIT_EXIT_BIT: u64 = 1 << 62;
+const JIT_EXIT_KIND_MASK: u64 = 0xff;
+const JIT_EXIT_PC_SHIFT: u32 = 8;
+
+/// Kinds of exits from generated code.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JitExitKind {
+    /// Resume the current frame in the interpreter at the encoded PC.
+    Deopt = 1,
+    /// Finish the current frame through the VM-owned return transition.
+    Return = 2,
+    /// Let the runtime perform a call/frame transition.
+    Call = 3,
+    /// A completion record has been stored in VM state.
+    Completion = 4,
+    /// A runtime budget or limit stopped native execution.
+    Budget = 5,
+}
+
+impl JitExitKind {
+    fn from_u8(kind: u8) -> Option<Self> {
+        match kind {
+            1 => Some(Self::Deopt),
+            2 => Some(Self::Return),
+            3 => Some(Self::Call),
+            4 => Some(Self::Completion),
+            5 => Some(Self::Budget),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded status returned by a native entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JitExit {
+    pub(crate) kind: JitExitKind,
+    pub(crate) pc: u32,
+}
+
+impl JitExit {
+    /// Encode an explicit native exit. The PC is always the exact bytecode
+    /// boundary at which the interpreter may resume.
+    #[inline]
+    pub(crate) const fn encode(kind: JitExitKind, pc: u32) -> u64 {
+        JIT_EXIT_BIT | ((pc as u64) << JIT_EXIT_PC_SHIFT) | kind as u64
+    }
+
+    /// Decode an explicit native exit. Legacy shim statuses intentionally
+    /// return `None` and continue to use their old PC/break protocol.
+    #[inline]
+    pub(crate) fn decode(status: u64) -> Option<Self> {
+        if status & JIT_EXIT_BIT == 0 || status & JIT_BREAK_BIT != 0 {
+            return None;
+        }
+
+        let kind = JitExitKind::from_u8((status & JIT_EXIT_KIND_MASK) as u8)?;
+        let pc = (status >> JIT_EXIT_PC_SHIFT) as u32;
+        Some(Self { kind, pc })
+    }
+}
+
+/// Hotness thresholds used by the opt-in runtime tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitThresholds {
+    /// Number of entries before an ordinary function is considered hot.
+    pub function_entries: u32,
+    /// Number of observed backward edges before a loop is considered hot.
+    pub loop_backedges: u32,
+}
+
+impl Default for JitThresholds {
+    fn default() -> Self {
+        Self {
+            function_entries: 64,
+            loop_backedges: 256,
+        }
+    }
+}
+
+/// Runtime counters for the opt-in JIT tier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitStats {
+    /// Number of cache lookup requests.
+    pub cache_requests: u64,
+    /// Number of compiled-entry cache hits.
+    pub cache_hits: u64,
+    /// Number of compiled-entry cache misses.
+    pub cache_misses: u64,
+    /// Number of successful compilations.
+    pub compilations: u64,
+    /// Number of compilation failures/rejections.
+    pub compilation_failures: u64,
+    /// Number of function entries observed by the tiering loop.
+    pub function_entries: u64,
+    /// Number of backward edges observed by the tiering loop.
+    pub loop_backedges: u64,
+    /// Number of generated entries invoked.
+    pub native_entries: u64,
+    /// Number of native entries that returned to the interpreter.
+    pub deopts: u64,
+    /// Nanoseconds spent compiling generated entries.
+    pub compile_time_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Hotness {
+    function_entries: u32,
+    loop_backedges: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CachedEntry {
+    entry: extern "C" fn(*mut Context) -> u64,
+}
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
 /// `pc`. The JIT can then lower it to a native edge to that target's block.
@@ -67,6 +188,13 @@ pub struct JitBackend {
     /// across compilations makes the second `define_function` fail with
     /// `DuplicateDefinition`. Each compile gets a fresh name from this counter.
     next_fn_id: u64,
+    /// Compiled entries are scoped to this backend. The code block's debug ID
+    /// is unique for the lifetime of the current thread, which is sufficient
+    /// because a backend is not shared across threads or realms.
+    cache: FxHashMap<u64, CachedEntry>,
+    hotness: FxHashMap<u64, Hotness>,
+    thresholds: JitThresholds,
+    stats: JitStats,
 }
 
 impl std::fmt::Debug for JitBackend {
@@ -95,7 +223,105 @@ impl JitBackend {
         Self {
             module: JITModule::new(builder),
             next_fn_id: 0,
+            cache: FxHashMap::default(),
+            hotness: FxHashMap::default(),
+            thresholds: JitThresholds::default(),
+            stats: JitStats::default(),
         }
+    }
+
+    /// Return a snapshot of the counters collected by this backend.
+    #[must_use]
+    pub const fn stats(&self) -> JitStats {
+        self.stats
+    }
+
+    /// Configure the thresholds used by the opt-in tiering loop.
+    pub fn set_thresholds(&mut self, thresholds: JitThresholds) {
+        self.thresholds = thresholds;
+    }
+
+    /// Return the currently configured tiering thresholds.
+    #[must_use]
+    pub const fn thresholds(&self) -> JitThresholds {
+        self.thresholds
+    }
+
+    /// Record an ordinary function entry for tiering.
+    pub(crate) fn record_function_entry(&mut self, code: &CodeBlock) {
+        self.stats.function_entries = self.stats.function_entries.saturating_add(1);
+        let hotness = self.hotness.entry(code.debug_id).or_default();
+        hotness.function_entries = hotness.function_entries.saturating_add(1);
+    }
+
+    /// Record a backward edge for tiering.
+    pub(crate) fn record_loop_backedge(&mut self, code: &CodeBlock) {
+        self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
+        let hotness = self.hotness.entry(code.debug_id).or_default();
+        hotness.loop_backedges = hotness.loop_backedges.saturating_add(1);
+    }
+
+    /// Whether this code block has enough observed activity for compilation.
+    #[must_use]
+    pub(crate) fn is_hot(&self, code: &CodeBlock) -> bool {
+        let Some(hotness) = self.hotness.get(&code.debug_id) else {
+            return false;
+        };
+
+        hotness.function_entries >= self.thresholds.function_entries
+            || hotness.loop_backedges >= self.thresholds.loop_backedges
+    }
+
+    /// Return a cached entry if one exists, compiling and caching it otherwise.
+    fn cached_entry(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
+        self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
+
+        if let Some(cached) = self.cache.get(&code.debug_id) {
+            self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+            return cached.entry;
+        }
+
+        self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
+        let started = Instant::now();
+        let entry = self.compile_codeblock(code);
+        self.stats.compile_time_ns = self
+            .stats
+            .compile_time_ns
+            .saturating_add(started.elapsed().as_nanos());
+        self.stats.compilations = self.stats.compilations.saturating_add(1);
+        self.cache.insert(code.debug_id, CachedEntry { entry });
+        entry
+    }
+
+    /// Invoke a cached entry for the current frame. This is the shared runtime
+    /// hook used by both the explicit API and the context-owned tier.
+    pub(crate) fn run_cached_entry(
+        &mut self,
+        code: &CodeBlock,
+        context: &mut Context,
+    ) -> CompletionRecord {
+        let entry = self.cached_entry(code);
+        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+        let status = entry(std::ptr::from_mut(context));
+
+        if status & JIT_BREAK_BIT != 0 {
+            return context
+                .vm
+                .jit_pending
+                .take()
+                .expect("a break status must have stashed a completion record");
+        }
+
+        if let Some(exit) = JitExit::decode(status) {
+            if matches!(exit.kind, JitExitKind::Deopt) {
+                self.stats.deopts = self.stats.deopts.saturating_add(1);
+            }
+        }
+
+        // Legacy shim entries and explicit deopt entries both leave the VM at
+        // an interpreter-visible program counter. The interpreter owns all
+        // frame, exception, and return transitions.
+        context.run()
     }
 
     /// Allocate a process-unique-within-this-backend symbol name for a freshly
@@ -347,21 +573,7 @@ impl JitBackend {
         code: &CodeBlock,
         context: &mut Context,
     ) -> CompletionRecord {
-        let compiled = self.compile_codeblock(code);
-        // SAFETY: `context` is a valid exclusive borrow for the duration of the
-        // call; the compiled code only touches it through the `extern "C"` shims.
-        let status = compiled(std::ptr::from_mut(context));
-        if status & JIT_BREAK_BIT != 0 {
-            context
-                .vm
-                .jit_pending
-                .take()
-                .expect("a break status must have stashed a completion record")
-        } else {
-            // The JIT deopted at `frame.pc`; finish in the interpreter, which
-            // resumes from there (running any branch taken or callee pushed).
-            context.run()
-        }
+        self.run_cached_entry(code, context)
     }
 }
 
@@ -450,6 +662,53 @@ mod tests {
             .evaluate_jit(&mut c2, &mut backend)
             .expect("jit #2 (must not panic)");
         assert_eq!(r2.as_i32(), Some(42));
+    }
+
+    #[test]
+    fn jit_backend_caches_codeblock_entries() {
+        let mut context = Context::default();
+        let script = crate::Script::parse(crate::Source::from_bytes("1 + 1"), None, &mut context)
+            .expect("parse");
+        let mut backend = JitBackend::new();
+
+        assert_eq!(
+            script
+                .evaluate_jit(&mut context, &mut backend)
+                .unwrap()
+                .as_i32(),
+            Some(2)
+        );
+        assert_eq!(
+            script
+                .evaluate_jit(&mut context, &mut backend)
+                .unwrap()
+                .as_i32(),
+            Some(2)
+        );
+
+        let stats = backend.stats();
+        assert_eq!(stats.cache_requests, 2);
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.compilations, 1);
+        assert_eq!(stats.native_entries, 2);
+    }
+
+    #[test]
+    fn jit_exit_round_trip() {
+        for (kind, pc) in [
+            (JitExitKind::Deopt, 0),
+            (JitExitKind::Return, 17),
+            (JitExitKind::Call, u32::MAX),
+            (JitExitKind::Completion, 42),
+            (JitExitKind::Budget, 99),
+        ] {
+            let status = JitExit::encode(kind, pc);
+            assert_eq!(JitExit::decode(status), Some(JitExit { kind, pc }));
+        }
+
+        assert_eq!(JitExit::decode(7), None);
+        assert_eq!(JitExit::decode(JIT_BREAK_BIT), None);
     }
 
     /// Run `src` through both the interpreter and the JIT and assert identical
