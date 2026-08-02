@@ -375,7 +375,9 @@ struct Helpers {
     get_argument_i32: Helper,
     get_argument_f64: Helper,
     dense_guard: Helper,
+    dense_guard_f64: Helper,
     dense_i32: Helper,
+    dense_f64: Helper,
     named_guard: Helper,
     named_i32: Helper,
     named_f64: Helper,
@@ -600,10 +602,20 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32, types::I32, types::I32],
                 types::I64,
             ),
+            dense_guard_f64: make(
+                jit_dense_array_guard_f64 as *const () as usize,
+                &[ptr, types::I32, types::F64, types::I32],
+                types::I64,
+            ),
             dense_i32: make(
                 jit_dense_array_i32 as *const () as usize,
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I32,
+            ),
+            dense_f64: make(
+                jit_dense_array_f64 as *const () as usize,
+                &[ptr, types::I32, types::F64, types::I32],
+                types::F64,
             ),
             named_guard: make(
                 jit_named_property_guard as *const () as usize,
@@ -916,24 +928,30 @@ impl<'a> NativeCompiler<'a> {
                 let Some(key) = self.use_register(bcx, register(*key)) else {
                     return false;
                 };
-                if self.mode == NativeMode::F64 {
-                    return false;
-                }
                 let dst = register(*dst);
                 let object = bcx.ins().iconst(types::I32, object as i64);
                 let ic_index = bcx.ins().iconst(types::I32, u32::from(*ic_index) as i64);
-                let mode = bcx
-                    .ins()
-                    .iconst(types::I32, i64::from(self.mode == NativeMode::F64));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let guard_helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.dense_guard.address as i64);
-                let guard = bcx.ins().call_indirect(
-                    helpers.dense_guard.signature,
-                    guard_helper,
-                    &[ctx, object, key, ic_index, mode],
-                );
+                let guard = if self.mode == NativeMode::F64 {
+                    let guard_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.dense_guard_f64.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.dense_guard_f64.signature,
+                        guard_helper,
+                        &[ctx, object, key, ic_index],
+                    )
+                } else {
+                    let mode = bcx.ins().iconst(types::I32, 0);
+                    let guard_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.dense_guard.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.dense_guard.signature,
+                        guard_helper,
+                        &[ctx, object, key, ic_index, mode],
+                    )
+                };
                 let guard = bcx.inst_results(guard)[0];
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
@@ -943,14 +961,25 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 }
                 bcx.switch_to_block(cont);
-                let load_helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.dense_i32.address as i64);
-                let result = bcx.ins().call_indirect(
-                    helpers.dense_i32.signature,
-                    load_helper,
-                    &[ctx, object, key, ic_index],
-                );
+                let result = if self.mode == NativeMode::F64 {
+                    let load_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.dense_f64.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.dense_f64.signature,
+                        load_helper,
+                        &[ctx, object, key, ic_index],
+                    )
+                } else {
+                    let load_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.dense_i32.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.dense_i32.signature,
+                        load_helper,
+                        &[ctx, object, key, ic_index],
+                    )
+                };
                 let result = bcx.inst_results(result)[0];
                 if !self.define_register(bcx, dst, result) {
                     return false;
@@ -1600,6 +1629,15 @@ fn dense_array_value(
     ic_index: u32,
 ) -> Option<(IndexedKind, JsValue)> {
     let index = u32::try_from(index).ok()?;
+    dense_array_value_at(context, register, index, ic_index)
+}
+
+fn dense_array_value_at(
+    context: &Context,
+    register: u32,
+    index: u32,
+    ic_index: u32,
+) -> Option<(IndexedKind, JsValue)> {
     let value = context.vm.get_register(register as usize);
     let object = value.as_object_borrowed()?;
     let object = object.borrow();
@@ -1612,6 +1650,18 @@ fn dense_array_value(
     let kind = ic.matches(object.shape())?;
     let value = object.properties().get_indexed_data_property(index)?;
     Some((kind, value))
+}
+
+fn dense_array_value_f64(
+    context: &Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+) -> Option<(IndexedKind, JsValue)> {
+    if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > u32::MAX as f64 {
+        return None;
+    }
+    dense_array_value_at(context, register, index as u32, ic_index)
 }
 
 extern "C" fn jit_dense_array_guard(
@@ -1645,6 +1695,36 @@ extern "C" fn jit_dense_array_i32(
     dense_array_value(context, register, index, ic_index)
         .and_then(|(_, value)| value.as_i32())
         .unwrap_or_default()
+}
+
+extern "C" fn jit_dense_array_guard_f64(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some((kind, value)) = dense_array_value_f64(context, register, index, ic_index) else {
+        return 0;
+    };
+    u64::from(
+        matches!(kind, IndexedKind::DenseI32 | IndexedKind::DenseF64)
+            && value.as_number().is_some(),
+    )
+}
+
+extern "C" fn jit_dense_array_f64(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+) -> f64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    dense_array_value_f64(context, register, index, ic_index)
+        .and_then(|(_, value)| value.as_number())
+        .unwrap_or(0.0)
 }
 
 fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Option<JsValue> {

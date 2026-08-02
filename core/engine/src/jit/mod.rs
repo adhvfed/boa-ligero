@@ -817,6 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_runs_native_dense_floating_array_load() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(values, n) { let total = 0.5; for (let i = 0; i < n; i++) { total = total + values[i]; } return total; } let values = [1.25, 2.5, 3.75]; let answer = 0; for (let j = 0; j < 80; j++) { answer = sum(values, 3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_number(), Some(8.0));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_runs_native_monomorphic_property_load() {
         let mut context = Context::default();
         context.enable_jit();
