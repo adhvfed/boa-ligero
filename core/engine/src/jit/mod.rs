@@ -1228,9 +1228,9 @@ mod tests {
     }
 
     /// Run `src` through both the interpreter and the JIT and assert identical
-    /// `i32` results. Exercises the JIT execution + deopt-to-interpreter hand-off
-    /// across program shapes (the JIT deopts on control flow today, so these
-    /// confirm the hand-off is correct before native loops/calls are added).
+    /// `i32` results. Exercises the explicit JIT execution and
+    /// deopt-to-interpreter hand-off across program shapes; the tiered tests
+    /// below separately cover native loops, property reads, and calls.
     fn assert_jit_matches_interp(src: &str, expected: i32) {
         let mut c1 = Context::default();
         let s1 =

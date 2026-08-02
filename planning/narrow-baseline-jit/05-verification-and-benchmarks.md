@@ -3,13 +3,14 @@
 The JIT must be verified as a second implementation of the VM boundary, not
 only as a Cranelift code-generation test.
 
-The first baseline checkpoint (2026-08-02) has 17 focused JIT tests, including
-native integer/floating loops, dense integer/floating reads, monomorphic named
-loads, ordinary calls, and guard-failure handoffs. The release warm-loop probe
-reports 7.62 ms native versus 54.54 ms interpreter (0.140 ratio) on the
-development machine, with compilation reported separately in `JitStats`.
-This does not replace the matching-shape, mismatch-shape, and browser-workload
-gates below.
+The 2026-08-02 baseline checkpoint has 25 filtered JIT tests (24 active, 1
+ignored), including native integer/floating loops, dense integer/floating
+reads, monomorphic named loads, ordinary calls, type/overflow fallback,
+runtime-limit safepoints, exception/recursion propagation, array holes, and
+forced GC around property guards. The release warm-loop probe reports 7.62 ms
+native versus 54.54 ms interpreter (0.140 ratio) on the development machine,
+with compilation reported separately in `JitStats`. This does not replace the
+matching-shape, mismatch-shape, and browser-workload gates below.
 
 ## Test layers
 

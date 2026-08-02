@@ -1,6 +1,6 @@
 # Narrow baseline JIT
 
-Status: baseline tier implemented; hardening and workload integration remain.
+Status: baseline tier implemented; workload integration remains.
 This directory is the implementation plan and verification contract for
 turning Boa's experimental Cranelift integration into a small, safe,
 measurable hot-code tier.
@@ -18,8 +18,11 @@ interpreter fallback.
 The release warm-loop probe (`jit_loop_perf`) measured 7.62 ms with the native
 baseline versus 54.54 ms in the interpreter on the same machine (0.140 ratio,
 including a separate ~4 ms compile phase during warm-up). This is a synthetic
-signal, not a workload gate; the remaining work is differential hardening,
-guard observability, and browser-shaped cold/warm measurements.
+signal, not a workload gate. The follow-up hardening checkpoint has 25
+filtered JIT tests (24 active, 1 ignored), covering type/overflow fallback,
+call-target replacement, runtime limits, exceptions, recursion, array holes,
+and forced GC around property guards. The remaining work is guard
+observability and browser-shaped cold/warm measurements.
 
 The goal is not to compile all JavaScript immediately. The goal is to compile
 the small set of operations that dominate hot, ordinary functions and loops,
