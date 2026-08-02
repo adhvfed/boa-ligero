@@ -1815,7 +1815,9 @@ extern "C" fn jit_call_ordinary(
     let Some(ordinary) = object.downcast_ref::<OrdinaryFunction>() else {
         return JIT_GUARD_FAIL_BIT;
     };
-    if ordinary.codeblock().debug_id != expected_target {
+    if ordinary.codeblock().is_class_constructor()
+        || ordinary.codeblock().debug_id != expected_target
+    {
         return JIT_GUARD_FAIL_BIT;
     }
 

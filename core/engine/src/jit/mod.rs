@@ -302,6 +302,9 @@ impl JitBackend {
         let Some(function) = object.downcast_ref::<OrdinaryFunction>() else {
             return;
         };
+        if function.codeblock().is_class_constructor() {
+            return;
+        }
         self.call_targets
             .insert((code.debug_id, pc), function.codeblock().debug_id);
     }
@@ -660,6 +663,7 @@ impl Default for JitBackend {
 mod tests {
     use super::*;
     use crate::JsValue;
+    use crate::error::{EngineError, RuntimeLimitError};
 
     /// A host helper that drives real VM state: it pushes a value onto the VM
     /// stack and returns a sentinel. Reaching `context.vm.stack` proves the
@@ -892,6 +896,233 @@ mod tests {
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_numeric_type_and_overflow_guards() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } let value = 0; for (let i = 0; i < 80; i++) { value = add(i, 1); } for (let i = 0; i < 80; i++) { value = subtract(i, 1); } let overflow = add(2147483647, 1); let text = add(\"x\", \"y\"); let negativeZero = subtract(-0, 0); (overflow === 2147483648 && text === \"xy\" && Object.is(negativeZero, -0)) ? 1 : 0",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(1));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 3, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_charges_native_loop_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define");
+
+        let warmup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(10); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse warmup");
+        warmup.evaluate(&mut context).expect("warm up");
+
+        context.runtime_limits_mut().set_loop_iteration_limit(3);
+        let limited =
+            crate::Script::parse(crate::Source::from_bytes("sum(10)"), None, &mut context)
+                .expect("parse limited call");
+        let error = limited
+            .evaluate(&mut context)
+            .expect_err("native loop must enforce the runtime limit");
+
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_bypasses_native_entry_with_instruction_budget() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define");
+
+        let warmup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(10); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse warmup");
+        warmup.evaluate(&mut context).expect("warm up");
+
+        context.set_instruction_budget(20);
+        let limited =
+            crate::Script::parse(crate::Source::from_bytes("sum(100)"), None, &mut context)
+                .expect("parse limited call");
+        let error = limited
+            .evaluate(&mut context)
+            .expect_err("the finite instruction budget must stop execution");
+
+        assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+        assert_eq!(context.instruction_budget_remaining(), Some(0));
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.deopts >= 1,
+            "the hot function must deopt around the budget: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_preserves_exception_propagation_through_call() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function fail() { throw new Error(\"boom\"); } function apply(function_value) { return function_value(); } let caught = 0; for (let i = 0; i < 80; i++) { try { apply(fail); } catch (error) { if (error.message === \"boom\") { caught++; } } } caught",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(80));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_preserves_recursion_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function recurse(n) { if (n === 0) { return 0; } return 1 + recurse(n - 1); }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define");
+
+        let warmup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let warm = 0; for (let i = 0; i < 80; i++) { warm = recurse(10); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse warmup");
+        warmup.evaluate(&mut context).expect("warm up");
+
+        context.runtime_limits_mut().set_recursion_limit(8);
+        let limited = crate::Script::parse(
+            crate::Source::from_bytes("recurse(100)"),
+            None,
+            &mut context,
+        )
+        .expect("parse limited recursion");
+        let error = limited
+            .evaluate(&mut context)
+            .expect_err("native recursion must enforce the runtime limit");
+
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::Recursion))
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_dense_load_on_hole() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(values, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + values[i]; } return total; } let values = [1, 2, 3]; let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(values, 3); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("setup");
+
+        let hole = crate::Script::parse(
+            crate::Source::from_bytes(
+                "delete values[1]; let result = sum(values, 3); result !== result",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse hole case");
+        let result = hole.evaluate(&mut context).expect("evaluate hole case");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_survives_forced_gc_around_property_guard() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(object) { return object.value; } let object = { value: 3 }; let warm = 0; for (let i = 0; i < 80; i++) { warm = read(object); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("setup");
+
+        boa_gc::force_collect();
+
+        let after_gc = crate::Script::parse(
+            crate::Source::from_bytes("read(object)"),
+            None,
+            &mut context,
+        )
+        .expect("parse after GC");
+        let result = after_gc.evaluate(&mut context).expect("evaluate after GC");
+        assert_eq!(result.as_i32(), Some(3));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
     }
 
