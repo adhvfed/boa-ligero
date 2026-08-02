@@ -6,7 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::vm::{CodeBlock, Instruction, InstructionIterator};
+use crate::object::shape::slot::SlotAttributes;
+use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
 use crate::{Context, JsValue};
 
 use super::{JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitExit, JitExitKind};
@@ -107,6 +108,149 @@ fn select_mode(instructions: &DecodedInstructions) -> NativeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegisterKind {
+    Numeric,
+    Boxed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegisterDefinition {
+    source: Option<usize>,
+    kind: RegisterKind,
+}
+
+struct RegisterAnalysis {
+    before: Vec<Vec<RegisterKind>>,
+    after: Vec<Vec<RegisterKind>>,
+}
+
+fn analyze_registers(
+    instructions: &DecodedInstructions,
+    register_count: usize,
+) -> RegisterAnalysis {
+    // Register numbers are reused by the bytecode allocator. Track the
+    // current definition instead of assigning one type to the whole register
+    // number; otherwise an object argument can incorrectly poison a later
+    // integer definition in the same register.
+    let mut definitions: Vec<RegisterDefinition> = (0..register_count)
+        .map(|_| RegisterDefinition {
+            source: None,
+            kind: RegisterKind::Numeric,
+        })
+        .collect();
+    let mut current: Vec<usize> = (0..register_count).collect();
+    let mut before_ids = Vec::with_capacity(instructions.instructions.len());
+    let mut after_ids = Vec::with_capacity(instructions.instructions.len());
+
+    for (_, _, instruction) in &instructions.instructions {
+        before_ids.push(current.clone());
+
+        for register in object_operands(instruction) {
+            mark_definition(current[register], &mut definitions);
+        }
+
+        if let Some((register, source, kind)) =
+            output_definition(instruction, &current, &definitions)
+        {
+            let definition = definitions.len();
+            definitions.push(RegisterDefinition { source, kind });
+            if let Some(current_definition) = current.get_mut(register) {
+                *current_definition = definition;
+            }
+        }
+
+        after_ids.push(current.clone());
+    }
+
+    let kinds = |ids: &[usize]| {
+        ids.iter()
+            .map(|definition| {
+                definitions
+                    .get(*definition)
+                    .map_or(RegisterKind::Boxed, |definition| definition.kind)
+            })
+            .collect()
+    };
+
+    RegisterAnalysis {
+        before: before_ids.iter().map(|ids| kinds(ids)).collect(),
+        after: after_ids.iter().map(|ids| kinds(ids)).collect(),
+    }
+}
+
+fn mark_definition(definition: usize, definitions: &mut [RegisterDefinition]) {
+    let Some(definition_info) = definitions.get_mut(definition) else {
+        return;
+    };
+    if definition_info.kind == RegisterKind::Boxed {
+        return;
+    }
+    definition_info.kind = RegisterKind::Boxed;
+    if let Some(source) = definition_info.source {
+        mark_definition(source, definitions);
+    }
+}
+
+fn object_operands(instruction: &Instruction) -> Vec<usize> {
+    match instruction {
+        Instruction::GetLengthProperty { value, .. }
+        | Instruction::GetPropertyByName { value, .. } => vec![usize::from(*value)],
+        Instruction::GetPropertyByNameWithThis {
+            receiver, value, ..
+        } => vec![usize::from(*receiver), usize::from(*value)],
+        Instruction::GetPropertyByValue {
+            receiver, object, ..
+        }
+        | Instruction::GetPropertyByValuePush {
+            receiver, object, ..
+        } => vec![usize::from(*receiver), usize::from(*object)],
+        _ => Vec::new(),
+    }
+}
+
+fn output_definition(
+    instruction: &Instruction,
+    current: &[usize],
+    definitions: &[RegisterDefinition],
+) -> Option<(usize, Option<usize>, RegisterKind)> {
+    let numeric = |register: usize| (register, None, RegisterKind::Numeric);
+    let boxed = |register: usize| (register, None, RegisterKind::Boxed);
+    let moved = |dst: usize, src: usize| {
+        let kind = definitions
+            .get(current.get(src).copied().unwrap_or(usize::MAX))
+            .map_or(RegisterKind::Boxed, |definition| definition.kind);
+        (dst, current.get(src).copied(), kind)
+    };
+
+    match instruction {
+        Instruction::GetArgument { dst, .. }
+        | Instruction::StoreZero { dst }
+        | Instruction::StoreOne { dst }
+        | Instruction::StoreInt8 { dst, .. }
+        | Instruction::StoreInt16 { dst, .. }
+        | Instruction::StoreInt32 { dst, .. }
+        | Instruction::StoreFloat { dst, .. }
+        | Instruction::StoreDouble { dst, .. }
+        | Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Inc { dst, .. }
+        | Instruction::PopIntoRegister { dst }
+        | Instruction::GetPropertyByName { dst, .. }
+        | Instruction::GetLengthProperty { dst, .. }
+        | Instruction::GetPropertyByNameWithThis { dst, .. }
+        | Instruction::GetPropertyByValue { dst, .. }
+        | Instruction::GetPropertyByValuePush { dst, .. } => Some(numeric(usize::from(*dst))),
+        Instruction::Move { dst, src } => Some(moved(usize::from(*dst), usize::from(*src))),
+        Instruction::GetFunction { dst, .. } | Instruction::StoreNewArray { dst } => {
+            Some(boxed(usize::from(*dst)))
+        }
+        _ => None,
+    }
+}
+
 fn eligible(code: &CodeBlock) -> bool {
     code.is_ordinary() && code.handlers.is_empty() && code.register_count <= 128
 }
@@ -126,6 +270,9 @@ fn is_supported(opcode: crate::vm::Opcode, instruction: &Instruction) -> bool {
         | (Opcode::StoreFloat, Instruction::StoreFloat { .. })
         | (Opcode::StoreDouble, Instruction::StoreDouble { .. })
         | (Opcode::Move, Instruction::Move { .. })
+        | (Opcode::GetPropertyByName, Instruction::GetPropertyByName { .. })
+        | (Opcode::GetPropertyByNameWithThis, Instruction::GetPropertyByNameWithThis { .. })
+        | (Opcode::GetPropertyByValue, Instruction::GetPropertyByValue { .. })
         | (Opcode::Add, Instruction::Add { .. })
         | (Opcode::Sub, Instruction::Sub { .. })
         | (Opcode::Div, Instruction::Div { .. })
@@ -188,8 +335,17 @@ struct Helpers {
     guard: Helper,
     guard_argument_number: Helper,
     guard_stack_number: Helper,
+    copy_argument_register: Helper,
+    copy_register: Helper,
+    push_register: Helper,
+    set_return_register: Helper,
     get_argument_i32: Helper,
     get_argument_f64: Helper,
+    dense_guard: Helper,
+    dense_i32: Helper,
+    named_guard: Helper,
+    named_i32: Helper,
+    named_f64: Helper,
     set_pc: Helper,
     store_i32: Helper,
     store_f64: Helper,
@@ -208,6 +364,8 @@ struct NativeCompiler<'a> {
     code: &'a CodeBlock,
     instructions: DecodedInstructions,
     mode: NativeMode,
+    analysis: RegisterAnalysis,
+    current_instruction: usize,
     helpers: Option<Helpers>,
     variables: Vec<Variable>,
     dirty: BTreeSet<usize>,
@@ -220,11 +378,14 @@ impl<'a> NativeCompiler<'a> {
         instructions: DecodedInstructions,
         mode: NativeMode,
     ) -> Option<Self> {
+        let analysis = analyze_registers(&instructions, code.register_count as usize);
         Some(Self {
             backend,
             code,
             instructions,
             mode,
+            analysis,
+            current_instruction: 0,
             helpers: None,
             variables: Vec::new(),
             dirty: BTreeSet::new(),
@@ -290,6 +451,7 @@ impl<'a> NativeCompiler<'a> {
             };
             let block = code_blocks[index];
             bcx.switch_to_block(block);
+            self.current_instruction = index;
 
             if !self.emit_instruction(
                 &mut bcx,
@@ -369,6 +531,26 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr],
                 types::I64,
             ),
+            copy_argument_register: make(
+                jit_copy_argument_register as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I64,
+            ),
+            copy_register: make(
+                jit_copy_register as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I64,
+            ),
+            push_register: make(
+                jit_push_register as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            set_return_register: make(
+                jit_set_return_register as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             get_argument_i32: make(
                 jit_get_argument_i32 as *const () as usize,
                 &[ptr, types::I32],
@@ -377,6 +559,31 @@ impl<'a> NativeCompiler<'a> {
             get_argument_f64: make(
                 jit_get_argument_f64 as *const () as usize,
                 &[ptr, types::I32],
+                types::F64,
+            ),
+            dense_guard: make(
+                jit_dense_array_guard as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
+            dense_i32: make(
+                jit_dense_array_i32 as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32],
+                types::I32,
+            ),
+            named_guard: make(
+                jit_named_property_guard as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
+            named_i32: make(
+                jit_named_property_i32 as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I32,
+            ),
+            named_f64: make(
+                jit_named_property_f64 as *const () as usize,
+                &[ptr, types::I32, types::I32],
                 types::F64,
             ),
             set_pc: make(
@@ -455,62 +662,75 @@ impl<'a> NativeCompiler<'a> {
         match instruction {
             Instruction::GetArgument { index, dst } => {
                 let index = bcx.ins().iconst(types::I32, u32::from(*index) as i64);
-                let deopt = bcx.create_block();
-                let cont = bcx.create_block();
+                let dst = register(*dst);
+                if self.defined_register_kind(dst) == RegisterKind::Boxed {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.copy_argument_register.address as i64);
+                    let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+                    bcx.ins().call_indirect(
+                        helpers.copy_argument_register.signature,
+                        helper,
+                        &[ctx, index, dst_value],
+                    );
+                } else {
+                    let deopt = bcx.create_block();
+                    let cont = bcx.create_block();
 
-                match self.mode {
-                    NativeMode::I32 => {
-                        let helper = bcx
-                            .ins()
-                            .iconst(helpers.ptr, helpers.get_argument_i32.address as i64);
-                        let result = bcx.ins().call_indirect(
-                            helpers.get_argument_i32.signature,
-                            helper,
-                            &[ctx, index],
-                        );
-                        let result = bcx.inst_results(result)[0];
-                        let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
-                        let failed = bcx.ins().band(result, fail_mask);
-                        bcx.ins().brif(failed, deopt, &[], cont, &[]);
+                    match self.mode {
+                        NativeMode::I32 => {
+                            let helper = bcx
+                                .ins()
+                                .iconst(helpers.ptr, helpers.get_argument_i32.address as i64);
+                            let result = bcx.ins().call_indirect(
+                                helpers.get_argument_i32.signature,
+                                helper,
+                                &[ctx, index],
+                            );
+                            let result = bcx.inst_results(result)[0];
+                            let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                            let failed = bcx.ins().band(result, fail_mask);
+                            bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
-                        bcx.switch_to_block(deopt);
-                        if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                            return false;
+                            bcx.switch_to_block(deopt);
+                            if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                                return false;
+                            }
+                            bcx.switch_to_block(cont);
+                            let value = bcx.ins().ireduce(types::I32, result);
+                            if !self.define_register(bcx, dst, value) {
+                                return false;
+                            }
                         }
-                        bcx.switch_to_block(cont);
-                        let value = bcx.ins().ireduce(types::I32, result);
-                        if !self.define_register(bcx, register(*dst), value) {
-                            return false;
-                        }
-                    }
-                    NativeMode::F64 => {
-                        let helper = bcx
-                            .ins()
-                            .iconst(helpers.ptr, helpers.guard_argument_number.address as i64);
-                        let guard = bcx.ins().call_indirect(
-                            helpers.guard_argument_number.signature,
-                            helper,
-                            &[ctx, index],
-                        );
-                        let guard = bcx.inst_results(guard)[0];
-                        bcx.ins().brif(guard, cont, &[], deopt, &[]);
+                        NativeMode::F64 => {
+                            let helper = bcx
+                                .ins()
+                                .iconst(helpers.ptr, helpers.guard_argument_number.address as i64);
+                            let guard = bcx.ins().call_indirect(
+                                helpers.guard_argument_number.signature,
+                                helper,
+                                &[ctx, index],
+                            );
+                            let guard = bcx.inst_results(guard)[0];
+                            bcx.ins().brif(guard, cont, &[], deopt, &[]);
 
-                        bcx.switch_to_block(deopt);
-                        if !self.emit_deopt(bcx, ctx, helpers, pc) {
-                            return false;
-                        }
-                        bcx.switch_to_block(cont);
-                        let helper = bcx
-                            .ins()
-                            .iconst(helpers.ptr, helpers.get_argument_f64.address as i64);
-                        let result = bcx.ins().call_indirect(
-                            helpers.get_argument_f64.signature,
-                            helper,
-                            &[ctx, index],
-                        );
-                        let value = bcx.inst_results(result)[0];
-                        if !self.define_register(bcx, register(*dst), value) {
-                            return false;
+                            bcx.switch_to_block(deopt);
+                            if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                                return false;
+                            }
+                            bcx.switch_to_block(cont);
+                            let helper = bcx
+                                .ins()
+                                .iconst(helpers.ptr, helpers.get_argument_f64.address as i64);
+                            let result = bcx.ins().call_indirect(
+                                helpers.get_argument_f64.signature,
+                                helper,
+                                &[ctx, index],
+                            );
+                            let value = bcx.inst_results(result)[0];
+                            if !self.define_register(bcx, dst, value) {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -564,10 +784,136 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::Move { dst, src } => {
-                let Some(value) = self.use_register(bcx, register(*src)) else {
+                let dst = register(*dst);
+                let src = register(*src);
+                if self.register_kind(src) == RegisterKind::Boxed {
+                    if self.defined_register_kind(dst) != RegisterKind::Boxed {
+                        return false;
+                    }
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.copy_register.address as i64);
+                    let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+                    let src_value = bcx.ins().iconst(types::I32, src as i64);
+                    bcx.ins().call_indirect(
+                        helpers.copy_register.signature,
+                        helper,
+                        &[ctx, dst_value, src_value],
+                    );
+                } else {
+                    let Some(value) = self.use_register(bcx, src) else {
+                        return false;
+                    };
+                    if !self.define_register(bcx, dst, value) {
+                        return false;
+                    }
+                }
+            }
+            Instruction::GetPropertyByName {
+                dst,
+                value,
+                ic_index,
+            }
+            | Instruction::GetPropertyByNameWithThis {
+                dst,
+                value,
+                ic_index,
+                ..
+            } => {
+                if self.register_kind(usize::from(*value)) != RegisterKind::Boxed {
+                    return false;
+                }
+                let dst = register(*dst);
+                let object = bcx.ins().iconst(types::I32, usize::from(*value) as i64);
+                let ic_index = bcx.ins().iconst(types::I32, u32::from(*ic_index) as i64);
+                let mode = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(self.mode == NativeMode::F64));
+                self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let guard_helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.named_guard.address as i64);
+                let guard = bcx.ins().call_indirect(
+                    helpers.named_guard.signature,
+                    guard_helper,
+                    &[ctx, object, ic_index, mode],
+                );
+                let guard = bcx.inst_results(guard)[0];
+                let deopt = bcx.create_block();
+                let cont = bcx.create_block();
+                bcx.ins().brif(guard, cont, &[], deopt, &[]);
+                bcx.switch_to_block(deopt);
+                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    return false;
+                }
+                bcx.switch_to_block(cont);
+                let load_helper = if self.mode == NativeMode::F64 {
+                    helpers.named_f64
+                } else {
+                    helpers.named_i32
+                };
+                let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
+                let result = bcx.ins().call_indirect(
+                    load_helper.signature,
+                    load_address,
+                    &[ctx, object, ic_index],
+                );
+                let result = bcx.inst_results(result)[0];
+                if !self.define_register(bcx, dst, result) {
+                    return false;
+                }
+            }
+            Instruction::GetPropertyByValue {
+                dst,
+                key,
+                object,
+                ic_index,
+                ..
+            } => {
+                let object = usize::from(*object);
+                if self.register_kind(object) != RegisterKind::Boxed {
+                    return false;
+                }
+                let Some(key) = self.use_register(bcx, register(*key)) else {
                     return false;
                 };
-                if !self.define_register(bcx, register(*dst), value) {
+                if self.mode == NativeMode::F64 {
+                    return false;
+                }
+                let dst = register(*dst);
+                let object = bcx.ins().iconst(types::I32, object as i64);
+                let ic_index = bcx.ins().iconst(types::I32, u32::from(*ic_index) as i64);
+                let mode = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(self.mode == NativeMode::F64));
+                self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let guard_helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.dense_guard.address as i64);
+                let guard = bcx.ins().call_indirect(
+                    helpers.dense_guard.signature,
+                    guard_helper,
+                    &[ctx, object, key, ic_index, mode],
+                );
+                let guard = bcx.inst_results(guard)[0];
+                let deopt = bcx.create_block();
+                let cont = bcx.create_block();
+                bcx.ins().brif(guard, cont, &[], deopt, &[]);
+                bcx.switch_to_block(deopt);
+                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    return false;
+                }
+                bcx.switch_to_block(cont);
+                let load_helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.dense_i32.address as i64);
+                let result = bcx.ins().call_indirect(
+                    helpers.dense_i32.signature,
+                    load_helper,
+                    &[ctx, object, key, ic_index],
+                );
+                let result = bcx.inst_results(result)[0];
+                if !self.define_register(bcx, dst, result) {
                     return false;
                 }
             }
@@ -803,18 +1149,31 @@ impl<'a> NativeCompiler<'a> {
                 bcx.switch_to_block(continuation);
             }
             Instruction::PushFromRegister { src } => {
-                let Some(value) = self.use_register(bcx, register(*src)) else {
-                    return false;
-                };
+                let src = register(*src);
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let helper = if self.mode == NativeMode::F64 {
-                    helpers.push_f64
+                if self.register_kind(src) == RegisterKind::Boxed {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.push_register.address as i64);
+                    let src_value = bcx.ins().iconst(types::I32, src as i64);
+                    bcx.ins().call_indirect(
+                        helpers.push_register.signature,
+                        helper,
+                        &[ctx, src_value],
+                    );
                 } else {
-                    helpers.push_i32
-                };
-                let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
-                bcx.ins()
-                    .call_indirect(helper.signature, helper_address, &[ctx, value]);
+                    let Some(value) = self.use_register(bcx, src) else {
+                        return false;
+                    };
+                    let helper = if self.mode == NativeMode::F64 {
+                        helpers.push_f64
+                    } else {
+                        helpers.push_i32
+                    };
+                    let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+                    bcx.ins()
+                        .call_indirect(helper.signature, helper_address, &[ctx, value]);
+                }
             }
             Instruction::PopIntoRegister { dst } => {
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
@@ -871,18 +1230,31 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::SetAccumulator { src } => {
-                let Some(value) = self.use_register(bcx, register(*src)) else {
-                    return false;
-                };
+                let src = register(*src);
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let helper = if self.mode == NativeMode::F64 {
-                    helpers.set_return_f64
+                if self.register_kind(src) == RegisterKind::Boxed {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.set_return_register.address as i64);
+                    let src_value = bcx.ins().iconst(types::I32, src as i64);
+                    bcx.ins().call_indirect(
+                        helpers.set_return_register.signature,
+                        helper,
+                        &[ctx, src_value],
+                    );
                 } else {
-                    helpers.set_return_i32
-                };
-                let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
-                bcx.ins()
-                    .call_indirect(helper.signature, helper_address, &[ctx, value]);
+                    let Some(value) = self.use_register(bcx, src) else {
+                        return false;
+                    };
+                    let helper = if self.mode == NativeMode::F64 {
+                        helpers.set_return_f64
+                    } else {
+                        helpers.set_return_i32
+                    };
+                    let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+                    bcx.ins()
+                        .call_indirect(helper.signature, helper_address, &[ctx, value]);
+                }
             }
             Instruction::CheckReturn => {
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
@@ -909,9 +1281,30 @@ impl<'a> NativeCompiler<'a> {
         bcx: &mut FunctionBuilder<'_>,
         register: usize,
     ) -> Option<cranelift_codegen::ir::Value> {
+        if self.register_kind(register) == RegisterKind::Boxed {
+            return None;
+        }
         self.variables
             .get(register)
             .and_then(|variable| bcx.try_use_var(*variable).ok())
+    }
+
+    fn register_kind(&self, register: usize) -> RegisterKind {
+        self.analysis
+            .before
+            .get(self.current_instruction)
+            .and_then(|kinds| kinds.get(register))
+            .copied()
+            .unwrap_or(RegisterKind::Boxed)
+    }
+
+    fn defined_register_kind(&self, register: usize) -> RegisterKind {
+        self.analysis
+            .after
+            .get(self.current_instruction)
+            .and_then(|kinds| kinds.get(register))
+            .copied()
+            .unwrap_or(RegisterKind::Boxed)
     }
 
     fn define_register(
@@ -920,6 +1313,9 @@ impl<'a> NativeCompiler<'a> {
         register: usize,
         value: cranelift_codegen::ir::Value,
     ) -> bool {
+        if self.defined_register_kind(register) == RegisterKind::Boxed {
+            return false;
+        }
         let Some(variable) = self.variables.get(register) else {
             return false;
         };
@@ -1075,6 +1471,157 @@ extern "C" fn jit_guard_stack_number(context: *mut Context) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     u64::from(context.vm.stack.jit_top_is_number())
+}
+
+extern "C" fn jit_copy_argument_register(context: *mut Context, index: u32, register: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let value = context
+        .vm
+        .stack
+        .get_argument(context.vm.frame(), index as usize)
+        .cloned()
+        .unwrap_or_else(JsValue::undefined);
+    context.vm.set_register(register as usize, value);
+    0
+}
+
+extern "C" fn jit_copy_register(context: *mut Context, dst: u32, src: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let value = context.vm.get_register(src as usize).clone();
+    context.vm.set_register(dst as usize, value);
+    0
+}
+
+extern "C" fn jit_push_register(context: *mut Context, register: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let value = context.vm.get_register(register as usize).clone();
+    context.vm.stack.push(value);
+    0
+}
+
+extern "C" fn jit_set_return_register(context: *mut Context, register: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let value = context.vm.get_register(register as usize).clone();
+    context.vm.set_return_value(value);
+    0
+}
+
+fn dense_array_value(
+    context: &Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+) -> Option<(IndexedKind, JsValue)> {
+    let index = u32::try_from(index).ok()?;
+    let value = context.vm.get_register(register as usize);
+    let object = value.as_object_borrowed()?;
+    let object = object.borrow();
+    let ic = context
+        .vm
+        .frame()
+        .code_block()
+        .element_ic
+        .get(ic_index as usize)?;
+    let kind = ic.matches(object.shape())?;
+    let value = object.properties().get_indexed_data_property(index)?;
+    Some((kind, value))
+}
+
+extern "C" fn jit_dense_array_guard(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+    mode: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some((kind, value)) = dense_array_value(context, register, index, ic_index) else {
+        return 0;
+    };
+    let kind_ok = if mode == 0 {
+        kind == IndexedKind::DenseI32 && value.as_i32().is_some()
+    } else {
+        matches!(kind, IndexedKind::DenseI32 | IndexedKind::DenseF64) && value.as_number().is_some()
+    };
+    u64::from(kind_ok)
+}
+
+extern "C" fn jit_dense_array_i32(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+) -> i32 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    dense_array_value(context, register, index, ic_index)
+        .and_then(|(_, value)| value.as_i32())
+        .unwrap_or_default()
+}
+
+fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Option<JsValue> {
+    let value = context.vm.get_register(register as usize);
+    let object = value.as_object_borrowed()?;
+    let object = object.borrow();
+    let ic = context.vm.frame().code_block().ic.get(ic_index as usize)?;
+    let slot = ic.get(object.shape())?;
+    if slot.attributes.has_get() {
+        return None;
+    }
+    if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
+        let prototype = object.shape().prototype()?;
+        let prototype = prototype.borrow();
+        prototype
+            .properties()
+            .storage
+            .get(slot.index as usize)
+            .cloned()
+    } else {
+        object
+            .properties()
+            .storage
+            .get(slot.index as usize)
+            .cloned()
+    }
+}
+
+extern "C" fn jit_named_property_guard(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+    mode: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some(value) = named_property_value(context, register, ic_index) else {
+        return 0;
+    };
+    u64::from(if mode == 0 {
+        value.as_i32().is_some()
+    } else {
+        value.as_number().is_some()
+    })
+}
+
+extern "C" fn jit_named_property_i32(context: *mut Context, register: u32, ic_index: u32) -> i32 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    named_property_value(context, register, ic_index)
+        .and_then(|value| value.as_i32())
+        .unwrap_or_default()
+}
+
+extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_index: u32) -> f64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    named_property_value(context, register, ic_index)
+        .and_then(|value| value.as_number())
+        .unwrap_or(0.0)
 }
 
 extern "C" fn jit_get_argument_i32(context: *mut Context, index: u32) -> u64 {

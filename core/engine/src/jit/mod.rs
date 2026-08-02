@@ -796,6 +796,27 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_runs_native_dense_integer_array_load() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(values, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + values[i]; } return total; } let values = [1, 2, 3]; let answer = 0; for (let j = 0; j < 80; j++) { answer = sum(values, 3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(6));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn jit_exit_round_trip() {
         for (kind, pc) in [
             (JitExitKind::Deopt, 0),
