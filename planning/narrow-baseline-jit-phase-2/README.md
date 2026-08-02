@@ -2,10 +2,10 @@
 
 Status: implementation underway, scheduled 2026-08-03. Phase 1 is landed
 behind the opt-in `jit` feature and its first publisher-neutral Ligero workload
-gate has passed. Slice 1 now has bounded engine diagnostics and standalone JSON
-export; the Ligero projection and representative profile matrix remain before
-the first lowering decision. Each new execution ABI still requires its own
-design review before implementation.
+gate has passed. Slice 1 now has bounded engine diagnostics, standalone JSON
+export, and an opt-in Ligero projection. The representative micro/engine/bundle
+profile matrix remains before the first lowering decision. Each new execution
+ABI still requires its own design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and

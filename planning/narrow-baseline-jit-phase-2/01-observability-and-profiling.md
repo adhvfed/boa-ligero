@@ -150,6 +150,25 @@ profiling overhead on an intentionally hostile 16.6-million-native-entry warm
 sample. Headline performance measurements must therefore keep diagnostics off
 and use a separate diagnostic run, as required above.
 
-Slice 1 is not complete yet: publish the same bounded snapshot through Ligero,
-run the agreed micro/engine/browser matrix, check in its publisher-neutral
-evidence, and only then select Slice 2's smallest blocker batch.
+Ligero commit `745848d8` now publishes the same bounded snapshot through an
+embedding-owned, source-free projection. `ligero bench --jit-diagnostics`
+requires both script execution and the explicit experimental-JIT opt-in;
+snapshot collection occurs after the timed page load and JSON serialization
+after rendering. The feature-disabled build and normal JIT mode retain no
+detailed records.
+
+Five interleaved fresh-process triples on the fixed browser gate measured
+42.90 ms median interpreter load, 30.88 ms normal-JIT load, and 30.75 ms
+diagnostic-JIT load. The diagnostic mode retained three compilation records
+and one exit record with no drops: one 24-instruction numeric kernel was native,
+two entries selected shims because of exception-handler metadata, and the
+native kernel recorded 999 normal returns with zero deoptimizations. All modes
+retained the same 387 display items and 258 paint segments. One 49.52 ms
+diagnostic outlier and the standalone runner's hostile-loop overhead result
+continue to require separate diagnostic and headline runs.
+
+This closes the Ligero projection part of Slice 1, but not Gate P. The fixed
+page is deliberately native-friendly W0 evidence and cannot rank the blockers
+in a representative bundle. Run the remaining agreed micro/engine/bundle
+matrix, check in its publisher-neutral evidence, and only then select Slice
+2's smallest blocker batch or execution ABI.
