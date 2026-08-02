@@ -192,6 +192,15 @@ impl Context {
         }
     }
 
+    /// Configure the hotness thresholds used by the experimental Cranelift
+    /// tier. This has no effect while the tier is disabled.
+    #[cfg(feature = "jit")]
+    pub fn set_jit_thresholds(&mut self, thresholds: crate::jit::JitThresholds) {
+        if let Some(backend) = self.jit_backend.as_mut() {
+            backend.set_thresholds(thresholds);
+        }
+    }
+
     /// Disable the experimental Cranelift tier for this context.
     #[cfg(feature = "jit")]
     pub fn disable_jit(&mut self) {

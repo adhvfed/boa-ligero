@@ -9,6 +9,9 @@ boa_engine = { workspace = true, features = ["intl_bundled"] }
 boa_runtime.workspace = true
 
 [features]
+# Enable the experimental Cranelift tier for the optional JIT benchmark mode.
+jit = ["boa_engine/jit"]
+
 # Passthrough for the off-by-default arith-opportunity instrumentation in
 # boa_engine. Enable with `--features arith-instrument` on this crate.
 arith-instrument = ["boa_engine/arith-instrument"]

@@ -131,6 +131,19 @@ For JIT-specific measurements, add a runner mode that reports:
 - deopt count and reason;
 - the same final sink/result as the interpreter runner.
 
+The benchmark runner now provides this mode when the `boa_benches` crate is
+built with its opt-in feature:
+
+```bash
+cargo build --release -p boa_benches --bin bench-compare-runner --features jit
+RUNS=200 WARMUP=80 BOA_JIT=1 tools/bench-compare/compare.sh int-arith
+```
+
+The `boa-jit` column is the warm measurement. Its output also includes a
+fresh-context first-call duration and compile/deopt counters; the cold timer
+includes native compilation while keeping parsing and top-level setup outside
+the timing protocol. The ordinary `boa` column remains the interpreter control.
+
 Keep DCE-suspect scripts out of the headline geomean until they have a real
 observable sink. Always include a Boa-vs-Boa comparison; Node `--jitless` is a
 useful reference, not proof that Boa's JIT is correct or that a change paid for

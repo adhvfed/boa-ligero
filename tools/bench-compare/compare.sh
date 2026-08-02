@@ -5,9 +5,12 @@
 #   compare.sh                  # all scripts, all available engines
 #   compare.sh property-mono    # filter scripts by substring
 #   RUNS=200 WARMUP=10 compare.sh
+#   BOA_JIT=1 compare.sh int-arith # add Boa's opt-in warm JIT column
 #
 # Build Boa's runner first:
 #   cargo build --release -p boa_benches --bin bench-compare-runner
+# For the optional JIT column, include the feature:
+#   cargo build --release -p boa_benches --bin bench-compare-runner --features jit
 
 set -euo pipefail
 
@@ -23,19 +26,23 @@ FILTER="${1:-}"
 # Build ordered list of engine names + corresponding command (parallel arrays).
 ENGINE_NAMES=()
 ENGINE_CMDS=()
+ENGINE_MODES=()
 
 if command -v node >/dev/null 2>&1; then
-  ENGINE_NAMES+=("node"); ENGINE_CMDS+=("node $RUNNER_JS")
-  ENGINE_NAMES+=("node-jit-less"); ENGINE_CMDS+=("node --jitless $RUNNER_JS")
+  ENGINE_NAMES+=("node"); ENGINE_CMDS+=("node $RUNNER_JS"); ENGINE_MODES+=("")
+  ENGINE_NAMES+=("node-jit-less"); ENGINE_CMDS+=("node --jitless $RUNNER_JS"); ENGINE_MODES+=("")
 fi
 if command -v bun >/dev/null 2>&1; then
-  ENGINE_NAMES+=("bun"); ENGINE_CMDS+=("bun $RUNNER_JS")
+  ENGINE_NAMES+=("bun"); ENGINE_CMDS+=("bun $RUNNER_JS"); ENGINE_MODES+=("")
 fi
 if command -v deno >/dev/null 2>&1; then
-  ENGINE_NAMES+=("deno"); ENGINE_CMDS+=("deno run --allow-read $RUNNER_JS")
+  ENGINE_NAMES+=("deno"); ENGINE_CMDS+=("deno run --allow-read $RUNNER_JS"); ENGINE_MODES+=("")
 fi
 if [[ -x "$BOA_RUNNER" ]]; then
-  ENGINE_NAMES+=("boa"); ENGINE_CMDS+=("$BOA_RUNNER")
+  ENGINE_NAMES+=("boa"); ENGINE_CMDS+=("$BOA_RUNNER"); ENGINE_MODES+=("")
+  if [[ "${BOA_JIT:-0}" == "1" ]]; then
+    ENGINE_NAMES+=("boa-jit"); ENGINE_CMDS+=("$BOA_RUNNER"); ENGINE_MODES+=("jit")
+  fi
 else
   echo "warn: boa runner missing; run \`cargo build --release -p boa_benches --bin bench-compare-runner\`" >&2
 fi
@@ -62,7 +69,11 @@ for f in "$SCRIPTS_DIR"/*.js; do
   printf "%-30s" "$name"
   results=()
   for i in "${!ENGINE_NAMES[@]}"; do
-    out=$(${ENGINE_CMDS[$i]} "$f" "$RUNS" "$WARMUP" 2>/dev/null || echo "ns_per_run=NaN")
+    if [[ -n "${ENGINE_MODES[$i]}" ]]; then
+      out=$(${ENGINE_CMDS[$i]} "$f" "$RUNS" "$WARMUP" "${ENGINE_MODES[$i]}" 2>/dev/null || echo "ns_per_run=NaN")
+    else
+      out=$(${ENGINE_CMDS[$i]} "$f" "$RUNS" "$WARMUP" 2>/dev/null || echo "ns_per_run=NaN")
+    fi
     ns=$(echo "$out" | sed -n 's/.*ns_per_run=\([0-9NaN]*\).*/\1/p')
     [[ -z "$ns" ]] && ns="NaN"
     results+=("$ns")
