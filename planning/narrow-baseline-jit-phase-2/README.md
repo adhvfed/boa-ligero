@@ -3,9 +3,11 @@
 Status: implementation underway, scheduled 2026-08-03. Phase 1 is landed
 behind the opt-in `jit` feature and its first publisher-neutral Ligero workload
 gate has passed. Slice 1 now has bounded engine diagnostics, standalone JSON
-export, and an opt-in Ligero projection. The representative micro/engine/bundle
-profile matrix remains before the first lowering decision. Each new execution
-ABI still requires its own design review before implementation.
+export, an opt-in Ligero projection, and a completed representative
+micro/engine/browser profile. The profile selects an admission-policy checkpoint
+before opcode expansion; guarded receiver loading is the smallest candidate
+coverage slice after that checkpoint. Each new execution ABI still requires its
+own design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -87,6 +89,8 @@ showing that another boundary dominates.
   differential, stress, platform, and real-workload acceptance criteria.
 - [Implementation sequence](08-implementation-sequence.md) — commit-sized
   slices, dependencies, stop/go decisions, and suggested commands.
+- [Gate P profile, 2026-08-03](09-gate-p-profile-2026-08-03.md) — the measured
+  micro/engine/browser frontier, negative controls, and next-slice decision.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

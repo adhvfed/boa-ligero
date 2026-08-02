@@ -42,6 +42,15 @@ Compile only when there is evidence that the entry can amortize compilation:
 Do not lower the threshold merely to make a microbench show native entries.
 Use the cold/warm runner and the browser workload to find the crossover.
 
+The 2026-08-03 Gate P matrix makes this a prerequisite for further coverage,
+not final tuning. Three tiny helper bodies compiled natively and returned tens
+of millions of times, yet the flat-call, monomorphic-property, polymorphic-
+property, and method controls were slower with normal JIT. Before adding a
+receiver or binding lowering that can expose more such entries, establish a
+measured coverage/size admission floor or another equally explicit suppression
+rule. Validate it against both the positive W0 browser kernel and these negative
+controls; do not infer a threshold from one instruction count.
+
 ## Thresholds and hysteresis
 
 Keep function-entry, loop-backedge, OSR, and call-target thresholds separate.

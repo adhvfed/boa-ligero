@@ -25,6 +25,24 @@ Region exit             => native code returned safely to the VM
 The profile should confirm these, but the current microbench shapes make them
 the leading candidates:
 
+### Receiver reads
+
+- `This`, which is the most frequent first blocker in the measured engine
+  subset and independently blocks the monomorphic-method control;
+- an exact read of the current VM frame's already-established `this` value,
+  specialized only when the existing value/materialization model can represent
+  it safely;
+- a pre-effect representation guard and exact-PC deopt for every value shape
+  the first lowering does not support.
+
+This is a frame-value read, not permission to cache a raw object pointer in
+generated code. The implementation review must cover strict/sloppy receiver
+normalization, primitive and object receivers, bound/ordinary calls, GC while
+the value is live, and finite-budget replay. The measured method control has
+`This` at PC 18 after a supported prefix, so first determine whether adding this
+operation makes the existing PC-zero whole-CodeBlock entry useful. Do not add a
+nonzero entry merely to bypass it.
+
 ### Environment and constant reads
 
 - `GetName`, `GetNameGlobal`, and the corresponding locator/undefined forms
@@ -115,3 +133,8 @@ is not an acceptable substitute.
   interpreter;
 - native coverage and first-blocker data are visible in the diagnostic stats;
 - JIT-off builds and Phase 1 tests are unchanged.
+
+The 2026-08-03 Gate P profile adds a negative criterion: a coverage change must
+also preserve or improve the helper-heavy property, flat-call, and method
+controls. Native entry count alone is insufficient when boundary overhead can
+make an already-native tiny helper slower than interpretation.

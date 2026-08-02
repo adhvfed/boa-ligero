@@ -9,14 +9,17 @@ The 2026-08-02 Ligero gate established opt-in feature/runtime plumbing, exact
 finite-budget execution, an observable browser sink, and interleaved cold
 measurements. It is W0 evidence only; it must not select the next native ABI.
 
-## Slice 1 — profile before lowering (engine groundwork landed)
+## Slice 1 — profile before lowering (complete)
 
 Add fallback reasons, native coverage, exit/transition counters, and a fixed
 stats snapshot. Run the microbench and the agreed browser-shaped workload.
 
-The bounded engine snapshot and standalone JSON publisher landed on 2026-08-03.
-The browser bridge and profile matrix remain; Slice 2 is still blocked on that
-evidence.
+The bounded engine snapshot, standalone JSON publisher, Ligero bridge, and Gate
+P matrix completed on 2026-08-03. The dated profile records seven micro
+controls, three bounded engine workloads, W0, and a user-authorized application
+load. It identifies `This` and name/global reads as the main static frontiers,
+but also shows that several tiny native helper bodies regress complete warm
+workloads.
 
 **Stop/go:** do not proceed until the top blockers are known and the stats
 distinguish shim fallback, native deopt, and scheduler transition costs.
@@ -27,13 +30,38 @@ Suggested commit:
 test(jit): add native coverage and fallback diagnostics
 ```
 
-## Slice 2 — unblock one measured primitive region
+## Slice 2A — enforce measured admission before widening coverage
 
-Lower the smallest measured blocker batch. Environment/constant,
-bitwise/conversion, and loop-edge operations are candidates, not a checklist.
+Use the Gate P positive and negative controls to select the smallest explicit
+native-admission rule that suppresses known losing tiny/helper-dominated
+entries without excluding W0's winning numeric kernel. Record the crossover
+experiment, keep diagnostic and headline timing separate, and test duplicate
+shim/failure suppression. This slice adds no entry kind or VM ABI.
+
+**Stop/go:** property, flat-call, polymorphic-property, and method controls must
+not regress beyond the recorded noise guardrail, while W0 must retain native
+execution and its visible checksum. If no static admission rule separates the
+cases, stop and attribute transition cost before tuning a threshold.
+
+Suggested commit:
+
+```text
+perf(jit): suppress unprofitable function entries
+```
+
+## Slice 2B — unblock one measured primitive region
+
+After Slice 2A, review guarded `This` loading as the smallest measured blocker
+batch: it is the leading engine frontier and blocks the method control at PC 18.
 First record whether the current PC-zero whole-CodeBlock compiler can express
-the useful result or whether explicit region identity is required. Add exact
-guards and differential tests before adding more opcodes.
+the useful result. Add exact receiver representation, GC, strict/sloppy call,
+and finite-budget guards and differential tests before adding another opcode.
+
+Name/global reads remain the next measured candidate, but they are not part of
+the receiver patch. They require a separate VM-owned binding identity and
+invalidation design; if that contract is unavailable, do not substitute a raw
+environment pointer. Bitwise/conversion and loop-edge operations remain
+candidates, not a checklist.
 
 **Stop/go:** the selected primitive benchmark must execute a real native loop;
 if native coverage remains low, inspect the next blocker instead of starting
@@ -42,8 +70,8 @@ OSR or calls.
 Suggested commits:
 
 ```text
-perf(jit): lower guarded binding and constant reads
-perf(jit): lower guarded integer conversion and bitwise operations
+perf(jit): lower guarded receiver reads
+docs(jit): review binding-read identity and invalidation
 ```
 
 ## Slice 3 — region stitching, only if selected

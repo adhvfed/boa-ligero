@@ -167,8 +167,16 @@ retained the same 387 display items and 258 paint segments. One 49.52 ms
 diagnostic outlier and the standalone runner's hostile-loop overhead result
 continue to require separate diagnostic and headline runs.
 
-This closes the Ligero projection part of Slice 1, but not Gate P. The fixed
-page is deliberately native-friendly W0 evidence and cannot rank the blockers
-in a representative bundle. Run the remaining agreed micro/engine/bundle
-matrix, check in its publisher-neutral evidence, and only then select Slice
-2's smallest blocker batch or execution ABI.
+The remaining Gate P matrix completed on 2026-08-03. Seven micro controls, three
+bounded V8-derived engine workloads, and a user-authorized browser application
+all retained their observable sinks. Detailed diagnostics remained separate
+from headline timing and dropped no records. The full evidence and decision are
+recorded in [the dated Gate P note](09-gate-p-profile-2026-08-03.md).
+
+The result does not justify widening the allowlist mechanically. `This` is the
+largest engine first-blocker frontier and `GetName`/`GetNameGlobal` span the
+micro and engine sets, but native tiny helper bodies made several negative
+controls slower while a real application produced 1,042 loop backedges and no
+native entry. Slice 2 therefore begins with an admission-policy checkpoint,
+then tests guarded receiver loading as the smallest whole-CodeBlock coverage
+slice. Binding reads remain behind their explicit identity/invalidation review.
