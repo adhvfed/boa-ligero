@@ -360,6 +360,8 @@ dependencies = [
  "boa_runtime",
  "criterion",
  "jemallocator",
+ "serde",
+ "serde_json",
  "walkdir",
 ]
 

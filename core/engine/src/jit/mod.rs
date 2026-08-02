@@ -168,7 +168,7 @@ pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 pub const MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND: usize = 4_096;
 
 /// Bounded record limits for opt-in detailed JIT diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticLimits {
     /// Maximum number of compilation records retained by a context.
     pub compile_records: usize,
@@ -197,7 +197,8 @@ impl Default for JitDiagnosticLimits {
 }
 
 /// Artifact selected for a JIT compilation request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JitCompileOutcome {
     /// The narrow native compiler accepted the complete code block.
     Native,
@@ -206,7 +207,8 @@ pub enum JitCompileOutcome {
 }
 
 /// Why the narrow native compiler could not accept a code block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JitCompileBlockerKind {
     /// The function kind is outside the ordinary-function baseline contract.
     FunctionKind,
@@ -231,7 +233,8 @@ pub enum JitCompileBlockerKind {
 
 /// Why generated code returned to the VM.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JitExitReason {
     /// The exit did not yet carry a more specific reason.
     #[default]
@@ -281,7 +284,8 @@ impl JitExitReason {
 }
 
 /// VM-facing category of a detailed native exit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JitDiagnosticExitKind {
     /// Resume the current frame in the interpreter.
     Deopt,
@@ -308,7 +312,7 @@ impl From<JitExitKind> for JitDiagnosticExitKind {
 }
 
 /// One aggregated, source-free native exit site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitExitRecord {
     /// Runtime-local code-block identity.
     pub code_id: u64,
@@ -327,7 +331,7 @@ pub struct JitExitRecord {
 }
 
 /// One bounded, source-free compilation diagnostic.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitCompileRecord {
     /// Runtime-local code-block identity. This is not stable across processes.
     pub code_id: u64,
@@ -358,7 +362,7 @@ pub struct JitCompileRecord {
 }
 
 /// Stable snapshot of opt-in detailed JIT diagnostics.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticSnapshot {
     /// Version of the public record schema.
     pub schema_version: u32,
@@ -1180,11 +1184,13 @@ mod tests {
         assert_eq!(shim.native_instructions, 0);
         assert!(shim.supported_prefix_instructions < shim.bytecode_instructions);
         assert!(shim.code_bytes > 0, "record: {shim:?}");
+        let serialized = serde_json::to_string(&shim_snapshot).expect("serialize diagnostics");
         assert!(
-            shim.first_blocking_opcode
-                .as_deref()
-                .is_none_or(|opcode| !opcode.contains("distinctive_private_source_name"))
+            !serialized.contains("distinctive_private_source_name"),
+            "diagnostics must not contain source or function names: {serialized}"
         );
+        assert!(serialized.contains("\"unsupported_opcode\""));
+        assert!(serialized.contains("\"BitAnd\""));
 
         let mut bounded = JitBackend::new();
         bounded.enable_diagnostics(JitDiagnosticLimits {

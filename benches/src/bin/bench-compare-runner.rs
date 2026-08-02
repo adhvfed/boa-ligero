@@ -6,7 +6,9 @@
 //! This mirrors the timing protocol in `tools/bench-compare/runner.mjs` so
 //! Boa and node/bun numbers are directly comparable. When built with the
 //! `jit` feature, a fourth `jit` mode reports a warm JIT measurement and a
-//! separate first-call measurement that includes native compilation.
+//! separate first-call measurement that includes native compilation. JIT mode
+//! can also write a bounded diagnostic snapshot after timing via
+//! `--jit-diagnostics-out <path>`.
 
 #![allow(clippy::print_stdout, clippy::unwrap_used)]
 
@@ -19,7 +21,7 @@ use boa_engine::{
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: runner-boa <script.js> [runs] [warmup]");
+        print_usage();
         process::exit(2);
     }
 
@@ -31,14 +33,31 @@ fn main() {
         .filter(|mode| !mode.is_empty())
         .map(String::as_str)
         .unwrap_or("interp");
+    let diagnostics_out = parse_jit_diagnostics_output(&args[5..]).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        print_usage();
+        process::exit(2);
+    });
 
     let code = fs::read_to_string(Path::new(script_path)).expect("read script");
 
     match mode {
-        "interp" => run_interpreter(script_path, &code, runs, warmup),
+        "interp" if diagnostics_out.is_none() => {
+            run_interpreter(script_path, &code, runs, warmup);
+        }
+        "interp" => {
+            eprintln!("--jit-diagnostics-out is only valid in jit mode");
+            process::exit(2);
+        }
         "jit" => {
             #[cfg(feature = "jit")]
-            run_jit(script_path, &code, runs, warmup);
+            run_jit(
+                script_path,
+                &code,
+                runs,
+                warmup,
+                diagnostics_out.map(Path::new),
+            );
             #[cfg(not(feature = "jit"))]
             {
                 eprintln!("jit mode requires building bench-compare-runner with `--features jit`");
@@ -49,6 +68,27 @@ fn main() {
             eprintln!("unknown runner mode `{other}`; expected `interp` or `jit`");
             process::exit(2);
         }
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: runner-boa <script.js> [runs] [warmup] [interp|jit] \
+         [--jit-diagnostics-out <path>]"
+    );
+}
+
+fn parse_jit_diagnostics_output(args: &[String]) -> Result<Option<&str>, &'static str> {
+    match args {
+        [] => Ok(None),
+        [flag, path] if flag == "--jit-diagnostics-out" && !path.is_empty() => {
+            Ok(Some(path.as_str()))
+        }
+        [flag, _] if flag != "--jit-diagnostics-out" => Err("unknown runner option"),
+        [flag, _] if flag == "--jit-diagnostics-out" => {
+            Err("--jit-diagnostics-out requires a non-empty path")
+        }
+        _ => Err("expected --jit-diagnostics-out followed by one path"),
     }
 }
 
@@ -107,7 +147,13 @@ fn main_function(context: &mut Context, script_path: &str) -> boa_engine::object
 }
 
 #[cfg(feature = "jit")]
-fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
+fn run_jit(
+    script_path: &str,
+    code: &str,
+    runs: usize,
+    warmup: usize,
+    diagnostics_out: Option<&Path>,
+) {
     // The cold sample starts from a fresh backend and lowers the first main()
     // entry immediately. Script parsing and top-level setup remain outside the
     // timer, matching the existing runner protocol; the reported duration
@@ -119,7 +165,11 @@ fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
     cold_script.codeblock(cold_context).unwrap();
     cold_script.evaluate(cold_context).unwrap();
     let cold_function = main_function(cold_context, script_path);
-    cold_context.enable_jit();
+    if diagnostics_out.is_some() {
+        cold_context.enable_jit_diagnostics(boa_engine::jit::JitDiagnosticLimits::default());
+    } else {
+        cold_context.enable_jit();
+    }
     cold_context.set_jit_thresholds(boa_engine::jit::JitThresholds {
         function_entries: 1,
         loop_backedges: 1,
@@ -132,6 +182,11 @@ fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
     let cold_elapsed_ns = cold_start.elapsed().as_nanos();
     let cold_acc = cold_value.to_i32(cold_context).unwrap_or(0);
     let cold_stats = cold_context.jit_stats().expect("JIT stats");
+    let cold_diagnostics = diagnostics_out.map(|_| {
+        cold_context
+            .jit_diagnostic_snapshot()
+            .expect("JIT diagnostics")
+    });
 
     // The warm sample uses the production thresholds and a fresh context so
     // compilation is not accidentally amortized by the cold sample.
@@ -142,7 +197,11 @@ fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
     script.codeblock(context).unwrap();
     script.evaluate(context).unwrap();
     let function = main_function(context, script_path);
-    context.enable_jit();
+    if diagnostics_out.is_some() {
+        context.enable_jit_diagnostics(boa_engine::jit::JitDiagnosticLimits::default());
+    } else {
+        context.enable_jit();
+    }
 
     for _ in 0..warmup {
         function.call(&JsValue::undefined(), &[], context).unwrap();
@@ -156,6 +215,8 @@ fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
     }
     let elapsed_ns = start.elapsed().as_nanos();
     let stats = context.jit_stats().expect("JIT stats");
+    let diagnostics =
+        diagnostics_out.map(|_| context.jit_diagnostic_snapshot().expect("JIT diagnostics"));
 
     println!(
         concat!(
@@ -182,4 +243,48 @@ fn run_jit(script_path: &str, code: &str, runs: usize, warmup: usize) {
         stats.native_entries,
         stats.deopts,
     );
+
+    if let Some(output) = diagnostics_out {
+        let report = JitDiagnosticReport {
+            schema_version: 1,
+            runs,
+            warmup,
+            cold: cold_diagnostics.expect("cold diagnostics were requested"),
+            warm: diagnostics.expect("warm diagnostics were requested"),
+        };
+        let json = serde_json::to_vec_pretty(&report).expect("serialize JIT diagnostics");
+        fs::write(output, json).expect("write JIT diagnostics");
+    }
+}
+
+#[cfg(feature = "jit")]
+#[derive(serde::Serialize)]
+struct JitDiagnosticReport {
+    schema_version: u32,
+    runs: usize,
+    warmup: usize,
+    cold: boa_engine::jit::JitDiagnosticSnapshot,
+    warm: boa_engine::jit::JitDiagnosticSnapshot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_jit_diagnostics_output;
+
+    #[test]
+    fn parses_optional_jit_diagnostics_output() {
+        assert_eq!(parse_jit_diagnostics_output(&[]), Ok(None));
+        assert_eq!(
+            parse_jit_diagnostics_output(&[
+                "--jit-diagnostics-out".to_owned(),
+                "profile.json".to_owned(),
+            ]),
+            Ok(Some("profile.json"))
+        );
+        assert!(parse_jit_diagnostics_output(&["--unknown".to_owned()]).is_err());
+        assert!(
+            parse_jit_diagnostics_output(&["--jit-diagnostics-out".to_owned(), String::new(),])
+                .is_err()
+        );
+    }
 }
