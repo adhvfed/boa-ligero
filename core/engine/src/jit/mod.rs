@@ -302,7 +302,7 @@ impl JitBackend {
         let Some(function) = object.downcast_ref::<OrdinaryFunction>() else {
             return;
         };
-        if function.codeblock().is_class_constructor() {
+        if !function.codeblock().is_ordinary() || function.codeblock().is_class_constructor() {
             return;
         }
         self.call_targets
