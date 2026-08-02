@@ -330,7 +330,7 @@ fn set_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
     let (function, code) = get_codeblock(&function).unwrap();
 
     assert_eq!(code.ic.len(), 1);
-    assert_eq!(code.ic[0].entries.borrow().len(), 0);
+    assert_eq!(code.ic[0].entry_count(), 0);
 
     let o = ObjectInitializer::new(context)
         .property(js_string!("test"), 0, Attribute::all())
@@ -339,9 +339,11 @@ fn set_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
 
     function.call(&JsValue::undefined(), &[o.clone().into()], context)?;
 
-    assert_eq!(code.ic[0].entries.borrow().len(), 1);
+    assert_eq!(code.ic[0].entry_count(), 1);
     assert_eq!(
-        code.ic[0].entries.borrow()[0]
+        code.ic[0]
+            .entry(0)
+            .unwrap()
             .shape
             .upgrade()
             .unwrap()
@@ -359,7 +361,7 @@ fn get_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
     let (function, code) = get_codeblock(&function).unwrap();
 
     assert_eq!(code.ic.len(), 1);
-    assert_eq!(code.ic[0].entries.borrow().len(), 0);
+    assert_eq!(code.ic[0].entry_count(), 0);
 
     let o = ObjectInitializer::new(context)
         .property(js_string!("test"), 0, Attribute::all())
@@ -368,9 +370,11 @@ fn get_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
 
     function.call(&JsValue::undefined(), &[o.clone().into()], context)?;
 
-    assert_eq!(code.ic[0].entries.borrow().len(), 1);
+    assert_eq!(code.ic[0].entry_count(), 1);
     assert_eq!(
-        code.ic[0].entries.borrow()[0]
+        code.ic[0]
+            .entry(0)
+            .unwrap()
             .shape
             .upgrade()
             .unwrap()
@@ -435,7 +439,7 @@ fn test_polymorphic_inline_cache() -> JsResult<()> {
     let (function, code) = get_codeblock(&function).unwrap();
 
     assert_eq!(code.ic.len(), 1);
-    assert_eq!(code.ic[0].entries.borrow().len(), 0);
+    assert_eq!(code.ic[0].entry_count(), 0);
     assert!(!code.ic[0].megamorphic.get());
 
     let shapes = vec![
@@ -460,7 +464,7 @@ fn test_polymorphic_inline_cache() -> JsResult<()> {
         function.call(&JsValue::undefined(), &[o.clone().into()], context)?;
     }
 
-    assert_eq!(code.ic[0].entries.borrow().len(), 4);
+    assert_eq!(code.ic[0].entry_count(), 4);
     assert!(!code.ic[0].megamorphic.get());
 
     Ok(())
@@ -498,7 +502,7 @@ fn test_megamorphic_inline_cache() -> JsResult<()> {
         function.call(&JsValue::undefined(), &[o.clone().into()], context)?;
     }
 
-    assert_eq!(code.ic[0].entries.borrow().len(), 0);
+    assert_eq!(code.ic[0].entry_count(), 0);
     assert!(code.ic[0].megamorphic.get());
 
     // Regression check: repeated miss should remain empty
@@ -507,7 +511,7 @@ fn test_megamorphic_inline_cache() -> JsResult<()> {
         .property(js_string!("test"), 1, Attribute::all())
         .build();
     function.call(&JsValue::undefined(), &[o6.clone().into()], context)?;
-    assert_eq!(code.ic[0].entries.borrow().len(), 0);
+    assert_eq!(code.ic[0].entry_count(), 0);
     assert!(code.ic[0].megamorphic.get());
 
     Ok(())
