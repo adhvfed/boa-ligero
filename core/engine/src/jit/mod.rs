@@ -25,6 +25,8 @@ use cranelift_module::{Linkage, Module};
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
+mod native;
+
 /// High bit of a shim's `u64` return value: set means the op broke (a
 /// [`CompletionRecord`] was stashed in `vm.jit_pending`); clear means continue,
 /// with the low bits holding the new `frame.pc`.
@@ -34,6 +36,7 @@ pub(crate) const JIT_BREAK_BIT: u64 = 1 << 63;
 /// bytecode PCs, so a tagged status can be decoded without changing the shim
 /// table while the native compiler is being introduced.
 pub(crate) const JIT_EXIT_BIT: u64 = 1 << 62;
+pub(crate) const JIT_GUARD_FAIL_BIT: u64 = 1 << 61;
 const JIT_EXIT_KIND_MASK: u64 = 0xff;
 const JIT_EXIT_PC_SHIFT: u32 = 8;
 
@@ -124,13 +127,17 @@ pub struct JitStats {
     pub cache_misses: u64,
     /// Number of successful compilations.
     pub compilations: u64,
+    /// Number of successful native baseline compilations.
+    pub native_compilations: u64,
+    /// Number of successful shim-fallback compilations.
+    pub shim_compilations: u64,
     /// Number of compilation failures/rejections.
     pub compilation_failures: u64,
     /// Number of function entries observed by the tiering loop.
     pub function_entries: u64,
     /// Number of backward edges observed by the tiering loop.
     pub loop_backedges: u64,
-    /// Number of generated entries invoked.
+    /// Number of native baseline entries invoked.
     pub native_entries: u64,
     /// Number of native entries that returned to the interpreter.
     pub deopts: u64,
@@ -147,6 +154,7 @@ struct Hotness {
 #[derive(Clone, Copy)]
 struct CachedEntry {
     entry: extern "C" fn(*mut Context) -> u64,
+    native: bool,
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -182,12 +190,12 @@ fn same_frame_jump_target(instr: &Instruction) -> Option<u32> {
 /// keep it alive for as long as any compiled function pointer is in use. The
 /// real tier will hold one of these per realm.
 pub struct JitBackend {
-    module: JITModule,
+    pub(super) module: JITModule,
     /// Monotonic counter for unique symbol names. `JITModule::declare_function`
     /// deduplicates by name, so reusing a fixed name (e.g. "`jit_codeblock`")
     /// across compilations makes the second `define_function` fail with
     /// `DuplicateDefinition`. Each compile gets a fresh name from this counter.
-    next_fn_id: u64,
+    pub(super) next_fn_id: u64,
     /// Compiled entries are scoped to this backend. The code block's debug ID
     /// is unique for the lifetime of the current thread, which is sufficient
     /// because a backend is not shared across threads or realms.
@@ -278,34 +286,42 @@ impl JitBackend {
     }
 
     /// Return a cached entry if one exists, compiling and caching it otherwise.
-    fn cached_entry(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
+    fn cached_entry(&mut self, code: &CodeBlock) -> CachedEntry {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
 
         if let Some(cached) = self.cache.get(&code.debug_id) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-            return cached.entry;
+            return *cached;
         }
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         let started = Instant::now();
-        let entry = self.compile_codeblock(code);
+        let (entry, native) = self.compile_codeblock_with_kind(code);
         self.stats.compile_time_ns = self
             .stats
             .compile_time_ns
             .saturating_add(started.elapsed().as_nanos());
         self.stats.compilations = self.stats.compilations.saturating_add(1);
-        self.cache.insert(code.debug_id, CachedEntry { entry });
-        entry
+        if native {
+            self.stats.native_compilations = self.stats.native_compilations.saturating_add(1);
+        } else {
+            self.stats.shim_compilations = self.stats.shim_compilations.saturating_add(1);
+        }
+        let cached = CachedEntry { entry, native };
+        self.cache.insert(code.debug_id, cached);
+        cached
     }
 
     /// Invoke a cached entry for the current frame. This is the shared runtime
     /// hook used by both the explicit API and the context-owned tier.
     pub(crate) fn invoke_cached_entry(&mut self, code: &CodeBlock, context: &mut Context) -> u64 {
-        let entry = self.cached_entry(code);
-        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+        let cached = self.cached_entry(code);
+        if cached.native {
+            self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+        }
         // SAFETY: `context` is exclusively borrowed for the duration of the
         // native call, and the backend owns the generated code pointer.
-        entry(std::ptr::from_mut(context))
+        (cached.entry)(std::ptr::from_mut(context))
     }
 
     /// Invoke a cached entry and finish it through the existing interpreter
@@ -342,7 +358,7 @@ impl JitBackend {
     /// Allocate a process-unique-within-this-backend symbol name for a freshly
     /// compiled function. Prevents `DuplicateDefinition` when the same backend
     /// compiles more than one function (or the same `CodeBlock` twice).
-    fn next_fn_name(&mut self, prefix: &str) -> String {
+    pub(super) fn next_fn_name(&mut self, prefix: &str) -> String {
         let id = self.next_fn_id;
         self.next_fn_id += 1;
         format!("{prefix}_{id}")
@@ -406,28 +422,33 @@ impl JitBackend {
         unsafe { std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> i64>(code) }
     }
 
-    /// Compile a [`CodeBlock`] to native code using the **safe-by-construction
-    /// baseline lowering** (see `planning/js-performance-roadmap/09-cranelift-jit.md`).
-    ///
-    /// The emitted `extern "C" fn(*mut Context) -> u64` runs the function's
-    /// bytecode by calling each opcode's `extern "C"` shim in program order.
-    /// After each op it inspects the returned status:
-    /// - high bit set (`JIT_BREAK_BIT`) → the op broke; return it (the caller
-    ///   reads `vm.jit_pending`);
-    /// - else the low bits are the new `frame.pc`: if it equals the statically
-    ///   known linear-next pc, fall through to the next op; otherwise a jump was
-    ///   taken or a frame was pushed (`Call`/`New`), so **deopt** — return the
-    ///   status; the caller resumes the interpreter from `frame.pc`.
-    ///
-    /// This needs no opcode classification and no CFG: any control flow falls
-    /// back to the interpreter, so the result is correct for *every* `CodeBlock`
-    /// (straight-line leaf code runs entirely in native code; everything else
-    /// deopts cleanly).
+    /// Compile a [`CodeBlock`] using the narrow native baseline lowering when
+    /// its bytecode and frame metadata satisfy the native allowlist. The
+    /// complete shim bridge remains the semantics-preserving fallback for
+    /// unsupported or malformed blocks.
     ///
     /// # Panics
     /// Panics if Cranelift codegen fails.
     #[must_use]
     pub fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
+        self.compile_codeblock_with_kind(code).0
+    }
+
+    fn compile_codeblock_with_kind(
+        &mut self,
+        code: &CodeBlock,
+    ) -> (extern "C" fn(*mut Context) -> u64, bool) {
+        if let Some(native) = native::compile(self, code) {
+            return (native, true);
+        }
+
+        (self.compile_shim_codeblock(code), false)
+    }
+
+    /// Compile a code block using the legacy shim bridge. This remains the
+    /// complete-semantics fallback while the native allowlist grows.
+    #[must_use]
+    fn compile_shim_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
         let ptr = self.module.target_config().pointer_type();
 
         // Walk the bytecode into (pc, opcode index, linear-next pc, jump target)
@@ -728,6 +749,28 @@ mod tests {
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.function_entries >= 2, "stats: {stats:?}");
         assert!(stats.compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_runs_native_integer_loop() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total = total + i; } return total; } let answer = 0; for (let j = 0; j < 80; j++) { answer = sum(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(45));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
     }
 

@@ -531,6 +531,7 @@ macro_rules! generate_opcodes {
             )?
         )*
 
+        #[derive(Clone)]
         pub(crate) enum Instruction {
             $(
                 $Variant $({

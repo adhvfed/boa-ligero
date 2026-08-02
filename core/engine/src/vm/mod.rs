@@ -250,6 +250,16 @@ impl Stack {
         self.stack.pop().expect("stack was empty")
     }
 
+    /// Pop an integer from the operand stack without mutating it when the top
+    /// value is not an integer. Native `PopIntoRegister` lowering uses this to
+    /// guard before handing control back to the interpreter.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_pop_i32(&mut self) -> Option<i32> {
+        let value = self.stack.last().and_then(JsValue::as_i32)?;
+        self.stack.pop();
+        Some(value)
+    }
+
     /// Pop the function arguments according to the calling convention.
     /// This will pop the last `argument_count` values from the stack.
     pub(crate) fn calling_convention_pop_arguments(
@@ -971,6 +981,20 @@ impl Context {
         self.vm.stack.push(result);
         self.vm.pop_frame().expect("frame must exist");
         ControlFlow::Continue(())
+    }
+
+    /// Perform the normal VM return transition for generated code.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_handle_return(&mut self) -> u64 {
+        match self.handle_return() {
+            ControlFlow::Continue(()) => {
+                crate::jit::JitExit::encode(crate::jit::JitExitKind::Return, 0)
+            }
+            ControlFlow::Break(record) => {
+                self.vm.jit_pending = Some(record);
+                crate::jit::JIT_BREAK_BIT
+            }
+        }
     }
 
     fn handle_yield(&mut self) -> ControlFlow<CompletionRecord> {
