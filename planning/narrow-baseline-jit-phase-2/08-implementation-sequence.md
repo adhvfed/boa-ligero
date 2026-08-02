@@ -63,9 +63,10 @@ invalidation design; if that contract is unavailable, do not substitute a raw
 environment pointer. Bitwise/conversion and loop-edge operations remain
 candidates, not a checklist.
 
-**Stop/go:** the selected primitive benchmark must execute a real native loop;
-if native coverage remains low, inspect the next blocker instead of starting
-OSR or calls.
+**Stop/go:** the selected method control must execute a useful native body and
+preserve or improve complete-workload time. If it only adds a losing tiny
+helper entry, revisit admission/transition cost instead of starting OSR or
+calls.
 
 Suggested commits:
 

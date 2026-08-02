@@ -51,17 +51,18 @@ Every Phase 2 entry and exit ABI inherits that rule.
 
 1. Add bounded, opt-in fallback/coverage observability and profile micro,
    engine, and actual `ligero-browser` workloads.
-2. Lower only the smallest measured blocker batch needed to expose useful
+2. Apply a measured admission guardrail against the positive and negative Gate
+   P controls before exposing more native function entries.
+3. Lower only the smallest measured blocker batch needed to expose useful
    native regions, first deciding whether the current whole-CodeBlock compiler
    can express the result or explicit region metadata is required.
-3. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
+4. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
    helper-backed storage by measured lost time and transition count.
-4. Implement the highest-ranked boundary behind its own ABI review; re-profile
+5. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
-5. Apply admission, cache bounds, failure suppression, and cold-start
-   guardrails throughout the program, then tune thresholds after the entry
-   kinds are stable.
-6. Keep direct storage last unless helper attribution proves it dominates and
+6. Apply cache bounds, failure suppression, and cold-start guardrails throughout
+   the program, then tune thresholds after the entry kinds are stable.
+7. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
 The first slice is deliberately measurement-only. OSR and compiled calls are
