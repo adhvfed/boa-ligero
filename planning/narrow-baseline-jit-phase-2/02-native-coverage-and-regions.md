@@ -1,0 +1,104 @@
+# Native coverage and region continuity
+
+Phase 1's native compiler is intentionally conservative. Phase 2 should make
+the selected hot loops native as a region instead of compiling a shim entry
+that quickly falls back because of one surrounding operation.
+
+## Design principle
+
+Do not widen the allowlist from intuition. Use the Phase 2 profile to choose a
+small batch of high-frequency blockers, and lower them through the existing
+value/materialization model. Unsupported instructions still terminate a native
+region at an exact PC; they must never be silently treated as a fallthrough.
+
+The compiler should distinguish:
+
+```text
+CodeBlock rejected     => no safe region or malformed metadata
+Shim fallback          => no native region was profitable/available
+Native region          => selected instructions and edges run in Cranelift
+Region exit             => native code returned safely to the VM
+```
+
+## Likely first operation batches
+
+The profile should confirm these, but the current microbench shapes make them
+the leading candidates:
+
+### Environment and constant reads
+
+- `GetName`, `GetNameGlobal`, and the corresponding locator/undefined forms
+  needed to read immutable or stable global bindings;
+- constant and accumulator/register moves that currently break value tracking;
+- a guarded binding/version snapshot so a global reassignment, `delete`,
+  `eval`, or dynamic environment change deopts before the read.
+
+A binding guard must use VM-owned identity/version information. Do not cache a
+raw environment pointer in generated code without a lifetime contract.
+
+### Integer representation operations
+
+- bitwise integer operations and shifts when both inputs are proven `i32`;
+- `ToInt32`/`|0` fast paths with exact fallback for arbitrary numbers, NaN,
+  infinities, negative zero, and out-of-range values;
+- increment/decrement and loop induction updates when the result stays in the
+  proven representation;
+- comparisons and branch conditions needed to connect the loop CFG.
+
+The fast path may use native integer operations only when JavaScript semantics
+are identical for the guarded representation. A generic bitwise operation must
+not be lowered as a floating-point or wrapping shortcut without a guard.
+
+### Region edges and exits
+
+- connect supported straight-line blocks through validated conditional edges;
+- keep backward edges native when all live values have a materialization map;
+- emit one explicit exit for the first unsupported operation in a block;
+- avoid invoking the opcode shim for instructions already selected for native
+  lowering.
+
+Exception-handler ranges, environment-changing operations, calls, and returns
+remain explicit boundaries until their dedicated Phase 2 contracts exist.
+
+## Binding feedback snapshot
+
+At compile request time, capture only the facts the native region needs:
+
+```text
+binding identity / environment version
+binding mutability facts
+value representation, if specialized
+realm/code-block identity
+```
+
+On every native read, guard the snapshot before producing a value. If the
+binding can invoke user code or has dynamic lookup semantics, leave it as an
+interpreter/helper exit. Materialize all live primitive SSA values before the
+guarded helper or deopt.
+
+## Region selection
+
+Prefer a measured hot region over whole-function rejection:
+
+1. decode and validate the complete CodeBlock;
+2. identify hot entry/loop/call PCs from the profile;
+3. build a region whose entry and exits are bytecode boundaries;
+4. lower only the explicit native allowlist;
+5. attach coverage and materialization metadata to the compiled entry;
+6. return to the interpreter for the first unsupported operation.
+
+The first implementation may still compile a whole CodeBlock when it is
+simple, but its metadata should model regions so OSR and later variants do not
+need a second compiler architecture.
+
+## Done criteria
+
+- `int-arith`, `float-arith`, and `array-numeric-sum` either show native
+  execution through their hot loop or have a measured, documented blocker;
+- integer overflow, coercion, negative zero, NaN, and binding mutation all
+  deopt before semantic mutation;
+- a region exit resumes at the same PC and produces the same sink/error as the
+  interpreter;
+- native coverage and first-blocker data are visible in the diagnostic stats;
+- JIT-off builds and Phase 1 tests are unchanged.
+
