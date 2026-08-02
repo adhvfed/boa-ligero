@@ -208,28 +208,12 @@ pub(crate) struct InlineCache {
     /// The property that is accessed.
     pub(crate) name: JsString,
 
-    /// Cached shape-to-slot entries.
-    ///
-    /// Most sites are monomorphic. Keeping their first entry out of the
-    /// `ArrayVec` avoids the polymorphic container's length/iteration work on
-    /// every hit. A second live shape promotes the state to the existing
-    /// bounded PIC without changing its liveness or megamorphic behavior.
-    entries: GcRefCell<InlineCacheEntries>,
+    /// Multiple cached shape-to-slot entries.
+    pub(crate) entries: GcRefCell<ArrayVec<CacheEntry, PIC_CAPACITY>>,
 
     /// Whether this access site has seen too many shapes and should no longer be cached.
     #[unsafe_ignore_trace]
     pub(crate) megamorphic: Cell<bool>,
-}
-
-/// Storage for a named-property inline cache.
-#[derive(Clone, Debug, Trace, Finalize)]
-enum InlineCacheEntries {
-    /// The site has not observed a cacheable receiver yet.
-    Empty,
-    /// The common one-shape case.
-    Mono(CacheEntry),
-    /// The polymorphic case, bounded by [`PIC_CAPACITY`].
-    Poly(Box<ArrayVec<CacheEntry, PIC_CAPACITY>>),
 }
 
 impl fmt::Display for InlineCache {
@@ -241,20 +225,12 @@ impl fmt::Display for InlineCache {
         }
 
         let entries = self.entries.borrow();
-        match &*entries {
-            InlineCacheEntries::Empty => write!(f, "())"),
-            InlineCacheEntries::Mono(entry) => {
-                write!(f, "({:#x}))", entry.shape.to_addr_usize())
-            }
-            InlineCacheEntries::Poly(entries) => {
-                // `shape_addr` is private — `WeakShape::to_addr_usize()`
-                // returns the same address while the shape is live and `0`
-                // once it's been collected, which is a strictly more
-                // informative display anyway.
-                let entries = entries.iter().map(|e| e.shape.to_addr_usize()).format(", ");
-                write!(f, "({entries:#x}))")
-            }
-        }
+        // `shape_addr` is private — `WeakShape::to_addr_usize()` returns the
+        // same address while the shape is live and `0` once it's been
+        // collected, which is a strictly more informative display anyway.
+        let entries = entries.iter().map(|e| e.shape.to_addr_usize()).format(", ");
+
+        write!(f, "({entries:#x}))")
     }
 }
 
@@ -262,7 +238,7 @@ impl InlineCache {
     pub(crate) fn new(name: JsString) -> Self {
         Self {
             name,
-            entries: GcRefCell::new(InlineCacheEntries::Empty),
+            entries: GcRefCell::new(ArrayVec::new()),
             megamorphic: Cell::new(false),
         }
     }
@@ -275,63 +251,23 @@ impl InlineCache {
             return;
         }
 
+        let mut entries = self.entries.borrow_mut();
+
+        // Cleanup pass: drop entries whose shape has been collected. This
+        // is the only place we pay the cost of touching weak refs, since
+        // `set` runs only on misses.
+        entries.retain(|entry| entry.shape.is_upgradable());
+
         let new_entry = CacheEntry {
             shape_addr: shape.to_addr_usize(),
             shape: shape.into(),
             slot,
         };
 
-        let mut entries = self.entries.borrow_mut();
-        let previous = std::mem::replace(&mut *entries, InlineCacheEntries::Empty);
-
-        *entries = match &previous {
-            InlineCacheEntries::Empty => InlineCacheEntries::Mono(new_entry),
-            InlineCacheEntries::Mono(previous) => {
-                if previous.shape.is_upgradable() {
-                    let mut entries = ArrayVec::new();
-                    entries.push(previous.clone());
-                    entries.push(new_entry);
-                    InlineCacheEntries::Poly(Box::new(entries))
-                } else {
-                    // The old weak shape was collected while this site was
-                    // cold; reuse the compact monomorphic representation.
-                    InlineCacheEntries::Mono(new_entry)
-                }
-            }
-            InlineCacheEntries::Poly(previous) => {
-                let mut entries = (**previous).clone();
-                // Cleanup pass: drop entries whose shapes have been
-                // collected. This remains cold-path work.
-                entries.retain(|entry| entry.shape.is_upgradable());
-
-                if entries.try_push(new_entry).is_err() {
-                    // Polymorphic cache is full, transition to megamorphic.
-                    self.megamorphic.set(true);
-                    InlineCacheEntries::Empty
-                } else {
-                    InlineCacheEntries::Poly(Box::new(entries))
-                }
-            }
-        };
-    }
-
-    /// Returns the number of live cache slots, for focused cache tests.
-    #[cfg(test)]
-    pub(crate) fn entry_count(&self) -> usize {
-        match &*self.entries.borrow() {
-            InlineCacheEntries::Empty => 0,
-            InlineCacheEntries::Mono(_) => 1,
-            InlineCacheEntries::Poly(entries) => entries.len(),
-        }
-    }
-
-    /// Returns a copy of a cache entry, for focused cache tests.
-    #[cfg(test)]
-    pub(crate) fn entry(&self, index: usize) -> Option<CacheEntry> {
-        match &*self.entries.borrow() {
-            InlineCacheEntries::Empty => None,
-            InlineCacheEntries::Mono(entry) => (index == 0).then(|| entry.clone()),
-            InlineCacheEntries::Poly(entries) => entries.get(index).cloned(),
+        if entries.try_push(new_entry).is_err() {
+            // Polymorphic cache is full, transition to megamorphic.
+            self.megamorphic.set(true);
+            entries.clear();
         }
     }
 
@@ -355,17 +291,14 @@ impl InlineCache {
             return None;
         }
 
-        match &*self.entries.borrow() {
-            InlineCacheEntries::Empty => None,
-            InlineCacheEntries::Mono(entry) => entry.matches(shape).then_some(entry.slot),
-            InlineCacheEntries::Poly(entries) => {
-                for entry in entries.iter() {
-                    if entry.matches(shape) {
-                        return Some(entry.slot);
-                    }
-                }
-                None
+        let entries = self.entries.borrow();
+
+        for entry in entries.iter() {
+            if entry.matches(shape) {
+                return Some(entry.slot);
             }
         }
+
+        None
     }
 }
