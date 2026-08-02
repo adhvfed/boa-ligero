@@ -442,6 +442,26 @@ fn instruction_budget_exhaustion_is_uncatchable() {
 }
 
 #[test]
+fn instruction_budget_enabled_by_native_callback_switches_dispatch_loop() {
+    let mut context = Context::default();
+    context
+        .register_global_callable(
+            js_string!("enable_budget"),
+            0,
+            NativeFunction::from_copy_closure(|_, _, context| {
+                context.set_instruction_budget(0);
+                Ok(JsValue::undefined())
+            }),
+        )
+        .expect("native budget toggle must register");
+
+    let error = context
+        .eval(Source::from_bytes("enable_budget(); 1;"))
+        .expect_err("a budget enabled by a host callback must stop the next opcode");
+    assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+}
+
+#[test]
 fn instruction_budget_is_persistent_resettable_and_optional() {
     let mut context = Context::default();
     assert_eq!(context.instruction_budget_remaining(), None);

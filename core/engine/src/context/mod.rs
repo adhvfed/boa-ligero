@@ -105,6 +105,13 @@ pub struct Context {
     /// behavior for embedders that do not need an execution budget.
     pub(crate) instruction_budget_remaining: Option<usize>,
 
+    /// Changes whenever an embedder changes the instruction-budget mode.
+    ///
+    /// The unlimited VM loop samples this epoch after each opcode so a host
+    /// callback that enables a budget during execution can transfer to the
+    /// bounded loop without putting the budget machinery on the normal path.
+    pub(crate) instruction_budget_epoch: u64,
+
     pub(crate) vm: Vm,
 
     pub(crate) kept_alive: Vec<JsObject>,
@@ -466,12 +473,14 @@ impl Context {
     #[inline]
     pub const fn set_instruction_budget(&mut self, instruction_budget: usize) {
         self.instruction_budget_remaining = Some(instruction_budget);
+        self.instruction_budget_epoch = self.instruction_budget_epoch.wrapping_add(1);
     }
 
     /// Disables instruction accounting for this context.
     #[inline]
     pub const fn clear_instruction_budget(&mut self) {
         self.instruction_budget_remaining = None;
+        self.instruction_budget_epoch = self.instruction_budget_epoch.wrapping_add(1);
     }
 
     /// Returns the amount of remaining instructions to be executed.
@@ -1307,6 +1316,7 @@ impl ContextBuilder {
                 }
             },
             instruction_budget_remaining: self.instruction_budget,
+            instruction_budget_epoch: 0,
             kept_alive: Vec::new(),
             host_hooks,
             clock,
