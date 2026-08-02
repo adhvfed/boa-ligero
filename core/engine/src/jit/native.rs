@@ -29,6 +29,7 @@ use cranelift_module::{Linkage, Module};
 pub(super) fn compile(
     backend: &mut JitBackend,
     code: &CodeBlock,
+    charge_instruction_budget: bool,
 ) -> Option<extern "C" fn(*mut Context) -> u64> {
     if !eligible(code) {
         return None;
@@ -36,7 +37,8 @@ pub(super) fn compile(
 
     let instructions = decode(code)?;
     let mode = select_mode(&instructions);
-    let mut compiler = NativeCompiler::new(backend, code, instructions, mode)?;
+    let mut compiler =
+        NativeCompiler::new(backend, code, instructions, mode, charge_instruction_budget)?;
     compiler.compile()
 }
 
@@ -398,6 +400,8 @@ struct Helpers {
     set_return_f64: Helper,
     increment_loop: Helper,
     handle_return: Helper,
+    consume_instruction_budget: Helper,
+    refund_instruction_budget: Helper,
 }
 
 struct NativeCompiler<'a> {
@@ -410,6 +414,7 @@ struct NativeCompiler<'a> {
     helpers: Option<Helpers>,
     variables: Vec<Variable>,
     dirty: BTreeSet<usize>,
+    charge_instruction_budget: bool,
 }
 
 impl<'a> NativeCompiler<'a> {
@@ -418,6 +423,7 @@ impl<'a> NativeCompiler<'a> {
         code: &'a CodeBlock,
         instructions: DecodedInstructions,
         mode: NativeMode,
+        charge_instruction_budget: bool,
     ) -> Option<Self> {
         let analysis = analyze_registers(&instructions, code.register_count as usize)?;
         Some(Self {
@@ -430,6 +436,7 @@ impl<'a> NativeCompiler<'a> {
             helpers: None,
             variables: Vec::new(),
             dirty: BTreeSet::new(),
+            charge_instruction_budget,
         })
     }
 
@@ -493,6 +500,10 @@ impl<'a> NativeCompiler<'a> {
             let block = code_blocks[index];
             bcx.switch_to_block(block);
             self.current_instruction = index;
+
+            if self.charge_instruction_budget {
+                self.emit_consume_instruction_budget(&mut bcx, ctx_val, helpers, pc, break_block);
+            }
 
             if !self.emit_instruction(
                 &mut bcx,
@@ -561,7 +572,11 @@ impl<'a> NativeCompiler<'a> {
 
         Helpers {
             ptr,
-            guard: make(jit_guard as *const () as usize, &[ptr], types::I64),
+            guard: make(
+                jit_guard as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             guard_argument_number: make(
                 jit_guard_argument_number as *const () as usize,
                 &[ptr, types::I32],
@@ -681,7 +696,44 @@ impl<'a> NativeCompiler<'a> {
             ),
             increment_loop: make(jit_increment_loop as *const () as usize, &[ptr], types::I64),
             handle_return: make(jit_handle_return as *const () as usize, &[ptr], types::I64),
+            consume_instruction_budget: make(
+                jit_consume_instruction_budget as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            refund_instruction_budget: make(
+                jit_refund_instruction_budget as *const () as usize,
+                &[ptr],
+                types::I64,
+            ),
         }
+    }
+
+    fn emit_consume_instruction_budget(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: Helpers,
+        pc: usize,
+        break_block: Block,
+    ) {
+        let helper = bcx.ins().iconst(
+            helpers.ptr,
+            helpers.consume_instruction_budget.address as i64,
+        );
+        let pc = bcx.ins().iconst(types::I32, pc as i64);
+        let status = bcx.ins().call_indirect(
+            helpers.consume_instruction_budget.signature,
+            helper,
+            &[ctx, pc],
+        );
+        let status = bcx.inst_results(status)[0];
+        let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+        let failed = bcx.ins().band(status, break_mask);
+        let continuation = bcx.create_block();
+        bcx.ins()
+            .brif(failed, break_block, &[status.into()], continuation, &[]);
+        bcx.switch_to_block(continuation);
     }
 
     fn emit_entry_guard(
@@ -692,9 +744,14 @@ impl<'a> NativeCompiler<'a> {
         helpers: Helpers,
     ) -> bool {
         let guard = bcx.ins().iconst(helpers.ptr, helpers.guard.address as i64);
-        let result = bcx
+        let charge_instruction_budget = bcx
             .ins()
-            .call_indirect(helpers.guard.signature, guard, &[ctx]);
+            .iconst(types::I32, i64::from(self.charge_instruction_budget));
+        let result = bcx.ins().call_indirect(
+            helpers.guard.signature,
+            guard,
+            &[ctx, charge_instruction_budget],
+        );
         let result = bcx.inst_results(result)[0];
         let native_entry = bcx.create_block();
         bcx.ins().brif(result, native_entry, &[], entry_deopt, &[]);
@@ -749,7 +806,7 @@ impl<'a> NativeCompiler<'a> {
                             bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
                             bcx.switch_to_block(deopt);
-                            if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                            if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                                 return false;
                             }
                             bcx.switch_to_block(cont);
@@ -771,7 +828,7 @@ impl<'a> NativeCompiler<'a> {
                             bcx.ins().brif(guard, cont, &[], deopt, &[]);
 
                             bcx.switch_to_block(deopt);
-                            if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                            if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                                 return false;
                             }
                             bcx.switch_to_block(cont);
@@ -899,7 +956,7 @@ impl<'a> NativeCompiler<'a> {
                 let cont = bcx.create_block();
                 bcx.ins().brif(guard, cont, &[], deopt, &[]);
                 bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
@@ -962,7 +1019,7 @@ impl<'a> NativeCompiler<'a> {
                 let cont = bcx.create_block();
                 bcx.ins().brif(guard, cont, &[], deopt, &[]);
                 bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
@@ -1027,7 +1084,7 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().brif(guard_failed, deopt, &[], called, &[]);
 
                 bcx.switch_to_block(deopt);
-                if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                     return false;
                 }
 
@@ -1059,7 +1116,7 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1090,7 +1147,7 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1120,7 +1177,7 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1165,7 +1222,7 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(max_overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1313,7 +1370,7 @@ impl<'a> NativeCompiler<'a> {
                     bcx.ins().brif(guard, cont, &[], deopt, &[]);
 
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1340,7 +1397,7 @@ impl<'a> NativeCompiler<'a> {
                     bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
                     bcx.switch_to_block(deopt);
-                    if !self.emit_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1513,13 +1570,28 @@ impl<'a> NativeCompiler<'a> {
         true
     }
 
-    fn emit_deopt(
+    /// Exit before the current bytecode has made any JavaScript-visible
+    /// change. This invariant lets budgeted entries refund their native charge
+    /// before the interpreter executes the same bytecode.
+    fn emit_guard_deopt(
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
         helpers: Helpers,
         pc: usize,
     ) -> bool {
+        // Budgeted native entries have charged this bytecode already, but a
+        // guard exit asks the interpreter to execute the same bytecode. Refund
+        // that charge so the interpreter remains the single owner of it.
+        if self.charge_instruction_budget {
+            let helper = bcx.ins().iconst(
+                helpers.ptr,
+                helpers.refund_instruction_budget.address as i64,
+            );
+            bcx.ins()
+                .call_indirect(helpers.refund_instruction_budget.signature, helper, &[ctx]);
+        }
+
         // Dirty values are materialized before returning to the interpreter.
         // `try_use_var` also validates that every value has a definition on
         // this path; an invalid map rejects native compilation.
@@ -1567,13 +1639,44 @@ impl<'a> NativeCompiler<'a> {
 // reviewed together with the generated calls. Helpers return zero on success
 // and a tagged/break status on failure.
 
-extern "C" fn jit_guard(context: *mut Context) -> u64 {
+extern "C" fn jit_guard(context: *mut Context, charge_instruction_budget: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
-    if context.vm.frame().construct() || context.instruction_budget_remaining.is_some() {
+    let budget_mode_matches =
+        context.instruction_budget_remaining.is_some() == (charge_instruction_budget != 0);
+    if context.vm.frame().construct() || !budget_mode_matches {
         return 0;
     }
     1
+}
+
+/// Charge one bytecode instruction before native lowering executes it.
+/// Failures stay in VM state because Rust values cannot unwind through the C
+/// ABI used by generated code.
+extern "C" fn jit_consume_instruction_budget(context: *mut Context, pc: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    match context.consume_instruction_budget() {
+        Ok(()) => 0,
+        Err(error) => {
+            context.vm.frame_mut().pc = pc;
+            let mut error = crate::JsError::from(error);
+            context.capture_error_backtrace(&mut error);
+            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
+            JIT_BREAK_BIT
+        }
+    }
+}
+
+/// Return the current bytecode's native charge before a guard exit lets the
+/// interpreter execute that same bytecode.
+extern "C" fn jit_refund_instruction_budget(context: *mut Context) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    if let Some(remaining) = &mut context.instruction_budget_remaining {
+        *remaining = remaining.saturating_add(1);
+    }
+    0
 }
 
 extern "C" fn jit_guard_argument_number(context: *mut Context, index: u32) -> u64 {

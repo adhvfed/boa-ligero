@@ -199,8 +199,9 @@ pub struct JitBackend {
     pub(super) next_fn_id: u64,
     /// Compiled entries are scoped to this backend. The code block's debug ID
     /// is unique for the lifetime of the current thread, which is sufficient
-    /// because a backend is not shared across threads or realms.
-    cache: FxHashMap<u64, CachedEntry>,
+    /// because a backend is not shared across threads or realms. Budgeted and
+    /// unbudgeted entries are distinct so the latter keep their fast path.
+    cache: FxHashMap<(u64, bool), CachedEntry>,
     hotness: FxHashMap<u64, Hotness>,
     /// The last ordinary-function target observed at each bytecode call site.
     /// Native call lowering specializes against this identity and deopts when
@@ -326,17 +327,18 @@ impl JitBackend {
     }
 
     /// Return a cached entry if one exists, compiling and caching it otherwise.
-    fn cached_entry(&mut self, code: &CodeBlock) -> CachedEntry {
+    fn cached_entry(&mut self, code: &CodeBlock, charge_instruction_budget: bool) -> CachedEntry {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
+        let cache_key = (code.debug_id, charge_instruction_budget);
 
-        if let Some(cached) = self.cache.get(&code.debug_id) {
+        if let Some(cached) = self.cache.get(&cache_key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
             return *cached;
         }
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         let started = Instant::now();
-        let (entry, native) = self.compile_codeblock_with_kind(code);
+        let (entry, native) = self.compile_codeblock_with_kind(code, charge_instruction_budget);
         self.stats.compile_time_ns = self
             .stats
             .compile_time_ns
@@ -348,14 +350,15 @@ impl JitBackend {
             self.stats.shim_compilations = self.stats.shim_compilations.saturating_add(1);
         }
         let cached = CachedEntry { entry, native };
-        self.cache.insert(code.debug_id, cached);
+        self.cache.insert(cache_key, cached);
         cached
     }
 
     /// Invoke a cached entry for the current frame. This is the shared runtime
     /// hook used by both the explicit API and the context-owned tier.
     pub(crate) fn invoke_cached_entry(&mut self, code: &CodeBlock, context: &mut Context) -> u64 {
-        let cached = self.cached_entry(code);
+        let charge_instruction_budget = context.instruction_budget_remaining().is_some();
+        let cached = self.cached_entry(code, charge_instruction_budget);
         if cached.native {
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         }
@@ -471,14 +474,15 @@ impl JitBackend {
     /// Panics if Cranelift codegen fails.
     #[must_use]
     pub fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
-        self.compile_codeblock_with_kind(code).0
+        self.compile_codeblock_with_kind(code, false).0
     }
 
     fn compile_codeblock_with_kind(
         &mut self,
         code: &CodeBlock,
+        charge_instruction_budget: bool,
     ) -> (extern "C" fn(*mut Context) -> u64, bool) {
-        if let Some(native) = native::compile(self, code) {
+        if let Some(native) = native::compile(self, code, charge_instruction_budget) {
             return (native, true);
         }
 
@@ -961,10 +965,11 @@ mod tests {
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
     }
 
-    #[test]
-    fn context_owned_jit_bypasses_native_entry_with_instruction_budget() {
+    fn warmed_sum_context(jit: bool) -> Context {
         let mut context = Context::default();
-        context.enable_jit();
+        if jit {
+            context.enable_jit();
+        }
 
         let definition = crate::Script::parse(
             crate::Source::from_bytes(
@@ -986,21 +991,113 @@ mod tests {
         .expect("parse warmup");
         warmup.evaluate(&mut context).expect("warm up");
 
-        context.set_instruction_budget(20);
-        let limited =
-            crate::Script::parse(crate::Source::from_bytes("sum(100)"), None, &mut context)
-                .expect("parse limited call");
-        let error = limited
-            .evaluate(&mut context)
-            .expect_err("the finite instruction budget must stop execution");
+        context
+    }
 
-        assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
-        assert_eq!(context.instruction_budget_remaining(), Some(0));
+    fn evaluate_with_instruction_budget(
+        context: &mut Context,
+        source: &str,
+        budget: usize,
+    ) -> Result<JsValue, crate::JsError> {
+        context.set_instruction_budget(budget);
+        let script = crate::Script::parse(crate::Source::from_bytes(source), None, context)
+            .expect("parse budgeted script");
+        script.evaluate(context)
+    }
+
+    #[test]
+    fn context_owned_jit_runs_native_entry_with_instruction_budget() {
+        let mut interpreter = warmed_sum_context(false);
+        let mut context = warmed_sum_context(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+
+        let expected = evaluate_with_instruction_budget(&mut interpreter, "sum(100)", 10_000)
+            .expect("interpreter sum");
+        let result =
+            evaluate_with_instruction_budget(&mut context, "sum(100)", 10_000).expect("native sum");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(
-            stats.deopts >= 1,
-            "the hot function must deopt around the budget: {stats:?}"
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
         );
+        assert_eq!(
+            stats.deopts, before.deopts,
+            "a finite budget must not force a guard deopt: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_exhausts_instruction_budget_in_native_code() {
+        let mut interpreter = warmed_sum_context(false);
+        let mut context = warmed_sum_context(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+
+        let expected_error = evaluate_with_instruction_budget(&mut interpreter, "sum(100)", 20)
+            .expect_err("the interpreter budget must stop execution");
+        let error = evaluate_with_instruction_budget(&mut context, "sum(100)", 20)
+            .expect_err("the finite instruction budget must stop execution");
+
+        assert_eq!(error, expected_error);
+        assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+        assert_eq!(context.instruction_budget_remaining(), Some(0));
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
+        );
+        assert_eq!(
+            stats.deopts, before.deopts,
+            "budget exhaustion must be a completion, not a guard deopt: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_refunds_budget_before_guard_deopt() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "function add(a, b) { return a + b; } let warm = 0; for (let i = 0; i < 80; i++) { warm = add(i, 1); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+        let source = "[add(2147483647, 1), add('x', 'y')].join(',')";
+
+        let expected = evaluate_with_instruction_budget(&mut interpreter, source, 1_000)
+            .expect("interpreter guarded calls");
+        let result = evaluate_with_instruction_budget(&mut context, source, 1_000)
+            .expect("JIT guarded calls");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "guard deopts must not double-charge the current bytecode"
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.deopts >= before.deopts + 2, "stats: {stats:?}");
     }
 
     #[test]
