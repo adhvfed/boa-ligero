@@ -12,7 +12,7 @@ use color_eyre::{
     eyre::{OptionExt, WrapErr},
 };
 use cow_utils::CowUtils;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::Deserialize;
 
 use crate::{HarnessFile, Ignored};
@@ -157,6 +157,7 @@ pub(super) fn read_suite(
     path: &Path,
     ignored: &Ignored,
     mut ignore_suite: bool,
+    selected_feature: Option<&str>,
 ) -> Result<TestSuite> {
     let name = path
         .file_name()
@@ -175,7 +176,13 @@ pub(super) fn read_suite(
 
         if filetype.is_dir() {
             suites.push(
-                read_suite(entry.path().as_path(), ignored, ignore_suite).wrap_err_with(|| {
+                read_suite(
+                    entry.path().as_path(),
+                    ignored,
+                    ignore_suite,
+                    selected_feature,
+                )
+                .wrap_err_with(|| {
                     let path = entry.path();
                     let suite = path.display();
                     format!("error reading sub-suite {suite}")
@@ -205,13 +212,14 @@ pub(super) fn read_suite(
             format!("error reading test {suite}")
         })?;
 
+        if !matches_selected_feature(&test.features, selected_feature) {
+            continue;
+        }
+
         if ignore_suite
             || ignored.contains_any_flag(test.flags)
             || ignored.contains_test(&test.path)
-            || test
-                .features
-                .iter()
-                .any(|feat| ignored.contains_feature(feat))
+            || contains_ignored_feature(&test.features, ignored, selected_feature)
         {
             test.set_ignored();
         }
@@ -223,6 +231,23 @@ pub(super) fn read_suite(
         path: Box::from(path),
         suites: suites.into_boxed_slice(),
         tests: tests.into_boxed_slice(),
+    })
+}
+
+fn matches_selected_feature(
+    features: &FxHashSet<Box<str>>,
+    selected_feature: Option<&str>,
+) -> bool {
+    selected_feature.is_none_or(|selected| features.contains(selected))
+}
+
+fn contains_ignored_feature(
+    features: &FxHashSet<Box<str>>,
+    ignored: &Ignored,
+    selected_feature: Option<&str>,
+) -> bool {
+    features.iter().any(|feature| {
+        selected_feature != Some(feature.as_ref()) && ignored.contains_feature(feature)
     })
 }
 
@@ -251,4 +276,51 @@ fn read_metadata(test: &Path) -> Result<MetaData> {
     let metadata = metadata.cow_replace('\r', "\n");
 
     serde_yaml::from_str(&metadata).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_ignored_feature, matches_selected_feature};
+    use crate::Ignored;
+    use rustc_hash::FxHashSet;
+
+    fn make_features(values: &[&str]) -> FxHashSet<Box<str>> {
+        values
+            .iter()
+            .map(|value| Box::<str>::from(*value))
+            .collect()
+    }
+
+    #[test]
+    fn selected_feature_filters_exact_metadata_names() {
+        let features = make_features(&["alpha", "beta.detail"]);
+        assert!(matches_selected_feature(&features, None));
+        assert!(matches_selected_feature(&features, Some("beta.detail")));
+        assert!(!matches_selected_feature(&features, Some("beta")));
+    }
+
+    #[test]
+    fn selected_feature_overrides_only_its_own_ignore() {
+        let features = make_features(&["selected", "other"]);
+        let ignored = Ignored {
+            features: make_features(&["selected"]),
+            ..Ignored::default()
+        };
+        assert!(contains_ignored_feature(&features, &ignored, None));
+        assert!(!contains_ignored_feature(
+            &features,
+            &ignored,
+            Some("selected")
+        ));
+
+        let ignored = Ignored {
+            features: make_features(&["selected", "other"]),
+            ..Ignored::default()
+        };
+        assert!(contains_ignored_feature(
+            &features,
+            &ignored,
+            Some("selected")
+        ));
+    }
 }

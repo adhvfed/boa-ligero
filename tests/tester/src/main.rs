@@ -134,6 +134,15 @@ enum Cli {
         #[arg(short, long, default_value = "test", value_hint = ValueHint::AnyPath)]
         suite: PathBuf,
 
+        /// Only run tests whose metadata contains this exact feature. The selected feature is
+        /// included even when the config normally ignores it; all other ignore rules still apply.
+        #[arg(long, value_name = "FEATURE")]
+        feature: Option<String>,
+
+        /// Exit unsuccessfully when the suite reports more than this many engine panics.
+        #[arg(long, value_name = "COUNT")]
+        max_panics: Option<usize>,
+
         /// Enable optimizations
         #[arg(long, short = 'O')]
         optimize: bool,
@@ -190,6 +199,8 @@ fn main() -> Result<()> {
             test262_path,
             test262_commit,
             suite,
+            feature,
+            max_panics,
             output,
             optimize,
             disable_parallelism,
@@ -227,6 +238,8 @@ fn main() -> Result<()> {
                 !disable_parallelism,
                 test262_path,
                 suite.as_path(),
+                feature.as_deref(),
+                max_panics,
                 output.as_deref(),
                 edition.unwrap_or_default(),
                 versioned,
@@ -392,6 +405,8 @@ fn run_test_suite(
     parallel: bool,
     test262_path: &Path,
     suite: &Path,
+    selected_feature: Option<&str>,
+    max_panics: Option<usize>,
     output: Option<&Path>,
     edition: SpecEdition,
     versioned: bool,
@@ -418,12 +433,25 @@ fn run_test_suite(
             let suite = suite.display();
             format!("could not read the test {suite}")
         })?;
+        if let Some(selected_feature) = selected_feature
+            && !test.features.contains(selected_feature)
+        {
+            bail!(
+                "test `{}` does not declare selected feature `{}`",
+                suite.display(),
+                selected_feature
+            );
+        }
 
         if test.edition <= edition {
             if verbose != 0 {
                 println!("Test loaded, starting...");
             }
-            test.run(&harness, verbose, optimizer_options, console);
+            let result = test.run(&harness, verbose, optimizer_options, console);
+            enforce_panic_limit(
+                usize::from(result.result == TestOutcomeResult::Panic),
+                max_panics,
+            )?;
         } else {
             println!(
                 "Minimum spec edition of test is bigger than the specified edition. Skipping."
@@ -432,11 +460,16 @@ fn run_test_suite(
 
         println!();
     } else {
-        let suite =
-            read_suite(&test262_path.join(suite), config.ignored(), false).wrap_err_with(|| {
-                let suite = suite.display();
-                format!("could not read the suite {suite}")
-            })?;
+        let suite = read_suite(
+            &test262_path.join(suite),
+            config.ignored(),
+            false,
+            selected_feature,
+        )
+        .wrap_err_with(|| {
+            let suite = suite.display();
+            format!("could not read the suite {suite}")
+        })?;
 
         if verbose != 0 {
             println!("Test suite loaded, starting tests...");
@@ -449,6 +482,11 @@ fn run_test_suite(
             optimizer_options,
             console,
         );
+        if let Some(selected_feature) = selected_feature
+            && results.stats.total == 0
+        {
+            bail!("no tests declare selected feature `{selected_feature}`");
+        }
 
         if versioned {
             let mut table = comfy_table::Table::new();
@@ -509,13 +547,36 @@ fn run_test_suite(
             );
         }
 
+        let panic_count = results.stats.panic;
         if let Some(output) = output {
             write_json(results, output, verbose, test262_path)
                 .wrap_err("could not write the results to the output JSON file")?;
         }
+        enforce_panic_limit(panic_count, max_panics)?;
     }
 
     Ok(())
+}
+
+fn enforce_panic_limit(panic_count: usize, max_panics: Option<usize>) -> Result<()> {
+    if let Some(max_panics) = max_panics
+        && panic_count > max_panics
+    {
+        bail!("test262 panic limit exceeded: observed {panic_count}, allowed {max_panics}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enforce_panic_limit;
+
+    #[test]
+    fn panic_limit_is_optional_and_inclusive() {
+        assert!(enforce_panic_limit(4, None).is_ok());
+        assert!(enforce_panic_limit(4, Some(4)).is_ok());
+        assert!(enforce_panic_limit(4, Some(3)).is_err());
+    }
 }
 
 /// All the harness include files.

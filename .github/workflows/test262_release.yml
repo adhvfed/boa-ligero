@@ -51,6 +51,14 @@ jobs:
           cd boa
           cargo run --release --bin boa_tester -- run -v -o ../data/test262
 
+      - name: Enforce zero panics for explicit resource management
+        run: |
+          cd boa
+          ./target/release/boa_tester run \
+            --test262-path test262 \
+            --feature explicit-resource-management \
+            --max-panics 0
+
       # Commit and push results back to the `data` repo
       - name: Commit results
         run: |

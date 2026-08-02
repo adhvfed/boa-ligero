@@ -47,6 +47,14 @@ jobs:
           cargo run --release --bin boa_tester -- run -v -o ../results/test262
           cd ..
 
+      - name: Enforce zero panics for explicit resource management
+        run: |
+          cd boa
+          ./target/release/boa_tester run \
+            --test262-path test262 \
+            --feature explicit-resource-management \
+            --max-panics 0
+
       - name: Compare results
         shell: bash
         run: |
