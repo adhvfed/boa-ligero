@@ -7,9 +7,10 @@ The 2026-08-02 baseline checkpoint has 25 filtered JIT tests (24 active, 1
 ignored), including native integer/floating loops, dense integer/floating
 reads, monomorphic named loads, ordinary calls, type/overflow fallback,
 runtime-limit safepoints, exception/recursion propagation, array holes, and
-forced GC around property guards. The release warm-loop probe reports 7.62 ms
-native versus 54.54 ms interpreter (0.140 ratio) on the development machine,
-with compilation reported separately in `JitStats`. This does not replace the
+forced GC around property guards. The final release warm-loop probe reports
+6.309 ms native versus 49.607 ms interpreter (0.127 ratio) on the development
+machine, with a 3.748 ms compile phase reported separately in `JitStats`; its
+1,999 native entries had zero deoptimizations. This does not replace the
 matching-shape, mismatch-shape, and browser-workload gates below.
 
 ## Test layers

@@ -15,10 +15,12 @@ JavaScript functions. Native values are materialized at helper, call, and
 deoptimization boundaries; unsupported operations use the existing shim or
 interpreter fallback.
 
-The release warm-loop probe (`jit_loop_perf`) measured 7.62 ms with the native
-baseline versus 54.54 ms in the interpreter on the same machine (0.140 ratio,
-including a separate ~4 ms compile phase during warm-up). This is a synthetic
-signal, not a workload gate. The follow-up hardening checkpoint has 25
+The final release warm-loop probe (`jit_loop_perf`) measured 6.309 ms with the
+native baseline versus 49.607 ms in the interpreter on the same machine
+(0.127 ratio, including a separate 3.748 ms compile phase during warm-up).
+The 1,999 native entries had zero deoptimizations in this matching-shape
+probe. This is a synthetic signal, not a workload gate. The follow-up
+hardening checkpoint has 25
 filtered JIT tests (24 active, 1 ignored), covering type/overflow fallback,
 call-target replacement, runtime limits, exceptions, recursion, array holes,
 and forced GC around property guards. The remaining work is guard
