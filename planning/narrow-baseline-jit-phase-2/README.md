@@ -1,10 +1,11 @@
 # Narrow baseline JIT — Phase 2
 
-Status: reviewed implementation program, scheduled 2026-08-03. Phase 1 is
-landed behind the opt-in `jit` feature and its first publisher-neutral Ligero
-workload gate has passed. Phase 2 implementation has not started; detailed
-profiling is the next authorized slice, and each new ABI still requires its
-own design review before implementation.
+Status: implementation underway, scheduled 2026-08-03. Phase 1 is landed
+behind the opt-in `jit` feature and its first publisher-neutral Ligero workload
+gate has passed. Slice 1 now has bounded engine diagnostics and standalone JSON
+export; the Ligero projection and representative profile matrix remain before
+the first lowering decision. Each new execution ABI still requires its own
+design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and

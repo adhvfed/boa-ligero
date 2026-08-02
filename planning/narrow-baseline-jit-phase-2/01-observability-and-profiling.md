@@ -1,8 +1,10 @@
 # Observability and workload profiling
 
-This is the first Phase 2 slice. It changes no generated code. Its purpose is
-to replace guesses about “missing opcodes” or “call overhead” with measurements
-from the workloads Boa actually needs to run.
+This is the first Phase 2 slice. It changes no JavaScript semantics and adds no
+storage, call, or OSR ABI. It does add compact reason tags to the existing
+generated-code exit status so a guard cause is not lost at the interpreter
+boundary. Its purpose is to replace guesses about “missing opcodes” or “call
+overhead” with measurements from the workloads Boa actually needs to run.
 
 ## Questions the profile must answer
 
@@ -38,25 +40,33 @@ bounded top-N or fixed-capacity table with explicit dropped-record counts so a
 hostile page cannot turn profiling into unbounded memory growth. Give the
 machine-readable snapshot a schema version and deterministic ordering.
 
-Suggested records:
+Initial whole-CodeBlock records:
 
 ```text
 CompileRecord {
-    code_id, entry_pc, region_id,
-    outcome: Native | Shim | Rejected,
+    code_id, entry_pc,
+    outcome: Native | Shim,
+    blocker,
     first_blocking_opcode, first_blocking_pc,
+    supported_prefix_instruction_count,
     native_instruction_count, bytecode_instruction_count,
     compile_ns, code_bytes, charged_budget_variant,
 }
 
 ExitRecord {
-    code_id, region_id, pc,
-    kind: Deopt | Call | Return | Throw | Budget | OSR,
-    reason: Unsupported | Type | Shape | Element | Binding | CallTarget |
-            Entry | Exception | RuntimeLimit | HostReentry,
-    count, native_instructions, native_ns,
+    code_id, entry_pc, pc,
+    kind: Deopt | Call | Return | Completion | Budget,
+    reason: EntryGuard | ArgumentType | StackType | DenseElement |
+            NamedProperty | CallTarget | IntegerOverflow | Scheduler |
+            Return | RuntimeLimit | Exception,
+    count, native_entry_wall_ns,
 }
 ```
+
+Region identity, OSR outcomes, direct-storage assumptions, and dynamic native
+instruction counts are intentionally absent until those execution mechanisms
+exist. Static lowered-bytecode coverage must not be described as dynamically
+executed instructions.
 
 The exact Rust representation can remain compact. The important property is
 that a benchmark output can answer “why did this stay interpreted?” without
@@ -108,3 +118,38 @@ This slice is done when:
 
 The output should be checked in as a dated measurement note only after the
 workload owner confirms that the invocation is representative.
+
+## Implementation checkpoint — 2026-08-03
+
+Engine groundwork landed in `bebcd640` and standalone JSON export in
+`17a80a53`:
+
+- diagnostics are explicit, absent when disabled, and hard-capped at 4,096
+  compile plus 4,096 distinct exit records regardless of caller input;
+- compilation records preserve the exact first unsupported opcode/PC and
+  actual Cranelift code bytes, while diagnostics-off compilation retains its
+  old early-rejection behavior;
+- exit records aggregate exact guard/transition reasons, resume PCs, counts,
+  and native-entry wall time; runtime-limit and final-return breaks use a VM
+  sideband without changing the completion payload;
+- deterministic snapshots retain numeric runtime-local IDs only and serialize
+  without source text, function names, URLs, property names, values, or raw
+  pointers;
+- the standalone runner writes cold and warm JSON only after timing when
+  `--jit-diagnostics-out <path>` is explicitly selected.
+
+Verification: 1,167 JIT tests passed with one ignored performance test, 1,138
+non-JIT tests passed, the no-default-features engine build passed, and focused
+runner/serialization tests passed. Warning-denying Clippy has no new findings;
+22 existing engine/JIT warnings remain scheduled for a behavior-neutral
+refactoring checkpoint.
+
+A five-pair release control on `property-mono` preserved the checksum and
+measured a 31.16 ms median with diagnostics off versus 34.92 ms on: 12.1%
+profiling overhead on an intentionally hostile 16.6-million-native-entry warm
+sample. Headline performance measurements must therefore keep diagnostics off
+and use a separate diagnostic run, as required above.
+
+Slice 1 is not complete yet: publish the same bounded snapshot through Ligero,
+run the agreed micro/engine/browser matrix, check in its publisher-neutral
+evidence, and only then select Slice 2's smallest blocker batch.

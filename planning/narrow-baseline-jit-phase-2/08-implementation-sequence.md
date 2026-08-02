@@ -9,10 +9,14 @@ The 2026-08-02 Ligero gate established opt-in feature/runtime plumbing, exact
 finite-budget execution, an observable browser sink, and interleaved cold
 measurements. It is W0 evidence only; it must not select the next native ABI.
 
-## Slice 1 — profile before lowering
+## Slice 1 — profile before lowering (engine groundwork landed)
 
 Add fallback reasons, native coverage, exit/transition counters, and a fixed
 stats snapshot. Run the microbench and the agreed browser-shaped workload.
+
+The bounded engine snapshot and standalone JSON publisher landed on 2026-08-03.
+The browser bridge and profile matrix remain; Slice 2 is still blocked on that
+evidence.
 
 **Stop/go:** do not proceed until the top blockers are known and the stats
 distinguish shim fallback, native deopt, and scheduler transition costs.
