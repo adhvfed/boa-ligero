@@ -32,10 +32,23 @@ use cranelift_module::{Linkage, Module};
 pub(super) enum NativeCompileResult {
     Compiled {
         entry: extern "C" fn(*mut Context) -> u64,
-        bytecode_instructions: u32,
+        profile: NativeStaticProfile,
         code_bytes: usize,
     },
     Rejected(NativeRejection),
+}
+
+/// Source-free static shape of a code block accepted by the native baseline.
+///
+/// These counters describe decoded bytecode, not runtime execution. They are
+/// carried into opt-in diagnostics so admission policy can be calibrated from
+/// browser workloads without retaining source text or property names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct NativeStaticProfile {
+    pub(super) bytecode_instructions: u32,
+    pub(super) backward_branches: u32,
+    pub(super) call_instructions: u32,
+    pub(super) property_instructions: u32,
 }
 
 pub(super) struct NativeRejection {
@@ -94,6 +107,7 @@ pub(super) fn compile(
         Err(rejection) => return NativeCompileResult::Rejected(rejection),
     };
     let bytecode_instructions = instructions.instructions.len();
+    let profile = instructions.static_profile();
     let mode = select_mode(&instructions);
     let Some(mut compiler) =
         NativeCompiler::new(backend, code, instructions, mode, charge_instruction_budget)
@@ -109,7 +123,7 @@ pub(super) fn compile(
     if let Some((entry, code_bytes)) = compiler.compile() {
         NativeCompileResult::Compiled {
             entry,
-            bytecode_instructions: bytecode_instructions as u32,
+            profile,
             code_bytes,
         }
     } else {
@@ -127,6 +141,36 @@ pub(super) fn compile(
 struct DecodedInstructions {
     instructions: Vec<(usize, usize, Instruction)>,
     pc_to_index: HashMap<usize, usize>,
+}
+
+impl DecodedInstructions {
+    fn static_profile(&self) -> NativeStaticProfile {
+        let mut profile = NativeStaticProfile {
+            bytecode_instructions: self.instructions.len() as u32,
+            ..NativeStaticProfile::default()
+        };
+
+        for (pc, _, instruction) in &self.instructions {
+            if branch_target(instruction).is_some_and(|target| target < *pc) {
+                profile.backward_branches = profile.backward_branches.saturating_add(1);
+            }
+            if matches!(instruction, Instruction::Call { .. }) {
+                profile.call_instructions = profile.call_instructions.saturating_add(1);
+            }
+            if matches!(
+                instruction,
+                Instruction::GetLengthProperty { .. }
+                    | Instruction::GetPropertyByName { .. }
+                    | Instruction::GetPropertyByNameWithThis { .. }
+                    | Instruction::GetPropertyByValue { .. }
+                    | Instruction::GetPropertyByValuePush { .. }
+            ) {
+                profile.property_instructions = profile.property_instructions.saturating_add(1);
+            }
+        }
+
+        profile
+    }
 }
 
 fn decode(

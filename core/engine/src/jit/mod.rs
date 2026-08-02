@@ -159,7 +159,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 2;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -353,6 +353,12 @@ pub struct JitCompileRecord {
     pub supported_prefix_instructions: u32,
     /// Instructions in the emitted native artifact, or zero for a shim.
     pub native_instructions: u32,
+    /// Static backward branches in a fully accepted native code block.
+    pub native_backward_branches: u32,
+    /// Static call instructions in a fully accepted native code block.
+    pub native_call_instructions: u32,
+    /// Static property-read instructions in a fully accepted native code block.
+    pub native_property_instructions: u32,
     /// Total decoded bytecode instructions in the code block.
     pub bytecode_instructions: u32,
     /// Wall-clock nanoseconds spent selecting and compiling the artifact.
@@ -674,7 +680,7 @@ impl JitBackend {
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         let started = Instant::now();
-        let (entry, native, code_bytes, bytecode_instructions, rejection) =
+        let (entry, native, code_bytes, native_profile, rejection) =
             self.compile_codeblock_with_kind(code, charge_instruction_budget);
         let compile_ns = started.elapsed().as_nanos();
         self.stats.compile_time_ns = self.stats.compile_time_ns.saturating_add(compile_ns);
@@ -698,8 +704,8 @@ impl JitBackend {
                     None,
                     None,
                     None,
-                    bytecode_instructions,
-                    bytecode_instructions,
+                    native_profile.bytecode_instructions,
+                    native_profile.bytecode_instructions,
                 ),
                 |rejection| {
                     (
@@ -731,6 +737,21 @@ impl JitBackend {
                     supported_prefix_instructions
                 },
                 native_instructions: if native { bytecode_instructions } else { 0 },
+                native_backward_branches: if native {
+                    native_profile.backward_branches
+                } else {
+                    0
+                },
+                native_call_instructions: if native {
+                    native_profile.call_instructions
+                } else {
+                    0
+                },
+                native_property_instructions: if native {
+                    native_profile.property_instructions
+                } else {
+                    0
+                },
                 bytecode_instructions,
                 compile_ns,
                 code_bytes,
@@ -893,7 +914,7 @@ impl JitBackend {
         extern "C" fn(*mut Context) -> u64,
         bool,
         usize,
-        u32,
+        native::NativeStaticProfile,
         Option<native::NativeRejection>,
     ) {
         let collect_diagnostic_metadata = self.diagnostics.is_some();
@@ -905,17 +926,16 @@ impl JitBackend {
         ) {
             native::NativeCompileResult::Compiled {
                 entry,
-                bytecode_instructions,
+                profile,
                 code_bytes,
-            } => (entry, true, code_bytes, bytecode_instructions, None),
+            } => (entry, true, code_bytes, profile, None),
             native::NativeCompileResult::Rejected(rejection) => {
-                let bytecode_instructions = rejection.bytecode_instructions;
                 let (entry, code_bytes) = self.compile_shim_codeblock(code);
                 (
                     entry,
                     false,
                     code_bytes,
-                    bytecode_instructions,
+                    native::NativeStaticProfile::default(),
                     Some(rejection),
                 )
             }
@@ -1164,6 +1184,9 @@ mod tests {
         assert_eq!(native.blocker, None);
         assert!(native.bytecode_instructions > 0, "record: {native:?}");
         assert_eq!(native.native_instructions, native.bytecode_instructions);
+        assert!(native.native_backward_branches > 0, "record: {native:?}");
+        assert_eq!(native.native_call_instructions, 0);
+        assert_eq!(native.native_property_instructions, 0);
         assert_eq!(
             native.supported_prefix_instructions,
             native.bytecode_instructions
@@ -1182,6 +1205,9 @@ mod tests {
         assert_eq!(shim.first_blocking_opcode.as_deref(), Some("BitAnd"));
         assert!(shim.first_blocking_pc.is_some(), "record: {shim:?}");
         assert_eq!(shim.native_instructions, 0);
+        assert_eq!(shim.native_backward_branches, 0);
+        assert_eq!(shim.native_call_instructions, 0);
+        assert_eq!(shim.native_property_instructions, 0);
         assert!(shim.supported_prefix_instructions < shim.bytecode_instructions);
         assert!(shim.code_bytes > 0, "record: {shim:?}");
         let serialized = serde_json::to_string(&shim_snapshot).expect("serialize diagnostics");

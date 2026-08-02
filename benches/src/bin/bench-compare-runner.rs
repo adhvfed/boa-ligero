@@ -14,6 +14,8 @@
 
 use std::{env, fs, path::Path, process, time::Instant};
 
+#[cfg(feature = "jit")]
+use boa_engine::jit::JIT_DIAGNOSTIC_SCHEMA_VERSION;
 use boa_engine::{
     Context, JsValue, Source, js_string, optimizer::OptimizerOptions, script::Script,
 };
@@ -246,7 +248,7 @@ fn run_jit(
 
     if let Some(output) = diagnostics_out {
         let report = JitDiagnosticReport {
-            schema_version: 1,
+            schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
             runs,
             warmup,
             cold: cold_diagnostics.expect("cold diagnostics were requested"),
