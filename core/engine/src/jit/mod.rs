@@ -39,7 +39,8 @@ pub(crate) const JIT_BREAK_BIT: u64 = 1 << 63;
 pub(crate) const JIT_EXIT_BIT: u64 = 1 << 62;
 pub(crate) const JIT_GUARD_FAIL_BIT: u64 = 1 << 61;
 const JIT_EXIT_KIND_MASK: u64 = 0xff;
-const JIT_EXIT_PC_SHIFT: u32 = 8;
+const JIT_EXIT_REASON_SHIFT: u32 = 8;
+const JIT_EXIT_PC_SHIFT: u32 = 16;
 
 /// Kinds of exits from generated code.
 #[repr(u8)]
@@ -74,15 +75,22 @@ impl JitExitKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JitExit {
     pub(crate) kind: JitExitKind,
+    pub(crate) reason: JitExitReason,
     pub(crate) pc: u32,
 }
 
 impl JitExit {
-    /// Encode an explicit native exit. The PC is always the exact bytecode
-    /// boundary at which the interpreter may resume.
+    /// Encode an explicit native exit with a diagnostic reason.
     #[inline]
-    pub(crate) const fn encode(kind: JitExitKind, pc: u32) -> u64 {
-        JIT_EXIT_BIT | ((pc as u64) << JIT_EXIT_PC_SHIFT) | kind as u64
+    pub(crate) const fn encode_with_reason(
+        kind: JitExitKind,
+        reason: JitExitReason,
+        pc: u32,
+    ) -> u64 {
+        JIT_EXIT_BIT
+            | ((pc as u64) << JIT_EXIT_PC_SHIFT)
+            | ((reason as u64) << JIT_EXIT_REASON_SHIFT)
+            | kind as u64
     }
 
     /// Decode an explicit native exit. Legacy shim statuses intentionally
@@ -94,8 +102,9 @@ impl JitExit {
         }
 
         let kind = JitExitKind::from_u8((status & JIT_EXIT_KIND_MASK) as u8)?;
+        let reason = JitExitReason::from_u8(((status >> JIT_EXIT_REASON_SHIFT) & 0xff) as u8)?;
         let pc = (status >> JIT_EXIT_PC_SHIFT) as u32;
-        Some(Self { kind, pc })
+        Some(Self { kind, reason, pc })
     }
 }
 
@@ -132,7 +141,10 @@ pub struct JitStats {
     pub native_compilations: u64,
     /// Number of successful shim-fallback compilations.
     pub shim_compilations: u64,
-    /// Number of compilation failures/rejections.
+    /// Reserved count of fatal compilation failures. Native eligibility
+    /// rejections that successfully select the shim fallback are not failures.
+    /// The current compiler reports fatal code-generation failures by panic,
+    /// so this counter remains zero.
     pub compilation_failures: u64,
     /// Number of function entries observed by the tiering loop.
     pub function_entries: u64,
@@ -144,6 +156,304 @@ pub struct JitStats {
     pub deopts: u64,
     /// Nanoseconds spent compiling generated entries.
     pub compile_time_ns: u128,
+}
+
+/// Schema version for [`JitDiagnosticSnapshot`].
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+
+/// Hard retention cap for each detailed JIT diagnostic record class.
+///
+/// Runtime callers may request a lower bound, but cannot turn diagnostics into
+/// an unbounded page-controlled allocation.
+pub const MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND: usize = 4_096;
+
+/// Bounded record limits for opt-in detailed JIT diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitDiagnosticLimits {
+    /// Maximum number of compilation records retained by a context.
+    pub compile_records: usize,
+    /// Maximum number of distinct exit records retained by a context.
+    pub exit_records: usize,
+}
+
+impl JitDiagnosticLimits {
+    fn bounded(self) -> Self {
+        Self {
+            compile_records: self
+                .compile_records
+                .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+            exit_records: self.exit_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+        }
+    }
+}
+
+impl Default for JitDiagnosticLimits {
+    fn default() -> Self {
+        Self {
+            compile_records: 256,
+            exit_records: 256,
+        }
+    }
+}
+
+/// Artifact selected for a JIT compilation request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitCompileOutcome {
+    /// The narrow native compiler accepted the complete code block.
+    Native,
+    /// The complete-semantics opcode-shim fallback was emitted.
+    Shim,
+}
+
+/// Why the narrow native compiler could not accept a code block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitCompileBlockerKind {
+    /// The function kind is outside the ordinary-function baseline contract.
+    FunctionKind,
+    /// The code block contains exception-handler metadata.
+    ExceptionHandlers,
+    /// The register file exceeds the current native compiler bound.
+    RegisterLimit,
+    /// The code block contains no instructions.
+    EmptyCodeBlock,
+    /// Decoding produced the same bytecode boundary more than once.
+    DuplicateInstructionBoundary,
+    /// The first opcode outside the native allowlist was encountered.
+    UnsupportedOpcode,
+    /// A branch target was not a decoded instruction boundary.
+    InvalidBranchTarget,
+    /// Register representation analysis could not produce a safe map.
+    RegisterAnalysis,
+    /// Native IR construction or code generation rejected the otherwise
+    /// eligible block.
+    Lowering,
+}
+
+/// Why generated code returned to the VM.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JitExitReason {
+    /// The exit did not yet carry a more specific reason.
+    #[default]
+    Unknown = 0,
+    /// The generated entry's frame or budget-mode guard failed.
+    EntryGuard = 1,
+    /// A function argument did not match the numeric specialization.
+    ArgumentType = 2,
+    /// A VM operand-stack value did not match the numeric specialization.
+    StackType = 3,
+    /// Dense indexed storage, bounds, hole, or element representation changed.
+    DenseElement = 4,
+    /// Named-property shape, slot, or representation changed.
+    NamedProperty = 5,
+    /// The ordinary call target did not match its monomorphic feedback.
+    CallTarget = 6,
+    /// An integer result left the native `i32` representation.
+    IntegerOverflow = 7,
+    /// The VM scheduler owns the next call/frame transition.
+    Scheduler = 8,
+    /// The shared VM return transition completed the native frame.
+    Return = 9,
+    /// Native instruction or loop accounting exhausted a runtime limit.
+    RuntimeLimit = 10,
+    /// A helper produced a JavaScript exception.
+    Exception = 11,
+}
+
+impl JitExitReason {
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::EntryGuard),
+            2 => Some(Self::ArgumentType),
+            3 => Some(Self::StackType),
+            4 => Some(Self::DenseElement),
+            5 => Some(Self::NamedProperty),
+            6 => Some(Self::CallTarget),
+            7 => Some(Self::IntegerOverflow),
+            8 => Some(Self::Scheduler),
+            9 => Some(Self::Return),
+            10 => Some(Self::RuntimeLimit),
+            11 => Some(Self::Exception),
+            _ => None,
+        }
+    }
+}
+
+/// VM-facing category of a detailed native exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JitDiagnosticExitKind {
+    /// Resume the current frame in the interpreter.
+    Deopt,
+    /// Let the VM perform a call/frame transition.
+    Call,
+    /// The generated frame returned normally.
+    Return,
+    /// A pending completion record ended native execution.
+    Completion,
+    /// A finite runtime budget ended native execution.
+    Budget,
+}
+
+impl From<JitExitKind> for JitDiagnosticExitKind {
+    fn from(value: JitExitKind) -> Self {
+        match value {
+            JitExitKind::Deopt => Self::Deopt,
+            JitExitKind::Call => Self::Call,
+            JitExitKind::Return => Self::Return,
+            JitExitKind::Completion => Self::Completion,
+            JitExitKind::Budget => Self::Budget,
+        }
+    }
+}
+
+/// One aggregated, source-free native exit site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitExitRecord {
+    /// Runtime-local code-block identity.
+    pub code_id: u64,
+    /// Entry PC of the compiled artifact. Phase 1 uses zero.
+    pub entry_pc: u32,
+    /// Exact interpreter-visible exit PC.
+    pub pc: u32,
+    /// VM-facing exit category.
+    pub kind: JitDiagnosticExitKind,
+    /// Guard, transition, or completion reason.
+    pub reason: JitExitReason,
+    /// Number of exits observed at this site.
+    pub count: u64,
+    /// Aggregate wall time spent inside native entries ending at this site.
+    pub native_ns: u128,
+}
+
+/// One bounded, source-free compilation diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JitCompileRecord {
+    /// Runtime-local code-block identity. This is not stable across processes.
+    pub code_id: u64,
+    /// Entry bytecode PC. Phase 1 entries always begin at zero.
+    pub entry_pc: u32,
+    /// Whether the selected artifact charges a finite instruction budget.
+    pub budgeted: bool,
+    /// Artifact selected for the cache entry.
+    pub outcome: JitCompileOutcome,
+    /// First native-eligibility blocker, if the shim was selected.
+    pub blocker: Option<JitCompileBlockerKind>,
+    /// Debug name of the first blocking opcode. This is a static opcode name,
+    /// never source text or a property value.
+    pub first_blocking_opcode: Option<String>,
+    /// PC of the first blocking opcode or malformed edge.
+    pub first_blocking_pc: Option<u32>,
+    /// Instructions preceding the first blocker that are individually in the
+    /// native allowlist. This is eligibility coverage, not executed coverage.
+    pub supported_prefix_instructions: u32,
+    /// Instructions in the emitted native artifact, or zero for a shim.
+    pub native_instructions: u32,
+    /// Total decoded bytecode instructions in the code block.
+    pub bytecode_instructions: u32,
+    /// Wall-clock nanoseconds spent selecting and compiling the artifact.
+    pub compile_ns: u128,
+    /// Machine-code bytes emitted for the selected artifact.
+    pub code_bytes: usize,
+}
+
+/// Stable snapshot of opt-in detailed JIT diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JitDiagnosticSnapshot {
+    /// Version of the public record schema.
+    pub schema_version: u32,
+    /// Effective hard-bounded retention limits for this snapshot.
+    pub limits: JitDiagnosticLimits,
+    /// Compilation records in deterministic cache-key order.
+    pub compile_records: Vec<JitCompileRecord>,
+    /// Aggregated native exits in deterministic key order.
+    pub exit_records: Vec<JitExitRecord>,
+    /// Compilation records omitted after reaching the configured bound.
+    pub dropped_compile_records: u64,
+    /// Exit records omitted after reaching the configured bound.
+    pub dropped_exit_records: u64,
+}
+
+#[derive(Debug)]
+struct JitDiagnosticState {
+    limits: JitDiagnosticLimits,
+    compile_records: Vec<JitCompileRecord>,
+    exit_records: Vec<JitExitRecord>,
+    dropped_compile_records: u64,
+    dropped_exit_records: u64,
+}
+
+impl JitDiagnosticState {
+    fn new(limits: JitDiagnosticLimits) -> Self {
+        let limits = limits.bounded();
+        Self {
+            limits,
+            compile_records: Vec::with_capacity(limits.compile_records.min(64)),
+            exit_records: Vec::with_capacity(limits.exit_records.min(64)),
+            dropped_compile_records: 0,
+            dropped_exit_records: 0,
+        }
+    }
+
+    fn record_compile(&mut self, record: JitCompileRecord) {
+        if self.compile_records.len() < self.limits.compile_records {
+            self.compile_records.push(record);
+        } else {
+            self.dropped_compile_records = self.dropped_compile_records.saturating_add(1);
+        }
+    }
+
+    fn record_exit(&mut self, code_id: u64, exit: JitExit, native_ns: u128) {
+        let kind = JitDiagnosticExitKind::from(exit.kind);
+        if let Some(record) = self.exit_records.iter_mut().find(|record| {
+            record.code_id == code_id
+                && record.entry_pc == 0
+                && record.pc == exit.pc
+                && record.kind == kind
+                && record.reason == exit.reason
+        }) {
+            record.count = record.count.saturating_add(1);
+            record.native_ns = record.native_ns.saturating_add(native_ns);
+            return;
+        }
+
+        if self.exit_records.len() < self.limits.exit_records {
+            self.exit_records.push(JitExitRecord {
+                code_id,
+                entry_pc: 0,
+                pc: exit.pc,
+                kind,
+                reason: exit.reason,
+                count: 1,
+                native_ns,
+            });
+        } else {
+            self.dropped_exit_records = self.dropped_exit_records.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> JitDiagnosticSnapshot {
+        let mut compile_records = self.compile_records.clone();
+        compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
+        let mut exit_records = self.exit_records.clone();
+        exit_records.sort_by_key(|record| {
+            (
+                record.code_id,
+                record.entry_pc,
+                record.pc,
+                record.kind,
+                record.reason,
+            )
+        });
+        JitDiagnosticSnapshot {
+            schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
+            limits: self.limits,
+            compile_records,
+            exit_records,
+            dropped_compile_records: self.dropped_compile_records,
+            dropped_exit_records: self.dropped_exit_records,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -210,6 +520,7 @@ pub struct JitBackend {
     call_targets: FxHashMap<(u64, u32), u64>,
     thresholds: JitThresholds,
     stats: JitStats,
+    diagnostics: Option<JitDiagnosticState>,
 }
 
 impl std::fmt::Debug for JitBackend {
@@ -243,6 +554,7 @@ impl JitBackend {
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             stats: JitStats::default(),
+            diagnostics: None,
         }
     }
 
@@ -250,6 +562,26 @@ impl JitBackend {
     #[must_use]
     pub const fn stats(&self) -> JitStats {
         self.stats
+    }
+
+    /// Enable bounded detailed diagnostics for cached runtime-tier compilation
+    /// and native exits, clearing any prior records.
+    ///
+    /// The low-level [`Self::compile_codeblock`] escape hatch does not enter
+    /// the runtime cache and is therefore outside this diagnostic stream.
+    pub fn enable_diagnostics(&mut self, limits: JitDiagnosticLimits) {
+        self.diagnostics = Some(JitDiagnosticState::new(limits));
+    }
+
+    /// Disable detailed diagnostics and release their retained records.
+    pub fn disable_diagnostics(&mut self) {
+        self.diagnostics = None;
+    }
+
+    /// Return a clone of the current detailed diagnostic records.
+    #[must_use]
+    pub fn diagnostic_snapshot(&self) -> Option<JitDiagnosticSnapshot> {
+        self.diagnostics.as_ref().map(JitDiagnosticState::snapshot)
     }
 
     /// Configure the thresholds used by the opt-in tiering loop.
@@ -338,11 +670,10 @@ impl JitBackend {
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         let started = Instant::now();
-        let (entry, native) = self.compile_codeblock_with_kind(code, charge_instruction_budget);
-        self.stats.compile_time_ns = self
-            .stats
-            .compile_time_ns
-            .saturating_add(started.elapsed().as_nanos());
+        let (entry, native, code_bytes, bytecode_instructions, rejection) =
+            self.compile_codeblock_with_kind(code, charge_instruction_budget);
+        let compile_ns = started.elapsed().as_nanos();
+        self.stats.compile_time_ns = self.stats.compile_time_ns.saturating_add(compile_ns);
         self.stats.compilations = self.stats.compilations.saturating_add(1);
         if native {
             self.stats.native_compilations = self.stats.native_compilations.saturating_add(1);
@@ -351,6 +682,56 @@ impl JitBackend {
         }
         let cached = CachedEntry { entry, native };
         self.cache.insert(cache_key, cached);
+        if let Some(diagnostics) = &mut self.diagnostics {
+            let (
+                blocker,
+                first_blocking_opcode,
+                first_blocking_pc,
+                supported_prefix_instructions,
+                bytecode_instructions,
+            ) = rejection.map_or(
+                (
+                    None,
+                    None,
+                    None,
+                    bytecode_instructions,
+                    bytecode_instructions,
+                ),
+                |rejection| {
+                    (
+                        Some(rejection.kind),
+                        rejection
+                            .first_blocking_opcode
+                            .map(|opcode| format!("{opcode:?}")),
+                        rejection.first_blocking_pc,
+                        rejection.supported_prefix_instructions,
+                        rejection.bytecode_instructions,
+                    )
+                },
+            );
+            diagnostics.record_compile(JitCompileRecord {
+                code_id: code.debug_id,
+                entry_pc: 0,
+                budgeted: charge_instruction_budget,
+                outcome: if native {
+                    JitCompileOutcome::Native
+                } else {
+                    JitCompileOutcome::Shim
+                },
+                blocker,
+                first_blocking_opcode,
+                first_blocking_pc,
+                supported_prefix_instructions: if native {
+                    bytecode_instructions
+                } else {
+                    supported_prefix_instructions
+                },
+                native_instructions: if native { bytecode_instructions } else { 0 },
+                bytecode_instructions,
+                compile_ns,
+                code_bytes,
+            });
+        }
         cached
     }
 
@@ -362,9 +743,32 @@ impl JitBackend {
         if cached.native {
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         }
+        let started = if cached.native && self.diagnostics.is_some() {
+            context.vm.jit_exit_pending = None;
+            Some(Instant::now())
+        } else {
+            None
+        };
         // SAFETY: `context` is exclusively borrowed for the duration of the
         // native call, and the backend owns the generated code pointer.
-        (cached.entry)(std::ptr::from_mut(context))
+        let status = (cached.entry)(std::ptr::from_mut(context));
+        if let Some(started) = started {
+            let exit = JitExit::decode(status).or_else(|| {
+                if status & JIT_BREAK_BIT != 0 {
+                    context.vm.jit_exit_pending.take().or(Some(JitExit {
+                        kind: JitExitKind::Completion,
+                        reason: JitExitReason::Unknown,
+                        pc: context.vm.frame().pc,
+                    }))
+                } else {
+                    None
+                }
+            });
+            if let (Some(diagnostics), Some(exit)) = (&mut self.diagnostics, exit) {
+                diagnostics.record_exit(code.debug_id, exit, started.elapsed().as_nanos());
+            }
+        }
+        status
     }
 
     /// Invoke a cached entry and finish it through the existing interpreter
@@ -386,10 +790,10 @@ impl JitBackend {
                 .expect("a break status must have stashed a completion record");
         }
 
-        if let Some(exit) = JitExit::decode(status) {
-            if matches!(exit.kind, JitExitKind::Deopt) {
-                self.record_deopt();
-            }
+        if let Some(exit) = JitExit::decode(status)
+            && matches!(exit.kind, JitExitKind::Deopt)
+        {
+            self.record_deopt();
         }
 
         // Legacy shim entries and explicit deopt entries both leave the VM at
@@ -481,18 +885,46 @@ impl JitBackend {
         &mut self,
         code: &CodeBlock,
         charge_instruction_budget: bool,
-    ) -> (extern "C" fn(*mut Context) -> u64, bool) {
-        if let Some(native) = native::compile(self, code, charge_instruction_budget) {
-            return (native, true);
+    ) -> (
+        extern "C" fn(*mut Context) -> u64,
+        bool,
+        usize,
+        u32,
+        Option<native::NativeRejection>,
+    ) {
+        let collect_diagnostic_metadata = self.diagnostics.is_some();
+        match native::compile(
+            self,
+            code,
+            charge_instruction_budget,
+            collect_diagnostic_metadata,
+        ) {
+            native::NativeCompileResult::Compiled {
+                entry,
+                bytecode_instructions,
+                code_bytes,
+            } => (entry, true, code_bytes, bytecode_instructions, None),
+            native::NativeCompileResult::Rejected(rejection) => {
+                let bytecode_instructions = rejection.bytecode_instructions;
+                let (entry, code_bytes) = self.compile_shim_codeblock(code);
+                (
+                    entry,
+                    false,
+                    code_bytes,
+                    bytecode_instructions,
+                    Some(rejection),
+                )
+            }
         }
-
-        (self.compile_shim_codeblock(code), false)
     }
 
     /// Compile a code block using the legacy shim bridge. This remains the
     /// complete-semantics fallback while the native allowlist grows.
     #[must_use]
-    fn compile_shim_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
+    fn compile_shim_codeblock(
+        &mut self,
+        code: &CodeBlock,
+    ) -> (extern "C" fn(*mut Context) -> u64, usize) {
         let ptr = self.module.target_config().pointer_type();
 
         // Walk the bytecode into (pc, opcode index, linear-next pc, jump target)
@@ -628,13 +1060,21 @@ impl JitBackend {
             .declare_function(&name, Linkage::Export, &cctx.func.signature)
             .expect("declare");
         self.module.define_function(id, &mut cctx).expect("define");
+        let code_bytes = cctx
+            .compiled_code()
+            .expect("defined function has compiled code")
+            .code_buffer()
+            .len();
         self.module.clear_context(&mut cctx);
         self.module.finalize_definitions().expect("finalize");
 
         let code_ptr = self.module.get_finalized_function(id);
         // SAFETY: the compiled function matches this signature, and `self` owns
         // the code for as long as the returned pointer is used.
-        unsafe { std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr) }
+        let entry = unsafe {
+            std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
+        };
+        (entry, code_bytes)
     }
 
     /// Compile `code` and run it against the current (already-entered) frame on
@@ -668,6 +1108,7 @@ mod tests {
     use super::*;
     use crate::JsValue;
     use crate::error::{EngineError, RuntimeLimitError};
+    use crate::vm::GlobalFunctionBinding;
 
     /// A host helper that drives real VM state: it pushes a value onto the VM
     /// stack and returns a sentinel. Reaching `context.vm.stack` proves the
@@ -678,6 +1119,99 @@ mod tests {
         let context = unsafe { &mut *ctx };
         context.vm.stack.push(JsValue::new(7i32));
         42
+    }
+
+    fn first_function_code(source: &str) -> boa_gc::Gc<CodeBlock> {
+        let mut context = Context::default();
+        let script = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+            .expect("parse");
+        let code = script.codeblock(&mut context).expect("codeblock");
+        let GlobalFunctionBinding { function_index, .. } = code.global_fns[0];
+        code.constant_function(function_index as usize)
+    }
+
+    #[test]
+    fn jit_compile_diagnostics_are_opt_in_bounded_and_source_free() {
+        let native_code = first_function_code(
+            "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total = total + i; } return total; }",
+        );
+        let unsupported_code = first_function_code(
+            "function distinctive_private_source_name(left, right) { return left & right; }",
+        );
+
+        let mut disabled = JitBackend::new();
+        let _ = disabled.cached_entry(&native_code, false);
+        assert_eq!(disabled.diagnostic_snapshot(), None);
+
+        let mut native_backend = JitBackend::new();
+        native_backend.enable_diagnostics(JitDiagnosticLimits::default());
+        let _ = native_backend.cached_entry(&native_code, false);
+        let native_snapshot = native_backend
+            .diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        assert_eq!(
+            native_snapshot.schema_version,
+            JIT_DIAGNOSTIC_SCHEMA_VERSION
+        );
+        assert_eq!(native_snapshot.compile_records.len(), 1);
+        assert_eq!(native_snapshot.dropped_compile_records, 0);
+        let native = &native_snapshot.compile_records[0];
+        assert_eq!(native.outcome, JitCompileOutcome::Native);
+        assert_eq!(native.blocker, None);
+        assert!(native.bytecode_instructions > 0, "record: {native:?}");
+        assert_eq!(native.native_instructions, native.bytecode_instructions);
+        assert_eq!(
+            native.supported_prefix_instructions,
+            native.bytecode_instructions
+        );
+        assert!(native.code_bytes > 0, "record: {native:?}");
+
+        let mut shim_backend = JitBackend::new();
+        shim_backend.enable_diagnostics(JitDiagnosticLimits::default());
+        let _ = shim_backend.cached_entry(&unsupported_code, false);
+        let shim_snapshot = shim_backend
+            .diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        let shim = &shim_snapshot.compile_records[0];
+        assert_eq!(shim.outcome, JitCompileOutcome::Shim);
+        assert_eq!(shim.blocker, Some(JitCompileBlockerKind::UnsupportedOpcode));
+        assert_eq!(shim.first_blocking_opcode.as_deref(), Some("BitAnd"));
+        assert!(shim.first_blocking_pc.is_some(), "record: {shim:?}");
+        assert_eq!(shim.native_instructions, 0);
+        assert!(shim.supported_prefix_instructions < shim.bytecode_instructions);
+        assert!(shim.code_bytes > 0, "record: {shim:?}");
+        assert!(
+            shim.first_blocking_opcode
+                .as_deref()
+                .is_none_or(|opcode| !opcode.contains("distinctive_private_source_name"))
+        );
+
+        let mut bounded = JitBackend::new();
+        bounded.enable_diagnostics(JitDiagnosticLimits {
+            compile_records: 1,
+            exit_records: 0,
+        });
+        let _ = bounded.cached_entry(&native_code, false);
+        let _ = bounded.cached_entry(&unsupported_code, false);
+        let bounded = bounded.diagnostic_snapshot().expect("diagnostics enabled");
+        assert_eq!(bounded.compile_records.len(), 1);
+        assert_eq!(bounded.dropped_compile_records, 1);
+
+        let mut hard_bounded = JitBackend::new();
+        hard_bounded.enable_diagnostics(JitDiagnosticLimits {
+            compile_records: usize::MAX,
+            exit_records: usize::MAX,
+        });
+        let hard_bounded = hard_bounded
+            .diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        assert_eq!(
+            hard_bounded.limits,
+            JitDiagnosticLimits {
+                compile_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+                exit_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+            }
+        );
     }
 
     #[test]
@@ -925,6 +1459,106 @@ mod tests {
     }
 
     #[test]
+    fn jit_exit_diagnostics_are_exact_bounded_and_opt_in() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let warmup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } let warm = 0; for (let i = 0; i < 80; i++) { warm = add(i, 1); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse warmup");
+        warmup.evaluate(&mut context).expect("warm up");
+        assert_eq!(context.jit_diagnostic_snapshot(), None);
+
+        context.enable_jit_diagnostics(JitDiagnosticLimits {
+            compile_records: 0,
+            exit_records: 1,
+        });
+        let overflow = crate::Script::parse(
+            crate::Source::from_bytes("add(2147483647, 1)"),
+            None,
+            &mut context,
+        )
+        .expect("parse overflow");
+        let result = overflow.evaluate(&mut context).expect("evaluate overflow");
+        assert_eq!(result.as_number(), Some(2_147_483_648.0));
+
+        let text = crate::Script::parse(
+            crate::Source::from_bytes("add('x', 'y')"),
+            None,
+            &mut context,
+        )
+        .expect("parse type mismatch");
+        let result = text.evaluate(&mut context).expect("evaluate type mismatch");
+        assert_eq!(
+            result
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("xy")
+        );
+
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(snapshot.compile_records.is_empty());
+        assert_eq!(snapshot.exit_records.len(), 1, "snapshot: {snapshot:?}");
+        let exit = snapshot.exit_records[0];
+        assert_eq!(exit.kind, JitDiagnosticExitKind::Deopt);
+        assert_eq!(exit.reason, JitExitReason::IntegerOverflow);
+        assert_eq!(exit.count, 1);
+        assert!(
+            snapshot.dropped_exit_records >= 1,
+            "the distinct argument-type exit must be counted as dropped: {snapshot:?}"
+        );
+
+        context.disable_jit_diagnostics();
+        assert_eq!(context.jit_diagnostic_snapshot(), None);
+    }
+
+    #[test]
+    fn jit_return_diagnostic_reports_caller_resume_pc() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let warmup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } let warm = 0; for (let i = 0; i < 80; i++) { warm = add(i, 1); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse warmup");
+        warmup.evaluate(&mut context).expect("warm up");
+
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let call = crate::Script::parse(
+            crate::Source::from_bytes("let answer = add(20, 22); answer"),
+            None,
+            &mut context,
+        )
+        .expect("parse nested call");
+        let result = call.evaluate(&mut context).expect("evaluate nested call");
+        assert_eq!(result.as_i32(), Some(42));
+
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        let return_exit = snapshot
+            .exit_records
+            .iter()
+            .find(|record| record.reason == JitExitReason::Return)
+            .expect("native return was recorded");
+        assert_eq!(return_exit.kind, JitDiagnosticExitKind::Return);
+        assert_ne!(
+            return_exit.pc, 0,
+            "nested native return must identify the caller resume PC"
+        );
+    }
+
+    #[test]
     fn context_owned_jit_charges_native_loop_limit() {
         let mut context = Context::default();
         context.enable_jit();
@@ -1036,6 +1670,7 @@ mod tests {
     fn context_owned_jit_exhausts_instruction_budget_in_native_code() {
         let mut interpreter = warmed_sum_context(false);
         let mut context = warmed_sum_context(true);
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let before = context.jit_stats().expect("JIT was enabled");
 
         let expected_error = evaluate_with_instruction_budget(&mut interpreter, "sum(100)", 20)
@@ -1059,6 +1694,13 @@ mod tests {
             stats.deopts, before.deopts,
             "budget exhaustion must be a completion, not a guard deopt: {stats:?}"
         );
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Budget
+                && record.reason == JitExitReason::RuntimeLimit
+        }));
     }
 
     #[test]
@@ -1289,7 +1931,7 @@ mod tests {
     #[test]
     fn context_owned_jit_deopts_property_shape_mismatch_to_interpreter() {
         let mut context = Context::default();
-        context.enable_jit();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function sum(object, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + object.value; } return total; } let first = { value: 3 }; let second = { value: 4, extra: 1 }; let answer = 0; for (let i = 0; i < 40; i++) { answer = answer + sum(first, 10); } for (let i = 0; i < 40; i++) { answer = answer + sum(second, 10); } answer",
@@ -1305,6 +1947,13 @@ mod tests {
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.deopts >= 1, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::NamedProperty
+        }));
     }
 
     #[test]
@@ -1316,9 +1965,27 @@ mod tests {
             (JitExitKind::Completion, 42),
             (JitExitKind::Budget, 99),
         ] {
-            let status = JitExit::encode(kind, pc);
-            assert_eq!(JitExit::decode(status), Some(JitExit { kind, pc }));
+            let status = JitExit::encode_with_reason(kind, JitExitReason::Unknown, pc);
+            assert_eq!(
+                JitExit::decode(status),
+                Some(JitExit {
+                    kind,
+                    reason: JitExitReason::Unknown,
+                    pc,
+                })
+            );
         }
+
+        let status =
+            JitExit::encode_with_reason(JitExitKind::Deopt, JitExitReason::IntegerOverflow, 31);
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::Deopt,
+                reason: JitExitReason::IntegerOverflow,
+                pc: 31,
+            })
+        );
 
         assert_eq!(JitExit::decode(7), None);
         assert_eq!(JitExit::decode(JIT_BREAK_BIT), None);

@@ -126,6 +126,12 @@ pub struct Vm {
     )]
     pub(crate) jit_pending: Option<CompletionRecord>,
 
+    /// Detailed reason for a native break status. This is separate from
+    /// `jit_pending` so the completion record remains the single semantic
+    /// payload crossing the generated-code ABI.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_exit_pending: Option<crate::jit::JitExit>,
+
     #[cfg(feature = "trace")]
     pub(crate) trace: bool,
     #[cfg(feature = "trace")]
@@ -482,6 +488,8 @@ impl Vm {
             shadow_stack: ShadowStack::default(),
             #[cfg(feature = "jit")]
             jit_pending: None,
+            #[cfg(feature = "jit")]
+            jit_exit_pending: None,
             #[cfg(feature = "trace")]
             trace: false,
             #[cfg(feature = "trace")]
@@ -1001,11 +1009,20 @@ impl Context {
     /// Perform the normal VM return transition for generated code.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_handle_return(&mut self) -> u64 {
-        match self.handle_return() {
-            ControlFlow::Continue(()) => {
-                crate::jit::JitExit::encode(crate::jit::JitExitKind::Return, 0)
-            }
+        let result = self.handle_return();
+        let pc = self.vm.frame().pc;
+        match result {
+            ControlFlow::Continue(()) => crate::jit::JitExit::encode_with_reason(
+                crate::jit::JitExitKind::Return,
+                crate::jit::JitExitReason::Return,
+                pc,
+            ),
             ControlFlow::Break(record) => {
+                self.vm.jit_exit_pending = Some(crate::jit::JitExit {
+                    kind: crate::jit::JitExitKind::Return,
+                    reason: crate::jit::JitExitReason::Return,
+                    pc,
+                });
                 self.vm.jit_pending = Some(record);
                 crate::jit::JIT_BREAK_BIT
             }

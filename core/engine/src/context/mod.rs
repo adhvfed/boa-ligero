@@ -221,6 +221,36 @@ impl Context {
         self.jit_backend.as_ref().map(crate::jit::JitBackend::stats)
     }
 
+    /// Enable bounded, detailed diagnostics for the experimental JIT tier.
+    ///
+    /// This also enables the tier when it is not already active. Existing
+    /// detailed records are cleared; aggregate [`crate::jit::JitStats`] are
+    /// unchanged.
+    #[cfg(feature = "jit")]
+    pub fn enable_jit_diagnostics(&mut self, limits: crate::jit::JitDiagnosticLimits) {
+        self.enable_jit();
+        if let Some(backend) = self.jit_backend.as_mut() {
+            backend.enable_diagnostics(limits);
+        }
+    }
+
+    /// Disable detailed JIT diagnostics without disabling generated code.
+    #[cfg(feature = "jit")]
+    pub fn disable_jit_diagnostics(&mut self) {
+        if let Some(backend) = self.jit_backend.as_mut() {
+            backend.disable_diagnostics();
+        }
+    }
+
+    /// Return a clone of the bounded detailed JIT diagnostic snapshot.
+    #[cfg(feature = "jit")]
+    #[must_use]
+    pub fn jit_diagnostic_snapshot(&self) -> Option<crate::jit::JitDiagnosticSnapshot> {
+        self.jit_backend
+            .as_ref()
+            .and_then(crate::jit::JitBackend::diagnostic_snapshot)
+    }
+
     /// Create a new [`ContextBuilder`] to specify the [`Interner`] and/or
     /// the icu data provider.
     #[must_use]

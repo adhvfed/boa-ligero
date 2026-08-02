@@ -12,7 +12,10 @@ use crate::object::shape::slot::SlotAttributes;
 use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
 use crate::{Context, JsValue};
 
-use super::{JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitExit, JitExitKind};
+use super::{
+    JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCompileBlockerKind, JitExit, JitExitKind,
+    JitExitReason,
+};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, types};
@@ -26,20 +29,99 @@ use cranelift_module::{Linkage, Module};
 /// operations are rejected, and the VM stack is materialized only at
 /// helper/exit boundaries. Returning `None` is a normal eligibility result;
 /// the caller uses the legacy shim compiler.
+pub(super) enum NativeCompileResult {
+    Compiled {
+        entry: extern "C" fn(*mut Context) -> u64,
+        bytecode_instructions: u32,
+        code_bytes: usize,
+    },
+    Rejected(NativeRejection),
+}
+
+pub(super) struct NativeRejection {
+    pub(super) kind: JitCompileBlockerKind,
+    pub(super) first_blocking_opcode: Option<crate::vm::Opcode>,
+    pub(super) first_blocking_pc: Option<u32>,
+    pub(super) supported_prefix_instructions: u32,
+    pub(super) bytecode_instructions: u32,
+}
+
+impl NativeRejection {
+    fn new(
+        kind: JitCompileBlockerKind,
+        first_blocking_opcode: Option<crate::vm::Opcode>,
+        first_blocking_pc: Option<u32>,
+        supported_prefix_instructions: usize,
+        bytecode_instructions: usize,
+    ) -> Self {
+        Self {
+            kind,
+            first_blocking_opcode,
+            first_blocking_pc,
+            supported_prefix_instructions: supported_prefix_instructions as u32,
+            bytecode_instructions: bytecode_instructions as u32,
+        }
+    }
+}
+
 pub(super) fn compile(
     backend: &mut JitBackend,
     code: &CodeBlock,
     charge_instruction_budget: bool,
-) -> Option<extern "C" fn(*mut Context) -> u64> {
-    if !eligible(code) {
-        return None;
+    collect_diagnostic_metadata: bool,
+) -> NativeCompileResult {
+    let eligibility_blocker = eligibility_blocker(code);
+    if let Some(kind) = eligibility_blocker {
+        let bytecode_instructions = if collect_diagnostic_metadata {
+            match decode(code, true) {
+                Ok(instructions) => instructions.instructions.len(),
+                Err(rejection) => rejection.bytecode_instructions as usize,
+            }
+        } else {
+            0
+        };
+        return NativeCompileResult::Rejected(NativeRejection::new(
+            kind,
+            None,
+            None,
+            0,
+            bytecode_instructions,
+        ));
     }
 
-    let instructions = decode(code)?;
+    let instructions = match decode(code, collect_diagnostic_metadata) {
+        Ok(instructions) => instructions,
+        Err(rejection) => return NativeCompileResult::Rejected(rejection),
+    };
+    let bytecode_instructions = instructions.instructions.len();
     let mode = select_mode(&instructions);
-    let mut compiler =
-        NativeCompiler::new(backend, code, instructions, mode, charge_instruction_budget)?;
-    compiler.compile()
+    let Some(mut compiler) =
+        NativeCompiler::new(backend, code, instructions, mode, charge_instruction_budget)
+    else {
+        return NativeCompileResult::Rejected(NativeRejection::new(
+            JitCompileBlockerKind::RegisterAnalysis,
+            None,
+            None,
+            0,
+            bytecode_instructions,
+        ));
+    };
+    if let Some((entry, code_bytes)) = compiler.compile() {
+        NativeCompileResult::Compiled {
+            entry,
+            bytecode_instructions: bytecode_instructions as u32,
+            code_bytes,
+        }
+    } else {
+        let (pc, opcode) = compiler.current_instruction_identity();
+        NativeCompileResult::Rejected(NativeRejection::new(
+            JitCompileBlockerKind::Lowering,
+            opcode,
+            pc,
+            compiler.current_instruction,
+            bytecode_instructions,
+        ))
+    }
 }
 
 struct DecodedInstructions {
@@ -47,38 +129,83 @@ struct DecodedInstructions {
     pc_to_index: HashMap<usize, usize>,
 }
 
-fn decode(code: &CodeBlock) -> Option<DecodedInstructions> {
+fn decode(
+    code: &CodeBlock,
+    collect_diagnostic_metadata: bool,
+) -> Result<DecodedInstructions, NativeRejection> {
     let mut instructions = Vec::new();
     let mut pc_to_index = HashMap::new();
     let mut iterator = InstructionIterator::new(&code.bytecode);
+    let mut first_unsupported = None;
 
     while let Some((pc, opcode, instruction)) = iterator.next() {
         if pc_to_index.insert(pc, instructions.len()).is_some() {
-            return None;
+            return Err(NativeRejection::new(
+                JitCompileBlockerKind::DuplicateInstructionBoundary,
+                Some(opcode),
+                Some(pc as u32),
+                instructions.len(),
+                instructions.len(),
+            ));
         }
         instructions.push((pc, iterator.pc(), instruction));
 
         if !is_supported(opcode, &instructions.last().expect("just pushed").2) {
-            return None;
+            let supported_prefix = instructions.len() - 1;
+            if !collect_diagnostic_metadata {
+                return Err(NativeRejection::new(
+                    JitCompileBlockerKind::UnsupportedOpcode,
+                    Some(opcode),
+                    Some(pc as u32),
+                    supported_prefix,
+                    instructions.len(),
+                ));
+            }
+            if first_unsupported.is_none() {
+                first_unsupported = Some((pc, opcode, supported_prefix));
+            }
         }
     }
 
     if instructions.is_empty() {
-        return None;
+        return Err(NativeRejection::new(
+            JitCompileBlockerKind::EmptyCodeBlock,
+            None,
+            None,
+            0,
+            0,
+        ));
+    }
+
+    if let Some((pc, opcode, supported_prefix)) = first_unsupported {
+        return Err(NativeRejection::new(
+            JitCompileBlockerKind::UnsupportedOpcode,
+            Some(opcode),
+            Some(pc as u32),
+            supported_prefix,
+            instructions.len(),
+        ));
     }
 
     // All branch targets must land on decoded instruction boundaries. This is
     // an allowlist check rather than an assumption about the current opcode
     // table; an omitted branch variant rejects native compilation safely.
-    for (_, _, instruction) in &instructions {
-        if let Some(target) = branch_target(instruction) {
-            if !pc_to_index.contains_key(&target) {
-                return None;
-            }
+    for (pc, _, instruction) in &instructions {
+        if let Some(target) = branch_target(instruction)
+            && !pc_to_index.contains_key(&target)
+        {
+            let opcode = crate::vm::Opcode::decode(code.bytecode.bytes[*pc]);
+            return Err(NativeRejection::new(
+                JitCompileBlockerKind::InvalidBranchTarget,
+                Some(opcode),
+                Some(*pc as u32),
+                instructions.len(),
+                instructions.len(),
+            ));
         }
     }
 
-    Some(DecodedInstructions {
+    Ok(DecodedInstructions {
         instructions,
         pc_to_index,
     })
@@ -286,8 +413,16 @@ fn output_definition(
     }
 }
 
-fn eligible(code: &CodeBlock) -> bool {
-    code.is_ordinary() && code.handlers.is_empty() && code.register_count <= 128
+fn eligibility_blocker(code: &CodeBlock) -> Option<JitCompileBlockerKind> {
+    if !code.is_ordinary() {
+        Some(JitCompileBlockerKind::FunctionKind)
+    } else if !code.handlers.is_empty() {
+        Some(JitCompileBlockerKind::ExceptionHandlers)
+    } else if code.register_count > 128 {
+        Some(JitCompileBlockerKind::RegisterLimit)
+    } else {
+        None
+    }
 }
 
 fn is_supported(opcode: crate::vm::Opcode, instruction: &Instruction) -> bool {
@@ -440,7 +575,7 @@ impl<'a> NativeCompiler<'a> {
         })
     }
 
-    fn compile(&mut self) -> Option<extern "C" fn(*mut Context) -> u64> {
+    fn compile(&mut self) -> Option<(extern "C" fn(*mut Context) -> u64, usize)> {
         let ptr = self.backend.module.target_config().pointer_type();
         let mut cctx = self.backend.module.make_context();
         let mut fctx = FunctionBuilderContext::new();
@@ -482,9 +617,10 @@ impl<'a> NativeCompiler<'a> {
 
         bcx.switch_to_block(entry_deopt);
         self.emit_set_pc(&mut bcx, ctx_val, helpers, 0);
-        let entry_deopt_status = bcx
-            .ins()
-            .iconst(types::I64, JitExit::encode(JitExitKind::Deopt, 0) as i64);
+        let entry_deopt_status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(JitExitKind::Deopt, JitExitReason::EntryGuard, 0) as i64,
+        );
         bcx.ins().return_(&[entry_deopt_status]);
 
         bcx.append_block_param(break_block, types::I64);
@@ -539,6 +675,7 @@ impl<'a> NativeCompiler<'a> {
             .declare_function(&name, Linkage::Export, &cctx.func.signature)
             .ok()?;
         self.backend.module.define_function(id, &mut cctx).ok()?;
+        let code_bytes = cctx.compiled_code()?.code_buffer().len();
         self.backend.module.clear_context(&mut cctx);
         self.backend.module.finalize_definitions().ok()?;
 
@@ -546,9 +683,20 @@ impl<'a> NativeCompiler<'a> {
         // SAFETY: the signature is declared as `extern "C" fn(*mut Context) ->
         // u64`, and the backend owns the finalized code for the function's
         // lifetime.
-        Some(unsafe {
+        let entry = unsafe {
             std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
-        })
+        };
+        Some((entry, code_bytes))
+    }
+
+    fn current_instruction_identity(&self) -> (Option<u32>, Option<crate::vm::Opcode>) {
+        self.instructions
+            .instructions
+            .get(self.current_instruction)
+            .map_or((None, None), |(pc, _, _)| {
+                let opcode = crate::vm::Opcode::decode(self.code.bytecode.bytes[*pc]);
+                (Some(*pc as u32), Some(opcode))
+            })
     }
 
     fn build_helpers(
@@ -806,7 +954,13 @@ impl<'a> NativeCompiler<'a> {
                             bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
                             bcx.switch_to_block(deopt);
-                            if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                            if !self.emit_guard_deopt(
+                                bcx,
+                                ctx,
+                                helpers,
+                                pc,
+                                JitExitReason::ArgumentType,
+                            ) {
                                 return false;
                             }
                             bcx.switch_to_block(cont);
@@ -828,7 +982,13 @@ impl<'a> NativeCompiler<'a> {
                             bcx.ins().brif(guard, cont, &[], deopt, &[]);
 
                             bcx.switch_to_block(deopt);
-                            if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                            if !self.emit_guard_deopt(
+                                bcx,
+                                ctx,
+                                helpers,
+                                pc,
+                                JitExitReason::ArgumentType,
+                            ) {
                                 return false;
                             }
                             bcx.switch_to_block(cont);
@@ -956,7 +1116,7 @@ impl<'a> NativeCompiler<'a> {
                 let cont = bcx.create_block();
                 bcx.ins().brif(guard, cont, &[], deopt, &[]);
                 bcx.switch_to_block(deopt);
-                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::NamedProperty) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
@@ -1019,7 +1179,7 @@ impl<'a> NativeCompiler<'a> {
                 let cont = bcx.create_block();
                 bcx.ins().brif(guard, cont, &[], deopt, &[]);
                 bcx.switch_to_block(deopt);
-                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::DenseElement) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
@@ -1084,14 +1244,18 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().brif(guard_failed, deopt, &[], called, &[]);
 
                 bcx.switch_to_block(deopt);
-                if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::CallTarget) {
                     return false;
                 }
 
                 bcx.switch_to_block(called);
                 let status = bcx.ins().iconst(
                     types::I64,
-                    JitExit::encode(JitExitKind::Call, next_pc as u32) as i64,
+                    JitExit::encode_with_reason(
+                        JitExitKind::Call,
+                        JitExitReason::Scheduler,
+                        next_pc as u32,
+                    ) as i64,
                 );
                 bcx.ins().return_(&[status]);
             }
@@ -1116,7 +1280,8 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::IntegerOverflow)
+                    {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1147,7 +1312,8 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::IntegerOverflow)
+                    {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1177,7 +1343,8 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::IntegerOverflow)
+                    {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1222,7 +1389,8 @@ impl<'a> NativeCompiler<'a> {
                     let cont = bcx.create_block();
                     bcx.ins().brif(max_overflow, deopt, &[], cont, &[]);
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::IntegerOverflow)
+                    {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1370,7 +1538,7 @@ impl<'a> NativeCompiler<'a> {
                     bcx.ins().brif(guard, cont, &[], deopt, &[]);
 
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::StackType) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1397,7 +1565,7 @@ impl<'a> NativeCompiler<'a> {
                     bcx.ins().brif(failed, deopt, &[], cont, &[]);
 
                     bcx.switch_to_block(deopt);
-                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc) {
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::StackType) {
                         return false;
                     }
                     bcx.switch_to_block(cont);
@@ -1579,6 +1747,7 @@ impl<'a> NativeCompiler<'a> {
         ctx: cranelift_codegen::ir::Value,
         helpers: Helpers,
         pc: usize,
+        reason: JitExitReason,
     ) -> bool {
         // Budgeted native entries have charged this bytecode already, but a
         // guard exit asks the interpreter to execute the same bytecode. Refund
@@ -1615,7 +1784,7 @@ impl<'a> NativeCompiler<'a> {
         self.emit_set_pc(bcx, ctx, helpers, pc);
         let status = bcx.ins().iconst(
             types::I64,
-            JitExit::encode(JitExitKind::Deopt, pc as u32) as i64,
+            JitExit::encode_with_reason(JitExitKind::Deopt, reason, pc as u32) as i64,
         );
         bcx.ins().return_(&[status]);
         true
@@ -1638,6 +1807,18 @@ impl<'a> NativeCompiler<'a> {
 // The helper implementations are kept with the compiler so their ABI is
 // reviewed together with the generated calls. Helpers return zero on success
 // and a tagged/break status on failure.
+
+fn jit_break(
+    context: &mut Context,
+    record: crate::vm::CompletionRecord,
+    kind: JitExitKind,
+    reason: JitExitReason,
+    pc: u32,
+) -> u64 {
+    context.vm.jit_exit_pending = Some(JitExit { kind, reason, pc });
+    context.vm.jit_pending = Some(record);
+    JIT_BREAK_BIT
+}
 
 extern "C" fn jit_guard(context: *mut Context, charge_instruction_budget: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
@@ -1662,8 +1843,13 @@ extern "C" fn jit_consume_instruction_budget(context: *mut Context, pc: u32) -> 
             context.vm.frame_mut().pc = pc;
             let mut error = crate::JsError::from(error);
             context.capture_error_backtrace(&mut error);
-            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
-            JIT_BREAK_BIT
+            jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Budget,
+                JitExitReason::RuntimeLimit,
+                pc,
+            )
         }
     }
 }
@@ -1935,18 +2121,34 @@ extern "C" fn jit_call_ordinary(
         Err(error) => {
             let mut error = crate::JsError::from(error);
             context.capture_error_backtrace(&mut error);
-            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
-            return JIT_BREAK_BIT;
+            let pc = context.vm.frame().pc;
+            return jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Completion,
+                JitExitReason::Exception,
+                pc,
+            );
         }
     };
 
     match call.resolve(context) {
-        Ok(_) => JitExit::encode(JitExitKind::Call, 0),
+        Ok(_) => JitExit::encode_with_reason(
+            JitExitKind::Call,
+            JitExitReason::Scheduler,
+            context.vm.frame().pc,
+        ),
         Err(error) => {
             let mut error = crate::JsError::from(error);
             context.capture_error_backtrace(&mut error);
-            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
-            JIT_BREAK_BIT
+            let pc = context.vm.frame().pc;
+            jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Completion,
+                JitExitReason::Exception,
+                pc,
+            )
         }
     }
 }
@@ -2056,8 +2258,14 @@ extern "C" fn jit_increment_loop(context: *mut Context) -> u64 {
         Err(error) => {
             let mut error = crate::JsError::from(error);
             context.capture_error_backtrace(&mut error);
-            context.vm.jit_pending = Some(crate::vm::CompletionRecord::Throw(error));
-            JIT_BREAK_BIT
+            let pc = context.vm.frame().pc;
+            jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Budget,
+                JitExitReason::RuntimeLimit,
+                pc,
+            )
         }
     }
 }
