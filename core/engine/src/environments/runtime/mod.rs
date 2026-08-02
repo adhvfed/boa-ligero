@@ -4,7 +4,6 @@ use crate::{
 };
 use boa_ast::scope::{BindingLocator, BindingLocatorScope, Scope};
 use boa_gc::{Finalize, Gc, Trace};
-use thin_vec::ThinVec;
 
 mod declarative;
 mod private;
@@ -30,6 +29,18 @@ pub(crate) struct EnvironmentNode {
     parent: Option<Gc<EnvironmentNode>>,
 }
 
+/// A node in the private environment chain.
+///
+/// Private environments are immutable after they are pushed. Keeping them in
+/// the same persistent shape as the ordinary environment chain makes cloning
+/// an [`EnvironmentStack`] independent of the number of private environments
+/// it contains.
+#[derive(Clone, Debug, Trace, Finalize)]
+struct PrivateEnvironmentNode {
+    environment: Gc<PrivateEnvironment>,
+    parent: Option<Gc<PrivateEnvironmentNode>>,
+}
+
 /// The environment stack holds all environments at runtime.
 ///
 /// Implemented as a singly-linked list of [`EnvironmentNode`]s, where each
@@ -48,7 +59,7 @@ pub(crate) struct EnvironmentStack {
     #[unsafe_ignore_trace]
     depth: u32,
 
-    private_stack: ThinVec<Gc<PrivateEnvironment>>,
+    private_tip: Option<Gc<PrivateEnvironmentNode>>,
 }
 
 /// Saved environment state for `pop_to_global` / `restore_from_saved`.
@@ -81,7 +92,7 @@ impl EnvironmentStack {
         Self {
             tip: None,
             depth: 0,
-            private_stack: ThinVec::new(),
+            private_tip: None,
         }
     }
 
@@ -351,12 +362,17 @@ impl EnvironmentStack {
 
     /// Push a private environment to the private environment stack.
     pub(crate) fn push_private(&mut self, environment: Gc<PrivateEnvironment>) {
-        self.private_stack.push(environment);
+        self.private_tip = Some(Gc::new(PrivateEnvironmentNode {
+            environment,
+            parent: self.private_tip.take(),
+        }));
     }
 
     /// Pop a private environment from the private environment stack.
     pub(crate) fn pop_private(&mut self) {
-        self.private_stack.pop();
+        if let Some(node) = self.private_tip.take() {
+            self.private_tip = node.parent.clone();
+        }
     }
 
     /// `ResolvePrivateIdentifier ( privEnv, identifier )`
@@ -366,10 +382,12 @@ impl EnvironmentStack {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-resolve-private-identifier
     pub(crate) fn resolve_private_identifier(&self, identifier: JsString) -> Option<PrivateName> {
-        for environment in self.private_stack.iter().rev() {
-            if environment.descriptions().contains(&identifier) {
-                return Some(PrivateName::new(identifier, environment.id()));
+        let mut current = self.private_tip.as_deref();
+        while let Some(node) = current {
+            if node.environment.descriptions().contains(&identifier) {
+                return Some(PrivateName::new(identifier, node.environment.id()));
             }
+            current = node.parent.as_deref();
         }
         None
     }
@@ -377,12 +395,14 @@ impl EnvironmentStack {
     /// Return all private name descriptions in all private environments.
     pub(crate) fn private_name_descriptions(&self) -> Vec<&JsString> {
         let mut names = Vec::new();
-        for environment in self.private_stack.iter().rev() {
-            for name in environment.descriptions() {
+        let mut current = self.private_tip.as_deref();
+        while let Some(node) = current {
+            for name in node.environment.descriptions() {
                 if !names.contains(&name) {
                     names.push(name);
                 }
             }
+            current = node.parent.as_deref();
         }
         names
     }
