@@ -85,69 +85,94 @@ impl GetNameGlobal {
         (dst, index, ic_index): (RegisterOperand, IndexOperand, IndexOperand),
         context: &mut Context,
     ) -> JsResult<()> {
-        let mut binding_locator =
-            context.vm.frame().code_block.bindings[usize::from(index)].clone();
+        let binding_index = usize::from(index);
+
+        // A global-object locator is already final while the active
+        // environment is a plain, unpoisoned declarative environment. In
+        // that common case, cloning the locator and calling
+        // `find_runtime_binding` only repeats the resolver's early return.
+        // Keep the check here (rather than caching the result permanently) so
+        // direct eval and `with` still take the existing slow path when they
+        // make runtime resolution observable.
+        if context.binding_locator_stable()
+            && context.vm.frame().code_block.bindings[binding_index].is_global()
+        {
+            return Self::get_global(dst, ic_index, context);
+        }
+
+        let mut binding_locator = context.vm.frame().code_block.bindings[binding_index].clone();
         context.find_runtime_binding(&mut binding_locator)?;
 
         if binding_locator.is_global() {
-            let object = context.global_object();
-
-            let ic = &context.vm.frame().code_block().ic[usize::from(ic_index)];
-
-            let object_borrowed = object.borrow();
-            if let Some(slot) = ic.get(object_borrowed.shape()) {
-                let mut result = if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
-                    let prototype = object_borrowed
-                        .shape()
-                        .prototype()
-                        .expect("prototype should have value");
-                    let prototype = prototype.borrow();
-                    prototype.properties().storage[slot.index as usize].clone()
-                } else {
-                    object_borrowed.properties().storage[slot.index as usize].clone()
-                };
-
-                drop(object_borrowed);
-                if slot.attributes.has_get() && result.is_object() {
-                    result = result.as_object().expect("should contain getter").call(
-                        &object.clone().into(),
-                        &[],
-                        context,
-                    )?;
-                }
-                context.vm.set_register(dst.into(), result);
-                return Ok(());
-            }
-
-            drop(object_borrowed);
-
-            let key: PropertyKey = ic.name.clone().into();
-
-            let context = &mut InternalMethodPropertyContext::new(context);
-            let Some(result) = object.__try_get__(&key, object.clone().into(), context)? else {
-                let name = binding_locator.name().to_std_string_escaped();
-                return Err(JsNativeError::reference()
-                    .with_message(format!("{name} is not defined"))
-                    .into());
-            };
-
-            // Cache the property.
-            let slot = *context.slot();
-            if slot.is_cacheable() {
-                let ic = &context.vm.frame().code_block.ic[usize::from(ic_index)];
-                let object_borrowed = object.borrow();
-                let shape = object_borrowed.shape();
-                ic.set(shape, slot);
-            }
-
-            context.vm.set_register(dst.into(), result);
-            return Ok(());
+            return Self::get_global(dst, ic_index, context);
         }
 
         let result = context.get_binding(&binding_locator)?.ok_or_else(|| {
             let name = binding_locator.name().to_std_string_escaped();
             JsNativeError::reference().with_message(format!("{name} is not defined"))
         })?;
+
+        context.vm.set_register(dst.into(), result);
+        Ok(())
+    }
+
+    /// Read a binding known to resolve to the global object.
+    #[inline(always)]
+    fn get_global(
+        dst: RegisterOperand,
+        ic_index: IndexOperand,
+        context: &mut Context,
+    ) -> JsResult<()> {
+        let object = context.global_object();
+
+        let ic = &context.vm.frame().code_block().ic[usize::from(ic_index)];
+
+        let object_borrowed = object.borrow();
+        if let Some(slot) = ic.get(object_borrowed.shape()) {
+            let mut result = if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
+                let prototype = object_borrowed
+                    .shape()
+                    .prototype()
+                    .expect("prototype should have value");
+                let prototype = prototype.borrow();
+                prototype.properties().storage[slot.index as usize].clone()
+            } else {
+                object_borrowed.properties().storage[slot.index as usize].clone()
+            };
+
+            drop(object_borrowed);
+            if slot.attributes.has_get() && result.is_object() {
+                result = result.as_object().expect("should contain getter").call(
+                    &object.clone().into(),
+                    &[],
+                    context,
+                )?;
+            }
+            context.vm.set_register(dst.into(), result);
+            return Ok(());
+        }
+
+        drop(object_borrowed);
+
+        let name = ic.name.clone();
+        let key: PropertyKey = name.clone().into();
+
+        let context = &mut InternalMethodPropertyContext::new(context);
+        let Some(result) = object.__try_get__(&key, object.clone().into(), context)? else {
+            let name = name.to_std_string_escaped();
+            return Err(JsNativeError::reference()
+                .with_message(format!("{name} is not defined"))
+                .into());
+        };
+
+        // Cache the property.
+        let slot = *context.slot();
+        if slot.is_cacheable() {
+            let ic = &context.vm.frame().code_block.ic[usize::from(ic_index)];
+            let object_borrowed = object.borrow();
+            let shape = object_borrowed.shape();
+            ic.set(shape, slot);
+        }
 
         context.vm.set_register(dst.into(), result);
         Ok(())

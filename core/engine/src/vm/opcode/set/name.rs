@@ -146,60 +146,25 @@ impl SetNameGlobal {
         (value, index, ic_index): (RegisterOperand, IndexOperand, IndexOperand),
         context: &mut Context,
     ) -> JsResult<()> {
-        let mut binding_locator =
-            context.vm.frame().code_block.bindings[usize::from(index)].clone();
+        let binding_index = usize::from(index);
+
+        // As in `GetNameGlobal`, the compile-time global-object locator is
+        // final while the active environment is plain and unpoisoned. Avoid
+        // cloning it and repeating the resolver's early return on every write.
+        if context.binding_locator_stable()
+            && context.vm.frame().code_block.bindings[binding_index].is_global()
+        {
+            return Self::set_global(value, ic_index, context);
+        }
+
+        let mut binding_locator = context.vm.frame().code_block.bindings[binding_index].clone();
         context.find_runtime_binding(&mut binding_locator)?;
 
         // Fast path: binding still resolves on the global object and the IC
         // remembers the slot. Skip `is_initialized_binding` because an IC hit
         // implies the property already exists on the global.
         if binding_locator.is_global() {
-            let value = context.vm.get_register(value.into()).clone();
-            let object = context.global_object();
-
-            let ic = &context.vm.frame().code_block().ic[usize::from(ic_index)];
-            let object_borrowed = object.borrow();
-
-            if let Some(slot) = ic.get(object_borrowed.shape()) {
-                // Accessor or prototype-bound slots take the cold path so the
-                // setter and prototype chain semantics are preserved exactly.
-                if !slot.attributes.intersects(
-                    SlotAttributes::PROTOTYPE | SlotAttributes::GET | SlotAttributes::SET,
-                ) && slot.attributes.contains(SlotAttributes::WRITABLE)
-                {
-                    let slot_index = slot.index as usize;
-                    drop(object_borrowed);
-                    let mut object_mut = object.borrow_mut();
-                    object_mut.properties_mut().storage[slot_index] = value;
-                    return Ok(());
-                }
-            }
-
-            drop(object_borrowed);
-
-            // Slow path: missing IC entry, accessor slot, or prototype slot.
-            // Run the ordinary `[[Set]]` so the cache can be seeded for a
-            // subsequent fast path.
-            let strict = context.vm.frame().code_block().strict();
-            let key: PropertyKey = ic.name.clone().into();
-            let receiver = object.clone().into();
-
-            let context_inner = &mut InternalMethodPropertyContext::new(context);
-            let succeeded = object.__set__(key.clone(), value.clone(), receiver, context_inner)?;
-            if !succeeded && strict {
-                return Err(JsNativeError::typ()
-                    .with_message(format!("cannot set non-writable property: {key}"))
-                    .into());
-            }
-
-            let slot = *context_inner.slot();
-            if succeeded && slot.is_cacheable() {
-                let ic = &context.vm.frame().code_block.ic[usize::from(ic_index)];
-                let object_borrowed = object.borrow();
-                let shape = object_borrowed.shape();
-                ic.set(shape, slot);
-            }
-            return Ok(());
+            return Self::set_global(value, ic_index, context);
         }
 
         // Binding now lives outside the global object (a `with` scope rebound
@@ -208,6 +173,62 @@ impl SetNameGlobal {
         let strict = context.vm.frame().code_block().strict();
         verify_initialized(&binding_locator, context)?;
         context.set_binding(&binding_locator, value, strict)?;
+        Ok(())
+    }
+
+    /// Write a binding known to resolve to the global object.
+    #[inline(always)]
+    fn set_global(
+        value: RegisterOperand,
+        ic_index: IndexOperand,
+        context: &mut Context,
+    ) -> JsResult<()> {
+        let value = context.vm.get_register(value.into()).clone();
+        let object = context.global_object();
+
+        let ic = &context.vm.frame().code_block().ic[usize::from(ic_index)];
+        let object_borrowed = object.borrow();
+
+        if let Some(slot) = ic.get(object_borrowed.shape()) {
+            // Accessor or prototype-bound slots take the cold path so the
+            // setter and prototype chain semantics are preserved exactly.
+            if !slot
+                .attributes
+                .intersects(SlotAttributes::PROTOTYPE | SlotAttributes::GET | SlotAttributes::SET)
+                && slot.attributes.contains(SlotAttributes::WRITABLE)
+            {
+                let slot_index = slot.index as usize;
+                drop(object_borrowed);
+                let mut object_mut = object.borrow_mut();
+                object_mut.properties_mut().storage[slot_index] = value;
+                return Ok(());
+            }
+        }
+
+        drop(object_borrowed);
+
+        // Slow path: missing IC entry, accessor slot, or prototype slot.
+        // Run the ordinary `[[Set]]` so the cache can be seeded for a
+        // subsequent fast path.
+        let strict = context.vm.frame().code_block().strict();
+        let key: PropertyKey = ic.name.clone().into();
+        let receiver = object.clone().into();
+
+        let context_inner = &mut InternalMethodPropertyContext::new(context);
+        let succeeded = object.__set__(key.clone(), value.clone(), receiver, context_inner)?;
+        if !succeeded && strict {
+            return Err(JsNativeError::typ()
+                .with_message(format!("cannot set non-writable property: {key}"))
+                .into());
+        }
+
+        let slot = *context_inner.slot();
+        if succeeded && slot.is_cacheable() {
+            let ic = &context.vm.frame().code_block.ic[usize::from(ic_index)];
+            let object_borrowed = object.borrow();
+            let shape = object_borrowed.shape();
+            ic.set(shape, slot);
+        }
         Ok(())
     }
 }

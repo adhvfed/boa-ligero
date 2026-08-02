@@ -33,6 +33,51 @@ fn fun_block_eval_2317() {
 }
 
 #[test]
+fn global_name_fast_path_preserves_dynamic_resolution() {
+    run_test_actions([TestAction::assert(indoc! {r#"
+        var value = 1;
+        var ok = true;
+
+        function read() {
+            return value;
+        }
+
+        function write(next) {
+            value = next;
+            return value;
+        }
+
+        if (read() !== 1) {
+            ok = false;
+        }
+        if (write(2) !== 2 || read() !== 2) {
+            ok = false;
+        }
+
+        if ((function (object) {
+            with (object) {
+                return value;
+            }
+        })({ value: 3 }) !== 3) {
+            ok = false;
+        }
+
+        function evalRead() {
+            eval("var value = 4;");
+            return value;
+        }
+
+        function evalWrite() {
+            eval("var value = 5;");
+            value = 6;
+            return value;
+        }
+
+        ok && evalRead() === 4 && evalWrite() === 6 && value === 2;
+    "#})]);
+}
+
+#[test]
 // https://github.com/boa-dev/boa/issues/2719
 fn with_env_not_panic() {
     run_test_actions([TestAction::assert_native_error(
