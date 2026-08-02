@@ -83,6 +83,50 @@ fn implicit_return_does_not_leak_completion_value_from_same_eval() {
 }
 
 #[test]
+fn eval_arrow_captures_the_callers_this_binding() {
+    run_test_actions([TestAction::assert(indoc! {r#"
+        (function () {
+            if (eval("()=>this")() !== globalThis) {
+                return false;
+            }
+
+            function nonStrictCapture() {
+                return eval("()=>this");
+            }
+            if (nonStrictCapture()() !== globalThis) {
+                return false;
+            }
+
+            const receiver = {
+                capture() {
+                    return eval("()=>this");
+                },
+            };
+            if (receiver.capture()() !== receiver) {
+                return false;
+            }
+
+            function throughArrow() {
+                return (() => eval("()=>this"))()();
+            }
+            if (throughArrow.call(receiver) !== receiver) {
+                return false;
+            }
+
+            function strictCapture() {
+                "use strict";
+                return eval("()=>this");
+            }
+            if (strictCapture.call(42)() !== 42) {
+                return false;
+            }
+
+            return (0, eval)("()=>this")() === globalThis;
+        })()
+    "#})]);
+}
+
+#[test]
 fn implicit_constructor_return_does_not_leak_completion_value_from_same_eval() {
     run_test_actions([
         TestAction::run(indoc! {r#"

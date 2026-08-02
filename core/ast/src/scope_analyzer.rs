@@ -42,16 +42,18 @@ pub(crate) fn collect_bindings<'a, N>(
     strict: bool,
     eval: bool,
     scope: &Scope,
+    this_scope: &Scope,
     interner: &Interner,
 ) -> Result<(), &'static str>
 where
     &'a mut N: Into<NodeRefMut<'a>>,
 {
+    debug_assert!(this_scope.is_function());
     let mut visitor = BindingCollectorVisitor {
         strict,
         eval,
         scope: scope.clone(),
-        this_scope: scope.clone(),
+        this_scope: this_scope.clone(),
         in_arrow: false,
         interner,
     };

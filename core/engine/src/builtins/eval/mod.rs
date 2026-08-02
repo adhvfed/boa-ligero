@@ -136,17 +136,16 @@ impl Eval {
         // 8. Let inDerivedConstructor be false.
         // 9. Let inClassFieldInitializer be false.
         // a. Let thisEnvRec be GetThisEnvironment().
-        let flags = match {
+        let realm_scope = context.realm().scope().clone();
+        let (flags, this_scope) = if direct {
             let frame = context.vm.frame();
-            frame
+            let this_environment = frame
                 .environments
-                .get_this_environment(frame.realm.environment())
-        }
-        .as_function()
-        {
+                .get_this_environment(frame.realm.environment());
+
             // 10. If direct is true, then
             //     b. If thisEnvRec is a Function Environment Record, then
-            Some(function_env) if direct => {
+            if let Some(function_env) = this_environment.as_function() {
                 // i. Let F be thisEnvRec.[[FunctionObject]].
                 let function_object = function_env
                     .slots()
@@ -173,9 +172,14 @@ impl Eval {
                     flags |= Flags::IN_CLASS_FIELD_INITIALIZER;
                 }
 
-                flags
+                (flags, function_env.compile().clone())
+            } else if let Some(module_environment) = this_environment.as_module() {
+                (Flags::default(), module_environment.compile().clone())
+            } else {
+                (Flags::default(), realm_scope)
             }
-            _ => Flags::default(),
+        } else {
+            (Flags::default(), realm_scope)
         };
 
         if !flags.contains(Flags::IN_FUNCTION) && contains(&body, ContainsSymbol::NewTarget) {
@@ -311,6 +315,7 @@ impl Eval {
                 strict,
                 &variable_scope,
                 &lexical_scope,
+                &this_scope,
                 &annex_b_function_names,
                 compiler.interner(),
             )

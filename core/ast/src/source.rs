@@ -58,7 +58,7 @@ impl Script {
         scope: &Scope,
         interner: &Interner,
     ) -> Result<(), &'static str> {
-        collect_bindings(self, self.strict(), false, scope, interner)?;
+        collect_bindings(self, self.strict(), false, scope, scope, interner)?;
         analyze_binding_escapes(self, false, scope.clone(), interner)?;
         optimize_scope_indices(self, scope);
         Ok(())
@@ -74,6 +74,7 @@ impl Script {
         strict: bool,
         variable_scope: &Scope,
         lexical_scope: &Scope,
+        this_scope: &Scope,
         annex_b_function_names: &[Sym],
         interner: &Interner,
     ) -> Result<EvalDeclarationBindings, String> {
@@ -86,7 +87,9 @@ impl Script {
             interner,
         )?;
 
-        if let Err(reason) = collect_bindings(self, strict, true, lexical_scope, interner) {
+        if let Err(reason) =
+            collect_bindings(self, strict, true, lexical_scope, this_scope, interner)
+        {
             return Err(format!("Failed to analyze scope: {reason}"));
         }
         if let Err(reason) = analyze_binding_escapes(self, true, lexical_scope.clone(), interner) {
@@ -186,7 +189,7 @@ impl Module {
         scope: &Scope,
         interner: &Interner,
     ) -> Result<(), &'static str> {
-        collect_bindings(self, true, false, scope, interner)?;
+        collect_bindings(self, true, false, scope, scope, interner)?;
         analyze_binding_escapes(self, false, scope.clone(), interner)?;
         optimize_scope_indices(self, &self.scope.clone());
 
