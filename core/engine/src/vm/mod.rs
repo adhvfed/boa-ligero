@@ -1237,6 +1237,12 @@ impl Context {
             let old_pc = self.vm.frame().pc;
             let opcode = Opcode::decode(byte);
 
+            if let (Instruction::Call { argument_count }, _) =
+                code.bytecode.next_instruction(old_pc as usize)
+            {
+                backend.record_call_target(&code, old_pc, self, usize::from(argument_count));
+            }
+
             match self.execute_one(
                 |context, opcode| {
                     let frame = context.vm.frame();

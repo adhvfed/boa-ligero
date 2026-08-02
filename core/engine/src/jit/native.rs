@@ -639,7 +639,7 @@ impl<'a> NativeCompiler<'a> {
             ),
             call_ordinary: make(
                 jit_call_ordinary as *const () as usize,
-                &[ptr, types::I32],
+                &[ptr, types::I32, types::I64],
                 types::I64,
             ),
             set_pc: make(
@@ -991,10 +991,13 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::Call { argument_count } => {
+                let Some(expected_target) = self.backend.call_target(self.code, pc) else {
+                    return false;
+                };
                 // The helper leaves the calling-convention stack untouched on
-                // a non-ordinary callee. That makes this a real guard exit:
-                // the interpreter can re-execute the Call opcode with its
-                // normal generic-call semantics.
+                // a non-ordinary or different ordinary callee. That makes
+                // this a real guard exit: the interpreter can re-execute the
+                // Call opcode with its normal generic-call semantics.
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
                 let helper = bcx
                     .ins()
@@ -1002,10 +1005,11 @@ impl<'a> NativeCompiler<'a> {
                 let argument_count = bcx
                     .ins()
                     .iconst(types::I32, u32::from(*argument_count) as i64);
+                let expected_target = bcx.ins().iconst(types::I64, expected_target as i64);
                 let status = bcx.ins().call_indirect(
                     helpers.call_ordinary.signature,
                     helper,
-                    &[ctx, argument_count],
+                    &[ctx, argument_count, expected_target],
                 );
                 let status = bcx.inst_results(status)[0];
 
@@ -1792,7 +1796,11 @@ extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_in
         .unwrap_or(0.0)
 }
 
-extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {
+extern "C" fn jit_call_ordinary(
+    context: *mut Context,
+    argument_count: u32,
+    expected_target: u64,
+) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let argument_count = argument_count as usize;
@@ -1804,7 +1812,10 @@ extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u
     let Some(object) = function.as_object() else {
         return JIT_GUARD_FAIL_BIT;
     };
-    if !object.is::<OrdinaryFunction>() {
+    let Some(ordinary) = object.downcast_ref::<OrdinaryFunction>() else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    if ordinary.codeblock().debug_id != expected_target {
         return JIT_GUARD_FAIL_BIT;
     }
 

@@ -12,6 +12,7 @@
 //! interpreter bytecode boundary.
 
 use crate::Context;
+use crate::builtins::function::OrdinaryFunction;
 use crate::vm::CodeBlock;
 use crate::vm::CompletionRecord;
 use crate::vm::opcode::{Instruction, JIT_OP_SHIMS, Opcode};
@@ -201,6 +202,11 @@ pub struct JitBackend {
     /// because a backend is not shared across threads or realms.
     cache: FxHashMap<u64, CachedEntry>,
     hotness: FxHashMap<u64, Hotness>,
+    /// The last ordinary-function target observed at each bytecode call site.
+    /// Native call lowering specializes against this identity and deopts when
+    /// a later value is a different function, including another ordinary
+    /// function with the same calling convention.
+    call_targets: FxHashMap<(u64, u32), u64>,
     thresholds: JitThresholds,
     stats: JitStats,
 }
@@ -233,6 +239,7 @@ impl JitBackend {
             next_fn_id: 0,
             cache: FxHashMap::default(),
             hotness: FxHashMap::default(),
+            call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             stats: JitStats::default(),
         }
@@ -272,6 +279,36 @@ impl JitBackend {
     /// Record a native entry that returned to the interpreter.
     pub(crate) fn record_deopt(&mut self) {
         self.stats.deopts = self.stats.deopts.saturating_add(1);
+    }
+
+    /// Record the ordinary function target observed before an interpreter
+    /// `Call` opcode executes. This is deliberately last-target feedback: the
+    /// first baseline tier is monomorphic and a changed target deopts rather
+    /// than widening the native call sequence.
+    pub(crate) fn record_call_target(
+        &mut self,
+        code: &CodeBlock,
+        pc: u32,
+        context: &Context,
+        argument_count: usize,
+    ) {
+        let function = context
+            .vm
+            .stack
+            .calling_convention_get_function(argument_count);
+        let Some(object) = function.as_object() else {
+            return;
+        };
+        let Some(function) = object.downcast_ref::<OrdinaryFunction>() else {
+            return;
+        };
+        self.call_targets
+            .insert((code.debug_id, pc), function.codeblock().debug_id);
+    }
+
+    /// Return the monomorphic target recorded for a bytecode call site.
+    pub(super) fn call_target(&self, code: &CodeBlock, pc: usize) -> Option<u64> {
+        self.call_targets.get(&(code.debug_id, pc as u32)).copied()
     }
 
     /// Whether this code block has enough observed activity for compilation.
@@ -894,6 +931,27 @@ mod tests {
 
         let result = script.evaluate(&mut context).expect("evaluate");
         assert_eq!(result.as_i32(), Some(3365));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_different_ordinary_call_target() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = answer + apply(add, 20, 22); } answer = answer + apply(subtract, 20, 22); answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(3358));
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 2, "stats: {stats:?}");
