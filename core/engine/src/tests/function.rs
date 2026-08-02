@@ -393,6 +393,16 @@ fn nested_arrow_created_by_returned_arrow_keeps_method_this() {
 }
 
 #[test]
+fn arrow_object_pattern_accepts_computed_key_with_default() {
+    run_test_actions([TestAction::assert(indoc! {r#"
+        let key = "value";
+        const sum = ({ [key]: left = 20 }, { [key]: right = 22 }) => left + right;
+
+        sum({}, {}) === 42 && sum({ value: 19 }, { value: 23 }) === 42;
+    "#})]);
+}
+
+#[test]
 fn arrow_in_class_field_nested_in_arrow_keeps_initializer_this() {
     run_test_actions([TestAction::assert(indoc! {r#"
         const makeClass = () => class {

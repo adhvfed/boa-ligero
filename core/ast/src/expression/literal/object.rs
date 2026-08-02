@@ -131,12 +131,15 @@ impl ObjectLiteral {
                         }
                         match assign.lhs() {
                             AssignTarget::Identifier(ident) => {
-                                let name = name.literal()?;
-                                if name.sym() == ident.sym() {
-                                    if strict && name == Sym::EVAL {
+                                if let Some(literal_name) = name.literal()
+                                    && literal_name.sym() == ident.sym()
+                                {
+                                    if strict && literal_name == Sym::EVAL {
                                         return None;
                                     }
-                                    if strict && RESERVED_IDENTIFIERS_STRICT.contains(&name.sym()) {
+                                    if strict
+                                        && RESERVED_IDENTIFIERS_STRICT.contains(&literal_name.sym())
+                                    {
                                         return None;
                                     }
                                 }
@@ -144,7 +147,7 @@ impl ObjectLiteral {
                                 init.set_anonymous_function_definition_name(ident);
                                 bindings.push(ObjectPatternElement::SingleName {
                                     ident: *ident,
-                                    name: PropertyName::Literal(name),
+                                    name: name.clone(),
                                     default_init: Some(init),
                                 });
                             }
