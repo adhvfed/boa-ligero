@@ -261,6 +261,11 @@ impl JitBackend {
         hotness.loop_backedges = hotness.loop_backedges.saturating_add(1);
     }
 
+    /// Record a native entry that returned to the interpreter.
+    pub(crate) fn record_deopt(&mut self) {
+        self.stats.deopts = self.stats.deopts.saturating_add(1);
+    }
+
     /// Whether this code block has enough observed activity for compilation.
     #[must_use]
     pub(crate) fn is_hot(&self, code: &CodeBlock) -> bool {
@@ -295,14 +300,24 @@ impl JitBackend {
 
     /// Invoke a cached entry for the current frame. This is the shared runtime
     /// hook used by both the explicit API and the context-owned tier.
+    pub(crate) fn invoke_cached_entry(&mut self, code: &CodeBlock, context: &mut Context) -> u64 {
+        let entry = self.cached_entry(code);
+        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+        // SAFETY: `context` is exclusively borrowed for the duration of the
+        // native call, and the backend owns the generated code pointer.
+        entry(std::ptr::from_mut(context))
+    }
+
+    /// Invoke a cached entry and finish it through the existing interpreter
+    /// transition machinery. The context-owned tier uses
+    /// [`Self::invoke_cached_entry`] directly so it can continue its one-step
+    /// scheduling loop after a deopt.
     pub(crate) fn run_cached_entry(
         &mut self,
         code: &CodeBlock,
         context: &mut Context,
     ) -> CompletionRecord {
-        let entry = self.cached_entry(code);
-        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
-        let status = entry(std::ptr::from_mut(context));
+        let status = self.invoke_cached_entry(code, context);
 
         if status & JIT_BREAK_BIT != 0 {
             return context
@@ -314,14 +329,14 @@ impl JitBackend {
 
         if let Some(exit) = JitExit::decode(status) {
             if matches!(exit.kind, JitExitKind::Deopt) {
-                self.stats.deopts = self.stats.deopts.saturating_add(1);
+                self.record_deopt();
             }
         }
 
         // Legacy shim entries and explicit deopt entries both leave the VM at
         // an interpreter-visible program counter. The interpreter owns all
         // frame, exception, and return transitions.
-        context.run()
+        context.run_interpreter()
     }
 
     /// Allocate a process-unique-within-this-backend symbol name for a freshly
@@ -695,6 +710,28 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_tiers_hot_function_entries() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(a, b) { return a + b; } let total = 0; for (let i = 0; i < 80; i++) { total = add(total, i); } total",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(3160));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.function_entries >= 2, "stats: {stats:?}");
+        assert!(stats.compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn jit_exit_round_trip() {
         for (kind, pc) in [
             (JitExitKind::Deopt, 0),
@@ -763,7 +800,7 @@ mod tests {
             let script =
                 crate::Script::parse(crate::Source::from_bytes(src), None, &mut c).unwrap();
             // Warm up compilation/caches by evaluating once via the chosen path.
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             let v = if jit {
                 let mut backend = JitBackend::new();
                 script.evaluate_jit(&mut c, &mut backend).unwrap()

@@ -1082,7 +1082,8 @@ impl Context {
         CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
     }
 
-    pub(crate) fn run(&mut self) -> CompletionRecord {
+    /// Run the current frame using only the bytecode interpreter.
+    pub(crate) fn run_interpreter(&mut self) -> CompletionRecord {
         while let Some(byte) = self
             .vm
             .frame()
@@ -1108,6 +1109,112 @@ impl Context {
         }
 
         CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn run(&mut self) -> CompletionRecord {
+        let Some(mut backend) = self.jit_backend.take() else {
+            return self.run_interpreter();
+        };
+
+        let record = self.run_with_jit_backend(&mut backend);
+        self.jit_backend = Some(backend);
+        record
+    }
+
+    #[cfg(not(feature = "jit"))]
+    pub(crate) fn run(&mut self) -> CompletionRecord {
+        self.run_interpreter()
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_with_jit_backend(&mut self, backend: &mut crate::jit::JitBackend) -> CompletionRecord {
+        loop {
+            let Some(byte) = self
+                .vm
+                .frame()
+                .code_block
+                .bytecode
+                .bytes
+                .get(self.vm.frame().pc as usize)
+            else {
+                return CompletionRecord::Throw(JsError::from_native(JsNativeError::error()));
+            };
+            let byte = *byte;
+
+            let code = self.vm.frame().code_block.clone();
+
+            if !self.vm.frame().jit_entry_counted() {
+                self.vm.frame_mut().mark_jit_entry_counted();
+                backend.record_function_entry(&code);
+            }
+
+            // The initial compiled entry starts at PC zero and runs the whole
+            // CodeBlock until it returns, breaks, or deopts. Never restart it
+            // after a deopt at a later PC; the interpreter is the continuation.
+            if self.vm.frame().pc == 0
+                && !self.vm.frame().jit_entry_attempted()
+                && backend.is_hot(&code)
+            {
+                self.vm.frame_mut().mark_jit_entry_attempted();
+                let status = backend.invoke_cached_entry(&code, self);
+
+                if status & crate::jit::JIT_BREAK_BIT != 0 {
+                    return self
+                        .vm
+                        .jit_pending
+                        .take()
+                        .expect("a break status must have stashed a completion record");
+                }
+
+                if let Some(exit) = crate::jit::JitExit::decode(status) {
+                    match exit.kind {
+                        crate::jit::JitExitKind::Deopt => {
+                            self.vm.frame_mut().pc = exit.pc;
+                            backend.record_deopt();
+                        }
+                        crate::jit::JitExitKind::Completion | crate::jit::JitExitKind::Budget => {
+                            return self
+                                .vm
+                                .jit_pending
+                                .take()
+                                .expect("a completion exit must have stashed a record");
+                        }
+                        crate::jit::JitExitKind::Return | crate::jit::JitExitKind::Call => {
+                            // These transitions are reserved for the native
+                            // lowering ABI. The current shim entry returns an
+                            // untagged status and is handled below.
+                        }
+                    }
+                }
+
+                // A legacy shim entry either changed the current frame/PC or
+                // completed a straight-line run. Continue scheduling from the
+                // VM state it left behind.
+                continue;
+            }
+
+            let old_code_id = code.debug_id;
+            let old_pc = self.vm.frame().pc;
+            let opcode = Opcode::decode(byte);
+
+            match self.execute_one(
+                |context, opcode| {
+                    let frame = context.vm.frame();
+                    let pc = frame.pc as usize;
+
+                    OPCODE_HANDLERS[opcode as usize](context, pc)
+                },
+                opcode,
+            ) {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(value) => return value,
+            }
+
+            if self.vm.frame().code_block.debug_id == old_code_id && self.vm.frame().pc < old_pc {
+                backend.record_loop_backedge(&code);
+            }
+        }
     }
 
     /// Checks if we haven't exceeded the defined runtime limits.

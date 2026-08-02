@@ -107,6 +107,11 @@ pub struct Context {
 
     pub(crate) vm: Vm,
 
+    /// Optional per-context Cranelift runtime. It is absent by default so
+    /// enabling the `jit` feature does not add work to the normal interpreter.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_backend: Option<crate::jit::JitBackend>,
+
     pub(crate) kept_alive: Vec<JsObject>,
 
     can_block: bool,
@@ -179,6 +184,34 @@ impl Default for Context {
 
 // ==== Public API ====
 impl Context {
+    /// Enable the experimental Cranelift tier for this context.
+    #[cfg(feature = "jit")]
+    pub fn enable_jit(&mut self) {
+        if self.jit_backend.is_none() {
+            self.jit_backend = Some(crate::jit::JitBackend::new());
+        }
+    }
+
+    /// Disable the experimental Cranelift tier for this context.
+    #[cfg(feature = "jit")]
+    pub fn disable_jit(&mut self) {
+        self.jit_backend = None;
+    }
+
+    /// Check whether this context has the experimental Cranelift tier enabled.
+    #[cfg(feature = "jit")]
+    #[must_use]
+    pub fn jit_enabled(&self) -> bool {
+        self.jit_backend.is_some()
+    }
+
+    /// Return a snapshot of the optional context-owned JIT counters.
+    #[cfg(feature = "jit")]
+    #[must_use]
+    pub fn jit_stats(&self) -> Option<crate::jit::JitStats> {
+        self.jit_backend.as_ref().map(crate::jit::JitBackend::stats)
+    }
+
     /// Create a new [`ContextBuilder`] to specify the [`Interner`] and/or
     /// the icu data provider.
     #[must_use]
@@ -1284,6 +1317,8 @@ impl ContextBuilder {
         let mut context = Context {
             interner: self.interner.unwrap_or_default(),
             vm,
+            #[cfg(feature = "jit")]
+            jit_backend: None,
             strict: false,
             #[cfg(feature = "temporal")]
             timezone_provider: if let Some(provider) = self.timezone_provider {

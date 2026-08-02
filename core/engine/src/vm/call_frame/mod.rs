@@ -33,6 +33,14 @@ bitflags::bitflags! {
 
         /// If the `this` value has been cached.
         const THIS_VALUE_CACHED = 0b0000_1000;
+
+        /// The JIT tier has counted this frame's entry for hotness purposes.
+        #[cfg(feature = "jit")]
+        const JIT_ENTRY_COUNTED = 0b0001_0000;
+
+        /// The JIT tier has attempted the native entry for this frame.
+        #[cfg(feature = "jit")]
+        const JIT_ENTRY_ATTEMPTED = 0b0010_0000;
     }
 }
 
@@ -235,6 +243,32 @@ impl CallFrame {
     /// The cached value is placed in the `this` position.
     pub(crate) fn has_this_value_cached(&self) -> bool {
         self.flags.contains(CallFrameFlags::THIS_VALUE_CACHED)
+    }
+
+    /// Whether the optional JIT runtime has counted this frame entry.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_entry_counted(&self) -> bool {
+        self.flags.contains(CallFrameFlags::JIT_ENTRY_COUNTED)
+    }
+
+    /// Mark this frame as counted by the optional JIT runtime.
+    #[cfg(feature = "jit")]
+    pub(crate) fn mark_jit_entry_counted(&mut self) {
+        self.flags.insert(CallFrameFlags::JIT_ENTRY_COUNTED);
+    }
+
+    /// Whether the optional JIT runtime has attempted this frame's native
+    /// entry. A failed entry must not restart at bytecode PC zero after a
+    /// deoptimization.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_entry_attempted(&self) -> bool {
+        self.flags.contains(CallFrameFlags::JIT_ENTRY_ATTEMPTED)
+    }
+
+    /// Mark this frame as having attempted its native entry.
+    #[cfg(feature = "jit")]
+    pub(crate) fn mark_jit_entry_attempted(&mut self) {
+        self.flags.insert(CallFrameFlags::JIT_ENTRY_ATTEMPTED);
     }
 }
 
