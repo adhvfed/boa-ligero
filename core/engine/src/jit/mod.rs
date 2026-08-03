@@ -5092,6 +5092,121 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_loop_state_is_bounded_through_production_scheduler() {
+        use std::fmt::Write as _;
+
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+
+        let mut definitions = String::new();
+        for index in 0..=MAX_LOOP_REGION_STATES {
+            write!(
+                definitions,
+                "function bounded{index}(limit) {{ Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) {{ total = total + i; }} return total; }}"
+            )
+            .expect("write source");
+        }
+        let script =
+            crate::Script::parse(crate::Source::from_bytes(&definitions), None, &mut context)
+                .expect("parse definitions");
+        let top_level = script.codeblock(&mut context).expect("compile definitions");
+        let function_codes = top_level
+            .global_fns
+            .iter()
+            .map(|binding| {
+                top_level
+                    .constant_function(binding.function_index as usize)
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(function_codes.len(), MAX_LOOP_REGION_STATES + 1);
+        for (index, code) in function_codes.iter().enumerate() {
+            assert_eq!(
+                code.name().to_std_string_escaped(),
+                format!("bounded{index}")
+            );
+        }
+        script
+            .evaluate(&mut context)
+            .expect("define bounded functions");
+
+        let evaluate = |index: usize, context: &mut Context| {
+            let call = format!("bounded{index}(3)");
+            crate::Script::parse(crate::Source::from_bytes(&call), None, context)
+                .expect("parse bounded call")
+                .evaluate(context)
+                .expect("evaluate bounded call")
+        };
+        for index in 0..MAX_LOOP_REGION_STATES {
+            assert_eq!(evaluate(index, &mut context).as_i32(), Some(3));
+            // Capacity ownership is the invariant under test. The independent
+            // compile-time breaker has a deterministic direct test; keep a
+            // slow test machine from masking later exact keys here.
+            context
+                .jit_backend
+                .as_mut()
+                .expect("JIT backend")
+                .loop_compile_time_exhausted = false;
+        }
+
+        let suppressed_code_id = function_codes[MAX_LOOP_REGION_STATES].debug_id;
+        let backend = context.jit_backend.as_ref().expect("JIT backend");
+        assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+        assert_eq!(backend.loop_plans.len(), MAX_LOOP_REGION_STATES);
+        assert_eq!(backend.loop_cache.len(), MAX_LOOP_REGION_STATES);
+        assert!(backend.loop_regions.values().all(|state| matches!(
+            state,
+            LoopRegionState {
+                kind: LoopRegionStateKind::Ready,
+                ..
+            }
+        )));
+        assert!(
+            backend
+                .loop_regions
+                .keys()
+                .all(|key| key.code_id != suppressed_code_id)
+        );
+
+        let before_suppressed = backend.stats();
+        assert_eq!(
+            evaluate(MAX_LOOP_REGION_STATES, &mut context).as_i32(),
+            Some(3)
+        );
+        let backend = context.jit_backend.as_ref().expect("JIT backend");
+        let after_suppressed = backend.stats();
+        assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+        assert_eq!(backend.loop_plans.len(), MAX_LOOP_REGION_STATES);
+        assert_eq!(backend.loop_cache.len(), MAX_LOOP_REGION_STATES);
+        assert!(
+            backend
+                .loop_regions
+                .keys()
+                .all(|key| key.code_id != suppressed_code_id)
+        );
+        assert_eq!(
+            after_suppressed.osr.suppressions.region_capacity
+                - before_suppressed.osr.suppressions.region_capacity,
+            1
+        );
+        assert_eq!(
+            after_suppressed.osr.compilations,
+            before_suppressed.osr.compilations
+        );
+        assert_eq!(after_suppressed.osr.entries, before_suppressed.osr.entries);
+
+        assert_eq!(evaluate(0, &mut context).as_i32(), Some(3));
+        let reused = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(reused.osr.compilations, after_suppressed.osr.compilations);
+        assert_eq!(reused.osr.entries, after_suppressed.osr.entries + 1);
+        assert_eq!(reused.osr.cache_hits, after_suppressed.osr.cache_hits + 1);
+    }
+
+    #[test]
     fn jit_loop_region_circuit_breakers_suppress_only_future_new_sites() {
         let mut slow = JitBackend::new();
         slow.enable_diagnostics(JitDiagnosticLimits::default());
