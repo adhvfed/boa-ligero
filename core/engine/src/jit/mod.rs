@@ -895,6 +895,18 @@ struct CachedEntry {
     native: bool,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct JitCacheKey {
+    code_id: u64,
+    budgeted: bool,
+}
+
+impl JitCacheKey {
+    const fn new(code_id: u64, budgeted: bool) -> Self {
+        Self { code_id, budgeted }
+    }
+}
+
 /// If `instr` is a **same-frame** branch (no frame push), return its target
 /// `pc`. The JIT can then lower it to a native edge to that target's block.
 ///
@@ -939,7 +951,7 @@ pub struct JitBackend {
     /// is unique for the lifetime of the current thread, which is sufficient
     /// because a backend is not shared across threads or realms. Budgeted and
     /// unbudgeted entries are distinct so the latter keep their fast path.
-    cache: FxHashMap<(u64, bool), CachedEntry>,
+    cache: FxHashMap<JitCacheKey, CachedEntry>,
     /// The last ordinary-function target observed at each bytecode call site.
     /// Native call lowering specializes against this identity and deopts when
     /// a later value is a different function, including another ordinary
@@ -1388,7 +1400,7 @@ impl JitBackend {
             let budgeted = context.instruction_budget_remaining().is_some();
             let cached_native = self
                 .cache
-                .get(&(target_code_id, budgeted))
+                .get(&JitCacheKey::new(target_code_id, budgeted))
                 .map(|entry| entry.native);
             JitCallTargetObservation::Ordinary {
                 code_id: target_code_id,
@@ -1419,7 +1431,7 @@ impl JitBackend {
     /// Return a cached entry if one exists, compiling and caching it otherwise.
     fn cached_entry(&mut self, code: &CodeBlock, charge_instruction_budget: bool) -> CachedEntry {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
-        let cache_key = (code.debug_id, charge_instruction_budget);
+        let cache_key = JitCacheKey::new(code.debug_id, charge_instruction_budget);
 
         if let Some(cached) = self.cache.get(&cache_key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
