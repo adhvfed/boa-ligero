@@ -1190,6 +1190,30 @@ pub(crate) enum JitLoopScheduleAction {
     Invalid,
 }
 
+/// A native loop exit whose status, pending VM state, and cached PCs agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidatedLoopExit {
+    /// Generated code stored a validated uncatchable completion in VM state.
+    Break(JitExit),
+    /// Generated code materialized a validated interpreter resume state.
+    Resume(JitExit),
+}
+
+impl ValidatedLoopExit {
+    const fn exit(self) -> JitExit {
+        match self {
+            Self::Break(exit) | Self::Resume(exit) => exit,
+        }
+    }
+
+    const fn schedule_action(self) -> JitLoopScheduleAction {
+        match self {
+            Self::Break(_) => JitLoopScheduleAction::Break,
+            Self::Resume(_) => JitLoopScheduleAction::Resume,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LoopCachedEntry {
     compiled: native::CompiledLoopRegion,
@@ -1740,73 +1764,63 @@ impl JitBackend {
         };
         let entry = cached.compiled.entry;
         let header_pc = cached.header_pc;
-        let resume_pc = cached.resume_pc;
         self.record_loop_entry();
         context.vm.jit_exit_pending = None;
         let started = self.diagnostics.is_some().then(Instant::now);
         let status = entry(std::ptr::from_mut(context));
 
-        if status & JIT_BREAK_BIT != 0 {
-            let pending_exit = context.vm.jit_exit_pending;
-            let valid = context.vm.jit_pending.is_some()
-                && pending_exit.is_some_and(|exit| {
-                    exit.kind == JitExitKind::Budget
-                        && exit.reason == JitExitReason::RuntimeLimit
-                        && self
-                            .loop_cache
-                            .get(&key)
-                            .is_some_and(|cached| cached.instruction_pcs.contains(&exit.pc))
-                });
-            if !valid {
-                return self.invalid_loop_state();
-            }
-            let Some(exit) = pending_exit else {
-                return self.invalid_loop_state();
-            };
-            self.record_loop_exit(JitExitKind::Budget);
-            if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
-                diagnostics.record_exit(key.code_id, header_pc, exit, started.elapsed().as_nanos());
-            }
-            return JitLoopScheduleAction::Break;
-        }
-
-        let Some(exit) = JitExit::decode(status) else {
+        let Some(validated) = self.validate_loop_exit(key, context, status) else {
             return self.invalid_loop_state();
         };
+        let exit = validated.exit();
+        self.record_loop_exit(exit.kind);
+        if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
+            diagnostics.record_exit(key.code_id, header_pc, exit, started.elapsed().as_nanos());
+        }
+        validated.schedule_action()
+    }
+
+    fn validate_loop_exit(
+        &self,
+        key: JitCacheKey,
+        context: &Context,
+        status: u64,
+    ) -> Option<ValidatedLoopExit> {
+        let cached = self.loop_cache.get(&key)?;
+        if status & JIT_BREAK_BIT != 0 {
+            let exit = context.vm.jit_exit_pending?;
+            return (context.vm.jit_pending.is_some()
+                && exit.kind == JitExitKind::Budget
+                && exit.reason == JitExitReason::RuntimeLimit
+                && cached.instruction_pcs.contains(&exit.pc))
+            .then_some(ValidatedLoopExit::Break(exit));
+        }
+
+        let exit = JitExit::decode(status)?;
         let valid = match exit.kind {
             JitExitKind::EntryRejected => {
                 matches!(
                     exit.reason,
                     JitExitReason::EntryGuard | JitExitReason::ArgumentType
-                ) && exit.pc == header_pc
-                    && context.vm.frame().pc == header_pc
+                ) && exit.pc == cached.header_pc
+                    && context.vm.frame().pc == cached.header_pc
             }
             JitExitKind::Continuation => {
                 exit.reason == JitExitReason::LoopExit
-                    && exit.pc == resume_pc
-                    && context.vm.frame().pc == resume_pc
+                    && exit.pc == cached.resume_pc
+                    && context.vm.frame().pc == cached.resume_pc
             }
             JitExitKind::Deopt => {
                 exit.reason == JitExitReason::IntegerOverflow
                     && context.vm.frame().pc == exit.pc
-                    && self
-                        .loop_cache
-                        .get(&key)
-                        .is_some_and(|cached| cached.instruction_pcs.contains(&exit.pc))
+                    && cached.instruction_pcs.contains(&exit.pc)
             }
             JitExitKind::Return
             | JitExitKind::Call
             | JitExitKind::Completion
             | JitExitKind::Budget => false,
         };
-        if !valid {
-            return self.invalid_loop_state();
-        }
-        self.record_loop_exit(exit.kind);
-        if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
-            diagnostics.record_exit(key.code_id, header_pc, exit, started.elapsed().as_nanos());
-        }
-        JitLoopScheduleAction::Resume
+        valid.then_some(ValidatedLoopExit::Resume(exit))
     }
 
     fn record_loop_compile_attempt(&mut self) {
