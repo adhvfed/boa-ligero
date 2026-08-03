@@ -155,14 +155,16 @@ enablement, **W2, representative breadth** requires stable wins or a documented
 neutral result across the agreed bundle/site set, with diagnostics disabled in
 headline timings.
 
-Decision checkpoint A does not yet satisfy the selection form of Gate P.
-Schema 4 records static call/property instructions and native exits, but
-production admission correctly denies call-containing callers before they can
-produce scheduler-call exits; it also does not count dynamic interpreted call
-sites, target stability, or cached-target opportunity. Add bounded source-free
-site telemetry in a diagnostics-only run, and require zero dropped observations
-before using it to select the call or storage ABI. The one-shot OSR fixture is
-an attributable feasibility signal, not representative browser evidence.
+**Decision checkpoint A now satisfies the selection form of Gate P for one
+narrow branch.** Schema 7 plus corrected 4,096-record runner controls retain
+zero-drop loop/call/storage evidence. The one-shot numeric body is the only
+candidate with a complete supported region and a matching 3.96× PC-zero native
+counterfactual, so conservative loop-header OSR proceeds to its ABI design
+review. No engine or broader application loop passes the first OSR screen;
+calls have no cached native targets in broad rows, and counted storage is
+interpreted. This selects an ABI to test, not representative breadth or JIT
+default enablement. See the
+[dated selection](19-decision-checkpoint-a-selection-2026-08-03.md).
 
 ## Platform matrix
 

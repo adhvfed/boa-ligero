@@ -296,7 +296,7 @@ Suggested commit:
 perf(jit): bound hot nonzero backedge bookkeeping
 ```
 
-## Decision checkpoint A — choose the next boundary
+## Decision checkpoint A — choose the next boundary (complete)
 
 With Slice 3A complete, re-run the fixed matrix and rank attributable lost
 time:
@@ -310,6 +310,14 @@ Check in the profile and select exactly one of Slices 4A–4D. Do not begin two
 new VM ABIs in parallel. A branch that is not selected remains planned, not
 implicitly approved or rejected.
 
+The [fixed zero-drop matrix](19-decision-checkpoint-a-selection-2026-08-03.md)
+selects Slice 4A's conservative numeric loop-header OSR as the only next ABI.
+The one-shot body has 2,000,000 eligible backedges and a 3.96× PC-zero native
+counterfactual. Calls lack cached native targets in broad rows; direct storage
+cannot consume interpreted sites; region stitching has no complete measured
+region. No engine or broader application loop passes the first OSR screen, so
+this selection is intentionally narrow.
+
 ## Slice 4A — loop-header OSR
 
 Add conservative loop-region keys, safe backedge compile requests, OSR entry
@@ -319,6 +327,22 @@ allowing property or call operations in an OSR region.
 Before implementation, review the nonzero-PC cache key, materialization map,
 backend ownership at the safe compile boundary, and exact finite-budget charge
 interval.
+
+### Slice 4A0 — ABI design review (next)
+
+Check in the typed region key, stable post-backedge compile boundary, exact
+live-value/materialization map, pre-effect guard/refund rules, finite-budget
+charge interval, backend-generation ownership, cache/failure bounds, and all
+first-shape exclusions before editing the compiler or scheduler. Calls,
+properties, allocation, handlers, eval/with, suspension, host re-entry, object
+live-ins, and unknown stack state remain rejected.
+
+### Slice 4A1 — first numeric OSR shape
+
+Implement only the reviewed shape. After its behavior and diagnostic slices,
+schedule a separately revertible behavior-neutral refactor of region-key,
+materialization-map, or exit-mapping plumbing before a second execution ABI is
+considered.
 
 **Stop/go:** a one-shot hot loop must show OSR execution and pass the full OSR
 test set; otherwise leave OSR disabled and diagnose the materialization gap.

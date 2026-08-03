@@ -34,7 +34,12 @@ with exact diagnostics-only evidence and a conservative static OSR-candidacy
 screen. Storage attribution is now complete in schema 7: bounded interpreted
 sites and fixed native-helper aggregates are deliberately separate, and only
 separately cached diagnostic artifacts update native counters. The fixed
-matrix rerun remains ahead of any execution ABI decision.
+matrix rerun is now complete. Decision checkpoint A selects only conservative
+numeric loop-header OSR: it is the sole branch with a zero-drop dynamic
+opportunity, a fully supported region, and a matching approximately 4× native
+counterfactual. Broader engine and application rows contain no first-shape OSR
+candidates, so this is a narrow ABI selection rather than a breadth claim.
+Slice 4A0's ownership/materialization/budget design review is next.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -118,10 +123,12 @@ Every Phase 2 entry and exit ABI inherits that rule.
    project bounded schema-6 loop-site evidence while preserving Gate H.
    **Storage attribution complete:** Boa `753ca3ea`, `04c18a03`, `8b9b58c3`,
    and `a398b455`, plus Ligero `e36b438f`, close schema 7 without instrumenting
-   production artifacts. Re-run the same matrix, then select exactly one
-   execution ABI.
-10. Implement the highest-ranked boundary behind its own ABI review; re-profile
-   before selecting the next boundary rather than assuming the original order.
+   production artifacts. **Decision checkpoint A complete:** Boa `343cf037`
+   and Ligero `78d55bda` enable zero-drop 4,096-record profiling; the fixed
+   matrix selects only conservative loop-header OSR.
+10. Check in Slice 4A0's exact OSR ownership, cache-key, materialization, GC,
+   exception, and finite-budget ABI review; then implement that one shape and
+   re-profile before selecting the next boundary.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -184,6 +191,9 @@ showing that another boundary dominates.
 - [Slice 3A storage-attribution closure, 2026-08-03](18-slice-3a-storage-attribution-closure-2026-08-03.md)
   — schema-7 interpreted/native storage evidence, diagnostic cache isolation,
   complete gates, and the fixed-matrix handoff to Decision checkpoint A.
+- [Decision checkpoint A selection, 2026-08-03](19-decision-checkpoint-a-selection-2026-08-03.md)
+  — the zero-drop fixed matrix, corrected runner bounds, narrow loop-header OSR
+  selection, deferred alternatives, and Slice 4A0 design-review contract.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
