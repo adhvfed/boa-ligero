@@ -875,11 +875,11 @@ impl JitDiagnosticState {
         }
     }
 
-    fn record_exit(&mut self, code_id: u64, exit: JitExit, native_ns: u128) {
+    fn record_exit(&mut self, code_id: u64, entry_pc: u32, exit: JitExit, native_ns: u128) {
         let kind = JitDiagnosticExitKind::from(exit.kind);
         if let Some(record) = self.exit_records.iter_mut().find(|record| {
             record.code_id == code_id
-                && record.entry_pc == 0
+                && record.entry_pc == entry_pc
                 && record.pc == exit.pc
                 && record.kind == kind
                 && record.reason == exit.reason
@@ -892,7 +892,7 @@ impl JitDiagnosticState {
         if self.exit_records.len() < self.limits.exit_records {
             self.exit_records.push(JitExitRecord {
                 code_id,
-                entry_pc: 0,
+                entry_pc,
                 pc: exit.pc,
                 kind,
                 reason: exit.reason,
@@ -1716,11 +1716,13 @@ impl JitBackend {
         let resume_pc = cached.resume_pc;
         self.record_loop_entry();
         context.vm.jit_exit_pending = None;
+        let started = self.diagnostics.is_some().then(Instant::now);
         let status = entry(std::ptr::from_mut(context));
 
         if status & JIT_BREAK_BIT != 0 {
+            let pending_exit = context.vm.jit_exit_pending;
             let valid = context.vm.jit_pending.is_some()
-                && context.vm.jit_exit_pending.is_some_and(|exit| {
+                && pending_exit.is_some_and(|exit| {
                     exit.kind == JitExitKind::Budget
                         && exit.reason == JitExitReason::RuntimeLimit
                         && self
@@ -1731,7 +1733,13 @@ impl JitBackend {
             if !valid {
                 return JitLoopScheduleAction::Invalid;
             }
+            let Some(exit) = pending_exit else {
+                return JitLoopScheduleAction::Invalid;
+            };
             self.record_loop_exit(JitExitKind::Budget);
+            if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
+                diagnostics.record_exit(key.code_id, header_pc, exit, started.elapsed().as_nanos());
+            }
             return JitLoopScheduleAction::Break;
         }
 
@@ -1768,6 +1776,9 @@ impl JitBackend {
             return JitLoopScheduleAction::Invalid;
         }
         self.record_loop_exit(exit.kind);
+        if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
+            diagnostics.record_exit(key.code_id, header_pc, exit, started.elapsed().as_nanos());
+        }
         JitLoopScheduleAction::Resume
     }
 
@@ -2347,7 +2358,7 @@ impl JitBackend {
                 }
             });
             if let (Some(diagnostics), Some(exit)) = (&mut self.diagnostics, exit) {
-                diagnostics.record_exit(code.debug_id, exit, started.elapsed().as_nanos());
+                diagnostics.record_exit(code.debug_id, 0, exit, started.elapsed().as_nanos());
             }
         }
         status
@@ -3618,41 +3629,487 @@ mod tests {
         assert_eq!(stats.osr.deopts, 0, "stats: {stats:?}");
     }
 
-    #[test]
-    fn context_owned_jit_osr_charges_exact_interpreter_instruction_budget() {
-        let source = "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } once(10)";
-        let run = |jit: bool| {
-            let mut context = Context::default();
-            if jit {
-                context.enable_jit();
-                context.set_jit_thresholds(JitThresholds {
-                    function_entries: u32::MAX,
-                    loop_backedges: 1,
-                });
-            }
-            let script =
-                crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
-                    .expect("parse");
-            context.set_instruction_budget(1_000);
-            let result = script
+    #[derive(Debug)]
+    struct OsrBudgetObservation {
+        outcome: Result<JsValue, crate::JsError>,
+        remaining: usize,
+        stats_before: Option<JitStats>,
+        stats_after: Option<JitStats>,
+        diagnostics_before: Option<JitDiagnosticSnapshot>,
+        diagnostics_after: Option<JitDiagnosticSnapshot>,
+    }
+
+    fn evaluate_osr_budget_case(
+        definition: &str,
+        call: &str,
+        budget: usize,
+        jit: bool,
+        cache_hit: bool,
+    ) -> OsrBudgetObservation {
+        let mut context = Context::default();
+        if jit {
+            context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+            context.set_jit_thresholds(JitThresholds {
+                function_entries: u32::MAX,
+                loop_backedges: 1,
+            });
+        }
+        crate::Script::parse(crate::Source::from_bytes(definition), None, &mut context)
+            .expect("parse definition")
+            .evaluate(&mut context)
+            .expect("evaluate definition");
+
+        if cache_hit {
+            let prime = crate::Script::parse(crate::Source::from_bytes(call), None, &mut context)
+                .expect("parse cache primer");
+            context.set_instruction_budget(10_000);
+            prime
                 .evaluate(&mut context)
-                .expect("budgeted evaluation")
-                .as_i32();
-            (
-                result,
-                context.instruction_budget_remaining(),
-                context.jit_stats(),
+                .expect("prime the budgeted loop artifact");
+            if jit {
+                let stats = context.jit_stats().expect("JIT was enabled");
+                assert_eq!(stats.osr.compilations, 1, "primer stats: {stats:?}");
+                assert_eq!(stats.osr.entries, 1, "primer stats: {stats:?}");
+            }
+        }
+
+        let stats_before = context.jit_stats();
+        let diagnostics_before = context.jit_diagnostic_snapshot();
+        let target = crate::Script::parse(crate::Source::from_bytes(call), None, &mut context)
+            .expect("parse budgeted call");
+        context.set_instruction_budget(budget);
+        let outcome = target.evaluate(&mut context);
+        OsrBudgetObservation {
+            outcome,
+            remaining: context
+                .instruction_budget_remaining()
+                .expect("the test installed a finite budget"),
+            stats_before,
+            stats_after: context.jit_stats(),
+            diagnostics_before,
+            diagnostics_after: context.jit_diagnostic_snapshot(),
+        }
+    }
+
+    fn osr_exit_count(
+        snapshot: &JitDiagnosticSnapshot,
+        entry_pc: u32,
+        pc: u32,
+        kind: JitDiagnosticExitKind,
+        reason: JitExitReason,
+    ) -> u64 {
+        snapshot
+            .exit_records
+            .iter()
+            .find(|record| {
+                record.entry_pc == entry_pc
+                    && record.pc == pc
+                    && record.kind == kind
+                    && record.reason == reason
+            })
+            .map_or(0, |record| record.count)
+    }
+
+    #[derive(Clone, Copy)]
+    enum OsrReplayOpcode {
+        Add,
+        Sub,
+        Mul,
+        Inc,
+    }
+
+    impl OsrReplayOpcode {
+        fn matches(self, instruction: &Instruction) -> bool {
+            matches!(
+                (self, instruction),
+                (Self::Add, Instruction::Add { .. })
+                    | (Self::Sub, Instruction::Sub { .. })
+                    | (Self::Mul, Instruction::Mul { .. })
+                    | (Self::Inc, Instruction::Inc { .. })
             )
+        }
+    }
+
+    fn assert_osr_budget_sweep(
+        definition: &str,
+        call: &str,
+        replay_opcode: Option<OsrReplayOpcode>,
+    ) {
+        let code = first_function_code(definition);
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            true,
+            true,
+        )
+        .expect("budget sweep must use the first scheduler-reachable shape");
+        let header_instruction = InstructionIterator::new(&code.bytecode)
+            .find_map(|(pc, _, instruction)| (pc as u32 == header_pc).then_some(instruction))
+            .expect("loop header instruction");
+        assert!(
+            matches!(header_instruction, Instruction::IncrementLoopIteration),
+            "the first-shape header and loop-iteration poll are one boundary"
+        );
+        let replay_pcs = replay_opcode.map_or_else(Vec::new, |opcode| {
+            InstructionIterator::new(&code.bytecode)
+                .filter_map(|(pc, _, instruction)| {
+                    opcode.matches(&instruction).then_some(pc as u32)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(replay_pcs.is_empty(), replay_opcode.is_none());
+        let resume_pc = plan.exits[0].resume_pc;
+
+        let generous = 10_000;
+        let baseline = evaluate_osr_budget_case(definition, call, generous, false, false);
+        assert!(baseline.outcome.is_ok(), "baseline: {baseline:?}");
+        let consumed = generous - baseline.remaining;
+        assert!(consumed > 0);
+
+        let mut mode_boundaries = Vec::new();
+        for cache_hit in [false, true] {
+            let mut saw_native_success = false;
+            let mut first_entry_budget = None;
+            let mut first_continuation_budget = None;
+            let mut first_deopt_budget = None;
+            let mut budget_exit_pcs = std::collections::BTreeSet::new();
+            for budget in 0..=consumed.saturating_add(1) {
+                let interpreted =
+                    evaluate_osr_budget_case(definition, call, budget, false, cache_hit);
+                let native = evaluate_osr_budget_case(definition, call, budget, true, cache_hit);
+                assert_eq!(
+                    native.outcome, interpreted.outcome,
+                    "outcome mismatch at budget {budget}, cache_hit={cache_hit}"
+                );
+                assert_eq!(
+                    native.remaining, interpreted.remaining,
+                    "remaining-budget mismatch at budget {budget}, cache_hit={cache_hit}"
+                );
+
+                let before = native.stats_before.expect("JIT was enabled");
+                let after = native.stats_after.expect("JIT was enabled");
+                assert_eq!(
+                    after.osr.compilations - before.osr.compilations,
+                    u64::from(!cache_hit && after.osr.entries > before.osr.entries),
+                    "compile/entry mismatch at budget {budget}, cache_hit={cache_hit}: {after:?}"
+                );
+                let entry_delta = after.osr.entries - before.osr.entries;
+                assert!(entry_delta <= 1, "stats: {after:?}");
+                if entry_delta == 1 {
+                    first_entry_budget.get_or_insert(budget);
+                    saw_native_success |= native.outcome.is_ok();
+                }
+
+                let diagnostics_before = native
+                    .diagnostics_before
+                    .as_ref()
+                    .expect("JIT diagnostics were enabled");
+                let diagnostics_after = native
+                    .diagnostics_after
+                    .as_ref()
+                    .expect("JIT diagnostics were enabled");
+                assert_eq!(diagnostics_after.dropped_exit_records, 0);
+                for record in diagnostics_after.exit_records.iter().filter(|record| {
+                    record.entry_pc == header_pc
+                        && record.kind == JitDiagnosticExitKind::Budget
+                        && record.reason == JitExitReason::RuntimeLimit
+                }) {
+                    let before_count = osr_exit_count(
+                        diagnostics_before,
+                        header_pc,
+                        record.pc,
+                        record.kind,
+                        record.reason,
+                    );
+                    if record.count > before_count {
+                        assert_eq!(record.count - before_count, 1);
+                        budget_exit_pcs.insert(record.pc);
+                    }
+                }
+
+                let continuation_delta = osr_exit_count(
+                    diagnostics_after,
+                    header_pc,
+                    resume_pc,
+                    JitDiagnosticExitKind::Continuation,
+                    JitExitReason::LoopExit,
+                ) - osr_exit_count(
+                    diagnostics_before,
+                    header_pc,
+                    resume_pc,
+                    JitDiagnosticExitKind::Continuation,
+                    JitExitReason::LoopExit,
+                );
+                assert_eq!(
+                    continuation_delta,
+                    after.osr.continuations - before.osr.continuations
+                );
+                if continuation_delta == 1 {
+                    first_continuation_budget.get_or_insert(budget);
+                }
+
+                let deopt_delta = replay_pcs
+                    .iter()
+                    .map(|pc| {
+                        osr_exit_count(
+                            diagnostics_after,
+                            header_pc,
+                            *pc,
+                            JitDiagnosticExitKind::Deopt,
+                            JitExitReason::IntegerOverflow,
+                        ) - osr_exit_count(
+                            diagnostics_before,
+                            header_pc,
+                            *pc,
+                            JitDiagnosticExitKind::Deopt,
+                            JitExitReason::IntegerOverflow,
+                        )
+                    })
+                    .sum::<u64>();
+                assert_eq!(deopt_delta, after.osr.deopts - before.osr.deopts);
+                if deopt_delta == 1 {
+                    first_deopt_budget.get_or_insert(budget);
+                }
+            }
+            let entry_budget = first_entry_budget.expect("the sweep must reach OSR entry");
+            assert!(entry_budget > 0);
+            assert!(
+                budget_exit_pcs.contains(&header_pc),
+                "the first native header/poll must expose its exact budget PC, cache_hit={cache_hit}"
+            );
+            assert!(
+                saw_native_success,
+                "the sweep must cross the normal OSR continuation, cache_hit={cache_hit}"
+            );
+            if replay_opcode.is_some() {
+                assert!(
+                    replay_pcs.iter().any(|pc| budget_exit_pcs.contains(pc)),
+                    "the replaying arithmetic opcode must expose its budget PC"
+                );
+                assert!(first_continuation_budget.is_none());
+                assert!(first_deopt_budget.is_some());
+            } else {
+                let expected_pcs = plan
+                    .instruction_pcs
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(budget_exit_pcs, expected_pcs);
+                assert!(first_continuation_budget.is_some());
+                assert!(first_deopt_budget.is_none());
+            }
+            mode_boundaries.push((entry_budget, first_continuation_budget, first_deopt_budget));
+        }
+        assert_eq!(
+            mode_boundaries[0], mode_boundaries[1],
+            "synchronous compilation must consume no JavaScript instructions"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_osr_matches_every_interpreter_instruction_budget() {
+        assert_osr_budget_sweep(
+            "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            "once(3)",
+            None,
+        );
+        assert_osr_budget_sweep(
+            "function once(limit) { Math.abs(limit); let total = 2147483646; for (let i = 0; i < limit; i++) { total = total + 1; } return total; }",
+            "once(2)",
+            Some(OsrReplayOpcode::Add),
+        );
+        assert_osr_budget_sweep(
+            "function once(limit) { Math.abs(limit); let total = -2147483647; for (let i = 0; i < limit; i++) { total = total - 1; } return total; }",
+            "once(2)",
+            Some(OsrReplayOpcode::Sub),
+        );
+        assert_osr_budget_sweep(
+            "function once(limit) { Math.abs(limit); let total = 1073741823; for (let i = 0; i < limit; i++) { total = total * 2; } return total; }",
+            "once(2)",
+            Some(OsrReplayOpcode::Mul),
+        );
+        assert_osr_budget_sweep(
+            "function once(limit) { Math.abs(limit); let total = 2147483646; for (let i = 0; i < limit; i++) { total++; } return total; }",
+            "once(2)",
+            Some(OsrReplayOpcode::Inc),
+        );
+    }
+
+    #[derive(Debug)]
+    struct OsrLoopLimitObservation {
+        outcome: Result<JsValue, crate::JsError>,
+        stats_before: Option<JitStats>,
+        stats_after: Option<JitStats>,
+        diagnostics_before: Option<JitDiagnosticSnapshot>,
+        diagnostics_after: Option<JitDiagnosticSnapshot>,
+    }
+
+    fn evaluate_osr_loop_limit_case(
+        definition: &str,
+        call: &str,
+        limit: u64,
+        jit: bool,
+        cache_hit: bool,
+    ) -> OsrLoopLimitObservation {
+        let mut context = Context::default();
+        if jit {
+            context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+            context.set_jit_thresholds(JitThresholds {
+                function_entries: u32::MAX,
+                loop_backedges: 1,
+            });
+        }
+        crate::Script::parse(crate::Source::from_bytes(definition), None, &mut context)
+            .expect("parse definition")
+            .evaluate(&mut context)
+            .expect("evaluate definition");
+
+        if cache_hit {
+            crate::Script::parse(crate::Source::from_bytes(call), None, &mut context)
+                .expect("parse cache primer")
+                .evaluate(&mut context)
+                .expect("prime the loop artifact");
+        }
+
+        let stats_before = context.jit_stats();
+        let diagnostics_before = context.jit_diagnostic_snapshot();
+        context.runtime_limits_mut().set_loop_iteration_limit(limit);
+        let outcome = crate::Script::parse(crate::Source::from_bytes(call), None, &mut context)
+            .expect("parse limited call")
+            .evaluate(&mut context);
+        OsrLoopLimitObservation {
+            outcome,
+            stats_before,
+            stats_after: context.jit_stats(),
+            diagnostics_before,
+            diagnostics_after: context.jit_diagnostic_snapshot(),
+        }
+    }
+
+    #[test]
+    fn context_owned_jit_osr_matches_interpreter_loop_limits() {
+        let definition = "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }";
+        let call = "once(3)";
+        let code = first_function_code(definition);
+        let (header_pc, _) = canonical_loop(&code);
+        let loop_limit_pc = InstructionIterator::new(&code.bytecode)
+            .find_map(|(pc, _, instruction)| {
+                (pc as u32 == header_pc
+                    && matches!(instruction, Instruction::IncrementLoopIteration))
+                .then_some(header_pc + 1)
+            })
+            .expect("loop-iteration failure PC");
+
+        for cache_hit in [false, true] {
+            for limit in 0..=4 {
+                let interpreted =
+                    evaluate_osr_loop_limit_case(definition, call, limit, false, cache_hit);
+                let native = evaluate_osr_loop_limit_case(definition, call, limit, true, cache_hit);
+                assert_eq!(
+                    native.outcome, interpreted.outcome,
+                    "loop-limit outcome mismatch at limit {limit}, cache_hit={cache_hit}"
+                );
+
+                let before = native.stats_before.expect("JIT was enabled");
+                let after = native.stats_after.expect("JIT was enabled");
+                let entry_delta = after.osr.entries - before.osr.entries;
+                assert_eq!(
+                    entry_delta, 1,
+                    "loop-limit entry mismatch at limit {limit}, cache_hit={cache_hit}: {after:?}"
+                );
+
+                let diagnostics_before = native
+                    .diagnostics_before
+                    .as_ref()
+                    .expect("JIT diagnostics were enabled");
+                let diagnostics_after = native
+                    .diagnostics_after
+                    .as_ref()
+                    .expect("JIT diagnostics were enabled");
+                assert_eq!(diagnostics_after.dropped_exit_records, 0);
+                let runtime_limit_delta = osr_exit_count(
+                    diagnostics_after,
+                    header_pc,
+                    loop_limit_pc,
+                    JitDiagnosticExitKind::Budget,
+                    JitExitReason::RuntimeLimit,
+                ) - osr_exit_count(
+                    diagnostics_before,
+                    header_pc,
+                    loop_limit_pc,
+                    JitDiagnosticExitKind::Budget,
+                    JitExitReason::RuntimeLimit,
+                );
+                assert_eq!(
+                    runtime_limit_delta,
+                    u64::from(limit < 3),
+                    "loop-limit exit mismatch at limit {limit}, cache_hit={cache_hit}: {diagnostics_after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_owned_jit_osr_keeps_budget_modes_in_distinct_cache_variants() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition")
+        .evaluate(&mut context)
+        .expect("evaluate definition");
+
+        let evaluate = |context: &mut Context| {
+            crate::Script::parse(crate::Source::from_bytes("once(3)"), None, context)
+                .expect("parse call")
+                .evaluate(context)
+                .expect("evaluate call")
         };
 
-        let interpreted = run(false);
-        let native = run(true);
-        assert_eq!(native.0, interpreted.0);
-        assert_eq!(native.1, interpreted.1);
-        let stats = native.2.expect("JIT was enabled");
-        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
-        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
-        assert_eq!(stats.osr.continuations, 1, "stats: {stats:?}");
+        assert_eq!(evaluate(&mut context).as_i32(), Some(3));
+        let unbudgeted = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(unbudgeted.osr.compilations, 1, "stats: {unbudgeted:?}");
+        assert_eq!(unbudgeted.osr.entries, 1, "stats: {unbudgeted:?}");
+
+        context.set_instruction_budget(1_000);
+        assert_eq!(evaluate(&mut context).as_i32(), Some(3));
+        let budgeted = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(budgeted.osr.compilations, 2, "stats: {budgeted:?}");
+        assert_eq!(budgeted.osr.entries, 2, "stats: {budgeted:?}");
+        assert!(
+            context
+                .instruction_budget_remaining()
+                .is_some_and(|left| left < 1_000),
+            "the budgeted variant must charge the original bytecodes"
+        );
+
+        context.clear_instruction_budget();
+        assert_eq!(evaluate(&mut context).as_i32(), Some(3));
+        let reused = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(reused.osr.compilations, 2, "stats: {reused:?}");
+        assert_eq!(reused.osr.entries, 3, "stats: {reused:?}");
+
+        let backend = context.jit_backend.as_ref().expect("JIT was enabled");
+        assert_eq!(backend.loop_cache.len(), 2);
+        let mut budget_modes = backend
+            .loop_cache
+            .keys()
+            .map(|key| key.budgeted)
+            .collect::<Vec<_>>();
+        budget_modes.sort_unstable();
+        assert_eq!(budget_modes, [false, true]);
     }
 
     #[test]
