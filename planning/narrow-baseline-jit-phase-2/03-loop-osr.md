@@ -1,5 +1,10 @@
 # Loop-header OSR
 
+Status: the general direction remains current. The exact first-shape ABI is
+normative in the [Slice 4A0 review](20-loop-osr-abi-review-2026-08-03.md), which
+adds latch/backedge and numeric-representation identity, a distinct post-effect
+continuation exit, and bounded per-region hotness.
+
 ## Why OSR is Phase 2 work
 
 The current tier can become eligible after function entries or observed
@@ -26,6 +31,7 @@ An OSR entry is not the same artifact as a function entry. Key it by:
 (realm identity,
  CodeBlock identity,
  loop-header PC,
+ latch/backedge PC,
  bytecode/ABI version,
  feedback/representation signature)
 ```
@@ -34,13 +40,15 @@ The entry metadata must record:
 
 - the exact header PC and predecessor/backedge PC;
 - live register and operand-stack locations;
-- the expected `CallFrame` identity and environment depth;
+- the expected current CodeBlock/header and validated frame/register shape;
 - the primitive representation of each native value;
 - guards required before entering the region;
 - every deopt PC and materialization map;
 - whether the region contains a runtime-limit poll or helper safepoint.
 
-Do not share an OSR entry across realms or mutable bytecode versions.
+Do not retain a raw frame pointer or share an OSR entry across mutable bytecode
+versions. The first pure-numeric artifact is backend-owned and reloads the
+current recursive frame after checking the live CodeBlock/header identity.
 
 ## Conservative first eligibility
 

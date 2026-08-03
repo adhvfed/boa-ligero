@@ -9,8 +9,16 @@ claim that OSR dominates arbitrary modern JavaScript. It selects OSR because
 it is the only branch with all three of:
 
 1. a dynamically hot, source-free, zero-drop production observation;
-2. a complete region already supported by the native compiler; and
-3. an end-to-end native counterfactual with a matching result sink.
+2. a loop whose bytecodes pass the conservative Phase 1 numeric/control-flow
+   screen; and
+3. an end-to-end whole-body native counterfactual with a matching result sink.
+
+The screen is not a nonzero-PC compilation proof. Slice 4A0 subsequently found
+two required ABI pieces: the loop's forward exit needs an explicit post-effect
+continuation/materialization map, and region-only mode selection cannot infer
+the fixture's live `F64` accumulator because its defining `StoreFloat` is before
+the header. Those findings refine the implementation contract without changing
+the ranking: no deferred alternative has a measured consumable native path.
 
 Compiled calls, direct guarded storage, and region stitching remain planned.
 No production admission rule, lowering allowlist, cache ownership rule, or VM
@@ -112,10 +120,12 @@ timing claim.
 The one-shot numeric body executes 2,000,000 backedges after its only PC-zero
 opportunity and passes the conservative static screen. Production JIT stays at
 interpreter parity because it correctly creates no mid-frame artifact. The
-runner's intentional threshold-1 PC-zero control executes the identical body
-natively with a 7.318 ms median including 0.429 ms median compilation, versus
-28.980 ms interpreted. This 3.96× counterfactual is not an OSR result; it bounds
-the opportunity and proves the region is useful once materialized.
+runner's intentional threshold-1 PC-zero control executes the complete
+function natively with a 7.318 ms median including 0.429 ms median compilation,
+versus 28.980 ms interpreted. This 3.96× counterfactual is not an OSR result; it bounds
+the opportunity and proves the screened loop bytecodes are useful inside a
+whole-body native artifact. It does not prove that the current compiler can
+materialize or exit the region from a nonzero-PC entry.
 
 ### 2. Compiled ordinary calls — deferred
 

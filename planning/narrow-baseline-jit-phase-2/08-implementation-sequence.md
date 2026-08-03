@@ -312,8 +312,10 @@ implicitly approved or rejected.
 
 The [fixed zero-drop matrix](19-decision-checkpoint-a-selection-2026-08-03.md)
 selects Slice 4A's conservative numeric loop-header OSR as the only next ABI.
-The one-shot body has 2,000,000 eligible backedges and a 3.96× PC-zero native
-counterfactual. Calls lack cached native targets in broad rows; direct storage
+The one-shot body has 2,000,000 statically screened backedges and a 3.96×
+whole-body PC-zero native counterfactual. The screen does not prove nonzero-PC
+materialization or an external region exit; Slice 4A0 owns those contracts.
+Calls lack cached native targets in broad rows; direct storage
 cannot consume interpreted sites; region stitching has no complete measured
 region. No engine or broader application loop passes the first OSR screen, so
 this selection is intentionally narrow.
@@ -328,9 +330,10 @@ Before implementation, review the nonzero-PC cache key, materialization map,
 backend ownership at the safe compile boundary, and exact finite-budget charge
 interval.
 
-### Slice 4A0 — ABI design review (next)
+### Slice 4A0 — ABI design review (complete)
 
-Check in the typed region key, stable post-backedge compile boundary, exact
+The [reviewed ABI](20-loop-osr-abi-review-2026-08-03.md) checks in the typed
+region key, stable post-backedge compile boundary, exact
 live-value/materialization map, pre-effect guard/refund rules, finite-budget
 charge interval, backend-generation ownership, cache/failure bounds, and all
 first-shape exclusions before editing the compiler or scheduler. Calls,

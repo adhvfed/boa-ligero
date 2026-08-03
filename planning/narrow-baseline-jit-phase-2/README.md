@@ -36,10 +36,13 @@ sites and fixed native-helper aggregates are deliberately separate, and only
 separately cached diagnostic artifacts update native counters. The fixed
 matrix rerun is now complete. Decision checkpoint A selects only conservative
 numeric loop-header OSR: it is the sole branch with a zero-drop dynamic
-opportunity, a fully supported region, and a matching approximately 4× native
-counterfactual. Broader engine and application rows contain no first-shape OSR
+opportunity, bytecodes inside the screened numeric/control-flow subset, and a
+matching approximately 4× whole-body native counterfactual. Slice 4A0 confirms
+that the region still needs an explicit external continuation and live-in
+representation plan; the earlier screen was not a nonzero-PC compilation
+proof. Broader engine and application rows contain no first-shape OSR
 candidates, so this is a narrow ABI selection rather than a breadth claim.
-Slice 4A0's ownership/materialization/budget design review is next.
+Slice 4A0's ownership/materialization/budget design review is complete.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -194,6 +197,10 @@ showing that another boundary dominates.
 - [Decision checkpoint A selection, 2026-08-03](19-decision-checkpoint-a-selection-2026-08-03.md)
   — the zero-drop fixed matrix, corrected runner bounds, narrow loop-header OSR
   selection, deferred alternatives, and Slice 4A0 design-review contract.
+- [Loop-header OSR ABI review, 2026-08-03](20-loop-osr-abi-review-2026-08-03.md)
+  — the exact typed region identity, safe post-backedge ownership boundary,
+  live-in and exit materialization rules, continuation/replay taxonomy, bounds,
+  exclusions, and Slice 4A1 gates.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
