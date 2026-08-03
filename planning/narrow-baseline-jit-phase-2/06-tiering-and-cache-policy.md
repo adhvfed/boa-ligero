@@ -83,6 +83,17 @@ stable and documented. Avoid immediate recompile loops:
 - do not compile a shim fallback repeatedly for the same code block;
 - keep a failed compilation from being retried on every entry.
 
+Crossing a hotness threshold must also stop expensive eligibility bookkeeping
+that can no longer change the current entry decision. A 2026-08-03 one-shot
+numeric control performed no compilation or native entry yet measured 37.963
+ms with the tier enabled versus 27.455 ms in the interpreter. The current
+code-global backedge map is still updated after the nonzero-PC frame is hot,
+so OSR could mask the loss for eligible loops while leaving ineligible loops
+slower. Before OSR is credited with a win, add a frame/site latch or equivalent
+bounded transition that preserves later PC-zero eligibility and exact
+diagnostics without a hash-table update on every remaining backedge. Gate
+below-threshold, hot-but-unentered, and statically ineligible loops separately.
+
 The first version can use a small bounded cache and no eviction if measurements
 show acceptable memory growth. Add an explicit size/count limit before enabling
 the tier for long-lived browser sessions.

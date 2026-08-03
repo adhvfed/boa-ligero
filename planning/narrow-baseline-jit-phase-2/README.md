@@ -20,7 +20,12 @@ scheduled separately revertible helper-table refactor. Post-refactor release
 gates retain a 4.80× floating-point win, keep all negative controls inside 5%,
 and preserve W0's checksum and paint structure at a 30.0% lower median cold
 load. Each new execution ABI still requires its own design review before
-implementation.
+implementation. Decision checkpoint A has now found that the current schema
+cannot rank the remaining boundaries honestly: production call-containing
+frames are denied before a scheduler exit can be observed, property counts are
+static rather than dynamic, and one-shot loops expose a separate hot-but-
+unentered tiering regression. The next scheduled slice is therefore bounded
+attribution and dormant-tier guardrails, not an execution ABI.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -91,13 +96,17 @@ Every Phase 2 entry and exit ABI inherits that rule.
 7. Pay the scheduled behavior-neutral helper/materialization refactor after
    the two Slice 2C behavior changes. **Complete:** Boa `54a109f6` borrows the
    generated helper table and removes its unused compiler copy.
-8. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
-   helper-backed storage by measured lost time and transition count.
-9. Implement the highest-ranked boundary behind its own ABI review; re-profile
+8. At a recorded decision checkpoint, verify that loop, call, and storage cost
+   is dynamically attributable. **Reviewed:** schema 4 cannot yet make that
+   comparison, so no execution ABI is selected.
+9. Add bounded source-free site telemetry and close the measured hot-but-
+   unentered tiering regression without relaxing production admission. Re-run
+   the same matrix, then select exactly one execution ABI.
+10. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
-10. Apply cache bounds, failure suppression, and cold-start guardrails throughout
+11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
-11. Keep direct storage last unless helper attribution proves it dominates and
+12. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
 The first slice was deliberately measurement-only. OSR and compiled calls are
@@ -139,6 +148,10 @@ showing that another boundary dominates.
 - [Slice 2C closure, 2026-08-03](13-slice-2c-closure-2026-08-03.md) — landed
   commits, correctness matrix, post-refactor release controls, W0, and the
   remaining Decision checkpoint A.
+- [Decision checkpoint A review, 2026-08-03](14-decision-checkpoint-a-review-2026-08-03.md)
+  — the attributable one-shot-loop result, the separate dormant-tier
+  regression, the call/storage observability gaps, and the refined no-ABI
+  schedule.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

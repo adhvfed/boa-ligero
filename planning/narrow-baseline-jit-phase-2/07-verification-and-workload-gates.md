@@ -119,6 +119,15 @@ segments. See the [Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
 A one-shot hot loop enters native code from an interpreter backedge and passes
 all budget, exception, GC, and guard-failure tests.
 
+### Gate H — hot-but-unentered tiering
+
+With zero compilations and zero native entries, enabling the tier must remain
+within 5% of interpreter time for below-threshold and statically ineligible
+loops. A separate default-threshold control must prove that reaching hotness at
+a nonzero PC does not keep paying unbounded map/scheduler bookkeeping. Report
+executed backedges, threshold crossings, entries, and artifacts so an OSR win
+cannot hide dormant-tier overhead.
+
 ### Gate K — calls
 
 Matching ordinary calls use the compiled-call path and show a warm win;
@@ -138,6 +147,15 @@ rank unsupported bytecode, OSR, call, or storage costs. Before default
 enablement, **W2, representative breadth** requires stable wins or a documented
 neutral result across the agreed bundle/site set, with diagnostics disabled in
 headline timings.
+
+Decision checkpoint A does not yet satisfy the selection form of Gate P.
+Schema 4 records static call/property instructions and native exits, but
+production admission correctly denies call-containing callers before they can
+produce scheduler-call exits; it also does not count dynamic interpreted call
+sites, target stability, or cached-target opportunity. Add bounded source-free
+site telemetry in a diagnostics-only run, and require zero dropped observations
+before using it to select the call or storage ABI. The one-shot OSR fixture is
+an attributable feasibility signal, not representative browser evidence.
 
 ## Platform matrix
 

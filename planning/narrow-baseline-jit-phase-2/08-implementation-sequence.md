@@ -179,32 +179,86 @@ Landed as Boa `54a109f6`. Compiler emission now borrows one generated helper
 table and no longer stores or copies an unused 536-byte table. Native coverage,
 diagnostics, and the allowlist are unchanged.
 
-## Slice 3 — region stitching, only if selected
+## Decision checkpoint A0 — verify attribution before choosing an ABI
 
-Represent native regions and unsupported exits explicitly. Make supported
-forward/backward edges stay in Cranelift while preserving exact PC and
-materialization maps at exits.
+The post-2C review found a measurement gap rather than a defensible winner.
+The one-shot numeric control proves a useful nonzero-PC opportunity, but also
+exposes a separate hot-but-unentered regression. Production call-containing
+callers now correctly install no artifact, which means the old native
+scheduler bridge cannot measure their current opportunity. Storage records are
+static instruction counts, not dynamic helper cost. Record this outcome; do
+not treat lack of a native exit as lack of workload cost.
 
-**Stop/go:** malformed targets, handler boundaries, and unsupported control
-flow must reject/deopt safely; native code must not invoke the opcode shim for
-selected operations.
+## Slice 3A — bounded boundary-attribution telemetry
+
+Add diagnostics-only, source-free, bounded site records needed to compare the
+remaining branches without changing admission, lowering, cache ownership, or
+the execution ABI:
+
+- call-site executions, ordinary/non-ordinary classification, first/same/
+  changed ordinary target counts, and whether the target already had a cached
+  native or shim variant for the current budget mode;
+- loop-header/backedge executions, the first hotness crossing, whether the
+  frame had already passed PC zero, and dry-run eligibility/rejection for the
+  conservative first OSR shape;
+- executed named/dense access sites and, for existing native helper paths,
+  guard hit/miss plus helper-load counts. Never retain a value, object, shape,
+  environment, function name, source, URL, property name, or raw pointer.
+
+Bound each record kind and count dropped observations without allocating an
+unbounded dropped-site set. Headline timing keeps diagnostics disabled. A
+separate diagnostics run must have zero dropped observations before it is used
+for ranking. Keep `denied_call_boundary` unchanged. A scheduler-call-exit
+aggregate may characterize the existing in-crate test override, but production
+selection must use production call-site observations.
+
+**Stop/go:** exact sinks remain equal; zero-cap/default/max-cap and source-free
+serialization tests pass; normal diagnostics-disabled negative controls stay
+within 5%; diagnostics are explicitly excluded from headline timing. This
+slice may identify a candidate, but cannot itself relax admission.
+
+Suggested commits:
+
+```text
+test(jit): attribute hot execution boundaries
+feat(jit): project boundary diagnostics to ligero
+```
+
+## Slice 3B — hot-but-unentered tier guardrail
+
+Add a durable one-shot numeric fixture and a separate ineligible-loop control.
+Measure unreachable thresholds, default hotness with zero native entry, and an
+intentional threshold-1 PC-zero native control. Once a frame/site has supplied
+the hotness information needed for the next safe decision, stop repeating
+expensive map/scheduler bookkeeping while preserving future PC-zero entry,
+runtime limits, exact counters or their documented bounded replacement, and
+the interpreter as the semantic authority.
+
+The recorded reproducer (`SHA-256
+0f54effe6b51cb7d0b29b88f478474cd3e9576e8a44f48fa1a6e90b12afef223`)
+measured 27.455 ms interpreter, 37.963 ms default JIT with zero artifacts, and
+7.429 ms for the intentional PC-zero native control. The last number is OSR
+feasibility evidence; it is not an OSR result.
+
+**Stop/go:** Gate H passes before a 4A speedup is accepted. Do not implement
+OSR merely to conceal a zero-entry tier regression.
 
 Suggested commit:
 
 ```text
-perf(jit): stitch native regions across supported control flow
+perf(jit): bound hot nonzero backedge bookkeeping
 ```
 
 ## Decision checkpoint A — choose the next boundary
 
-Re-run the fixed matrix after Slice 2 or 3 and rank attributable lost time:
+Re-run the fixed matrix after Slices 3A and 3B and rank attributable lost time:
 
 1. interpreted one-shot loop work after the PC-zero opportunity;
 2. scheduler round trips to already-compiled monomorphic callees;
 3. property/element helper and guard cost;
 4. compilation, cache, or admission overhead.
 
-Check in the profile and select exactly one of Slices 4A–4C. Do not begin two
+Check in the profile and select exactly one of Slices 4A–4D. Do not begin two
 new VM ABIs in parallel. A branch that is not selected remains planned, not
 implicitly approved or rejected.
 
@@ -258,6 +312,24 @@ Suggested commit:
 
 ```text
 perf(jit): inline the measured guarded storage load
+```
+
+## Slice 4D — region stitching, only if selected
+
+Represent native regions and unsupported exits explicitly. Make supported
+forward/backward edges stay in Cranelift while preserving exact PC and
+materialization maps at exits. This is an alternative evidence-selected ABI
+branch, not a prerequisite that may land before Decision checkpoint A.
+
+**Stop/go:** malformed targets, handler boundaries, and unsupported control
+flow must reject/deopt safely; native code must not invoke the opcode shim for
+selected operations; the complete measured region must pass production
+admission and workload timing.
+
+Suggested commit:
+
+```text
+perf(jit): stitch native regions across supported control flow
 ```
 
 ## Decision checkpoint B — re-profile
