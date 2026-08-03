@@ -31,9 +31,10 @@ guardrail: eligible and statically ineligible one-shot loops are within 0.94%
 of interpreter medians with zero artifacts, while explicit diagnostics retain
 exact 2,000,000-backedge evidence. Loop attribution has now landed in schema 6
 with exact diagnostics-only evidence and a conservative static OSR-candidacy
-screen. Storage attribution remains ahead of any execution ABI decision; its
-interpreted-site records and native-helper aggregates are deliberately
-separate so production artifacts pay no diagnostic counter cost.
+screen. Storage attribution is now complete in schema 7: bounded interpreted
+sites and fixed native-helper aggregates are deliberately separate, and only
+separately cached diagnostic artifacts update native counters. The fixed
+matrix rerun remains ahead of any execution ABI decision.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -114,9 +115,11 @@ Every Phase 2 entry and exit ABI inherits that rule.
    `cc07a908` replace unbounded/map-backed hotness with generation-scoped state
    and a dormant-frame transition; Ligero `6594d5a2` projects the counters.
    **Loop attribution complete:** Boa `0233f60f` and Ligero `48573227` add and
-   project bounded schema-6 loop-site evidence while preserving Gate H. Finish
-   the two-part storage attribution contract, re-run the same matrix, then
-   select exactly one execution ABI.
+   project bounded schema-6 loop-site evidence while preserving Gate H.
+   **Storage attribution complete:** Boa `753ca3ea`, `04c18a03`, `8b9b58c3`,
+   and `a398b455`, plus Ligero `e36b438f`, close schema 7 without instrumenting
+   production artifacts. Re-run the same matrix, then select exactly one
+   execution ABI.
 10. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
@@ -178,6 +181,9 @@ showing that another boundary dominates.
 - [Slice 3A loop-attribution checkpoint, 2026-08-03](17-slice-3a-loop-attribution-2026-08-03.md)
   — schema-6 interpreted loop evidence, diagnostics-off parity, and the
   refined two-part storage-attribution contract before Decision checkpoint A.
+- [Slice 3A storage-attribution closure, 2026-08-03](18-slice-3a-storage-attribution-closure-2026-08-03.md)
+  — schema-7 interpreted/native storage evidence, diagnostic cache isolation,
+  complete gates, and the fixed-matrix handoff to Decision checkpoint A.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

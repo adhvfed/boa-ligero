@@ -233,7 +233,7 @@ frame becomes dormant, while diagnostics-disabled medians remain inside Gate
 H's 5% parity bound. Static candidacy is not OSR approval. See the
 [dated checkpoint](17-slice-3a-loop-attribution-2026-08-03.md).
 
-### Slice 3A2 — storage attribution (scheduled)
+### Slice 3A2 — storage attribution (complete)
 
 Land interpreted storage-site attribution first. Observe only coarse named,
 dense, computed, and specialized-length categories plus the pre-operation
@@ -253,9 +253,15 @@ serialization, guard-miss replay, finite budgets, GC, feature-disabled builds,
 and diagnostics-disabled parity all pass. Project schema 7 through Ligero only
 after the engine contract is stable.
 
-After these two behavior slices, land a separately revertible behavior-neutral
-refactor before the matrix rerun. Prefer typed cache-key/profiling plumbing if
-it was not already isolated as the diagnostic-variant prerequisite.
+The separately revertible behavior-neutral refactor is the typed cache-key
+plumbing required to isolate the diagnostic artifact variant.
+
+Boa `753ca3ea` lands bounded interpreted sites; `04c18a03` isolates typed cache
+keys as the prerequisite refactor; `8b9b58c3` adds diagnostic-only native
+helper variants; and `a398b455` closes the affected strict-lint delta. Ligero
+`e36b438f` projects schema 7. Seven diagnostics-off Gate H pairs measure 0.201%
+above and 0.101% below the interpreter medians. See the
+[closure record](18-slice-3a-storage-attribution-closure-2026-08-03.md).
 
 ## Slice 3B — hot-but-unentered tier guardrail (complete)
 
@@ -292,8 +298,8 @@ perf(jit): bound hot nonzero backedge bookkeeping
 
 ## Decision checkpoint A — choose the next boundary
 
-After completing the remaining storage portion of Slice 3A, re-run the
-fixed matrix and rank attributable lost time:
+With Slice 3A complete, re-run the fixed matrix and rank attributable lost
+time:
 
 1. interpreted one-shot loop work after the PC-zero opportunity;
 2. scheduler round trips to already-compiled monomorphic callees;
