@@ -247,7 +247,7 @@ impl Call {
         let frame_depth = context.vm.frames.len();
         context.vm.frame_mut().mark_jit_entry_counted();
         context.vm.frame_mut().mark_jit_entry_attempted();
-        context.run_interpreter_until_frame_exit(frame_depth)
+        context.run_interpreter_until_frame_change(frame_depth)
     }
 
     #[cfg(not(feature = "jit"))]

@@ -1169,10 +1169,15 @@ impl Context {
         CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
     }
 
-    /// Run a statically call-free, admission-denied frame through the ordinary
-    /// interpreter until it returns or unexpectedly enters another frame.
+    /// Run an admission-denied frame through ordinary interpreter dispatch
+    /// until an opcode enters or leaves its current frame depth.
+    ///
+    /// Call-free denied callees normally return to their caller. A denied
+    /// caller with a call, accessor, or other re-entrant operation yields as
+    /// soon as the depth changes so the tiering scheduler owns the new frame
+    /// before its next bytecode executes.
     #[cfg(feature = "jit")]
-    pub(crate) fn run_interpreter_until_frame_exit(
+    pub(crate) fn run_interpreter_until_frame_change(
         &mut self,
         frame_depth: usize,
     ) -> ControlFlow<CompletionRecord> {
@@ -1199,42 +1204,6 @@ impl Context {
         }
 
         ControlFlow::Continue(())
-    }
-
-    /// Run a permanently admission-denied frame until an opcode leaves its
-    /// frame depth. Call-free denied callees complete inside the `Call`
-    /// handler; an unknown or admitted callee changes depth and returns control
-    /// to the tiering scheduler before its first bytecode executes.
-    #[cfg(feature = "jit")]
-    fn run_dormant_interpreter_until_frame_change(
-        &mut self,
-        frame_depth: usize,
-    ) -> ControlFlow<CompletionRecord> {
-        loop {
-            let frame = self.vm.frame();
-            let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
-                return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
-                    JsNativeError::error(),
-                )));
-            };
-            let opcode = Opcode::decode(*byte);
-
-            if let ControlFlow::Break(value) = self.execute_one(
-                |context, opcode| {
-                    let frame = context.vm.frame();
-                    let pc = frame.pc as usize;
-
-                    OPCODE_HANDLERS[opcode as usize](context, pc)
-                },
-                opcode,
-            ) {
-                return ControlFlow::Break(value);
-            }
-
-            if self.vm.frames.len() != frame_depth {
-                return ControlFlow::Continue(());
-            }
-        }
     }
 
     #[cfg(feature = "jit")]
@@ -1329,7 +1298,7 @@ impl Context {
                 JitAdmissionState::DeniedLeaf => {
                     let frame_depth = self.vm.frames.len();
                     if let ControlFlow::Break(value) =
-                        self.run_interpreter_until_frame_exit(frame_depth)
+                        self.run_interpreter_until_frame_change(frame_depth)
                     {
                         return value;
                     }
@@ -1338,7 +1307,7 @@ impl Context {
                 JitAdmissionState::Denied => {
                     let frame_depth = self.vm.frames.len();
                     if let ControlFlow::Break(value) =
-                        self.run_dormant_interpreter_until_frame_change(frame_depth)
+                        self.run_interpreter_until_frame_change(frame_depth)
                     {
                         return value;
                     }
@@ -1399,7 +1368,7 @@ impl Context {
                         self.vm.frame_mut().mark_jit_entry_attempted();
                         backend.record_function_entry(self.vm.frame().code_block.as_ref());
                         if let ControlFlow::Break(value) =
-                            self.run_interpreter_until_frame_exit(old_frame_depth + 1)
+                            self.run_interpreter_until_frame_change(old_frame_depth + 1)
                         {
                             return value;
                         }
