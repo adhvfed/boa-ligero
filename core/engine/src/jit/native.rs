@@ -16,7 +16,7 @@ use crate::{Context, JsValue};
 
 use super::{
     JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind, JitExit,
-    JitExitKind, JitExitReason, JitNumericRepresentation,
+    JitExitKind, JitExitReason, JitOsrRejectionReason, JitOsrRepresentation,
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -186,6 +186,21 @@ pub(super) enum LoopPlanRejection {
     UnprovenValue,
 }
 
+impl From<LoopPlanRejection> for JitOsrRejectionReason {
+    fn from(reason: LoopPlanRejection) -> Self {
+        match reason {
+            LoopPlanRejection::IneligibleCodeBlock(_) => Self::IneligibleCodeBlock,
+            LoopPlanRejection::InvalidBoundary => Self::InvalidBoundary,
+            LoopPlanRejection::RegionTooLarge => Self::RegionTooLarge,
+            LoopPlanRejection::UnsupportedRegionOpcode => Self::UnsupportedRegionOpcode,
+            LoopPlanRejection::InvalidControlFlow => Self::InvalidControlFlow,
+            LoopPlanRejection::UnsupportedContinuation => Self::UnsupportedContinuation,
+            LoopPlanRejection::RepresentationMismatch => Self::RepresentationMismatch,
+            LoopPlanRejection::UnprovenValue => Self::UnprovenValue,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoopEntrySource {
     VmRegister,
@@ -200,7 +215,7 @@ pub(super) enum LoopExitSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LoopEntryValue {
     pub(super) register: u32,
-    pub(super) representation: JitNumericRepresentation,
+    pub(super) representation: JitOsrRepresentation,
     pub(super) source: LoopEntrySource,
 }
 
@@ -248,7 +263,7 @@ pub(super) fn plan_loop_region(
     code: &CodeBlock,
     header_pc: u32,
     backedge_pc: u32,
-    representation: JitNumericRepresentation,
+    representation: JitOsrRepresentation,
     budgeted: bool,
     diagnostic: bool,
 ) -> Result<LoopRegionPlan, LoopPlanRejection> {
@@ -330,7 +345,7 @@ pub(super) fn plan_loop_region(
     }
 
     let (exit_from_pc, resume_pc) = external_exit.ok_or(LoopPlanRejection::InvalidControlFlow)?;
-    if requires_f64 && representation != JitNumericRepresentation::F64 {
+    if requires_f64 && representation != JitOsrRepresentation::F64 {
         return Err(LoopPlanRejection::RepresentationMismatch);
     }
     let exit_live = continuation_live_in(code, resume_pc, code.register_count as usize)?;

@@ -1457,6 +1457,16 @@ impl Context {
                                 // lowering ABI. The current shim entry returns an
                                 // untagged status and is handled below.
                             }
+                            crate::jit::JitExitKind::EntryRejected
+                            | crate::jit::JitExitKind::Continuation => {
+                                // Loop-only exits are invalid for the PC-zero
+                                // function entry. No loop artifact is invokable
+                                // until the dedicated scheduler slice validates
+                                // the exit against its immutable region map.
+                                return CompletionRecord::Throw(JsError::from_native(
+                                    JsNativeError::error(),
+                                ));
+                            }
                         }
                     }
 

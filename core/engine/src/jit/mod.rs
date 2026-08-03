@@ -59,6 +59,12 @@ pub(crate) enum JitExitKind {
     Completion = 4,
     /// A runtime budget or limit stopped native execution.
     Budget = 5,
+    /// A loop artifact rejected the current frame before charging or changing
+    /// any interpreter-visible state.
+    EntryRejected = 6,
+    /// A loop artifact completed a taken external branch and materialized the
+    /// exact post-effect interpreter continuation.
+    Continuation = 7,
 }
 
 impl JitExitKind {
@@ -69,6 +75,8 @@ impl JitExitKind {
             3 => Some(Self::Call),
             4 => Some(Self::Completion),
             5 => Some(Self::Budget),
+            6 => Some(Self::EntryRejected),
+            7 => Some(Self::Continuation),
             _ => None,
         }
     }
@@ -172,10 +180,155 @@ pub struct JitStats {
     pub admission_denials: u64,
     /// Nanoseconds spent compiling generated entries.
     pub compile_time_ns: u128,
+    /// Fixed-size counters for the loop-OSR tier. These remain zero until the
+    /// scheduler slice begins observing typed loop regions.
+    pub osr: JitOsrCounters,
+}
+
+/// Uniform numeric representation selected for one loop-OSR artifact.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitOsrRepresentation {
+    /// Every live value is guarded as an exact Boa integer.
+    I32,
+    /// Every live value is guarded as a JavaScript Number and represented as
+    /// an IEEE-754 double, including integer-valued Numbers.
+    F64,
+}
+
+/// Why a loop region was permanently rejected before code generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitOsrRejectionReason {
+    /// The code-block kind, handlers, or register bound is ineligible.
+    IneligibleCodeBlock,
+    /// Header or latch is not a decoded ordered instruction boundary.
+    InvalidBoundary,
+    /// The candidate exceeds the hard decoded-instruction bound.
+    RegionTooLarge,
+    /// The region contains an opcode outside the first numeric allowlist.
+    UnsupportedRegionOpcode,
+    /// The region does not have the single canonical-latch CFG shape.
+    InvalidControlFlow,
+    /// The external edge does not reach the bounded return continuation.
+    UnsupportedContinuation,
+    /// An I32 key was requested for a region that statically requires F64.
+    RepresentationMismatch,
+    /// Entry or path-specific exit liveness could not prove a value source.
+    UnprovenValue,
+    /// Native IR construction rejected an otherwise planned region.
+    Lowering,
+}
+
+/// Why new loop-OSR compilation was suppressed by a backend-wide bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitOsrSuppressionReason {
+    /// The backend already retains its maximum 64 exact region keys.
+    RegionCapacity,
+    /// Accounted emitted loop code reached the backend circuit breaker.
+    CodeBytes,
+    /// A prior synchronous loop compilation exceeded the time breaker.
+    CompileTime,
+}
+
+/// Fixed rejection counts, split by a bounded source-free reason taxonomy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitOsrRejectionCounters {
+    /// Rejections for function kind, handler metadata, or register bounds.
+    pub ineligible_code_block: u64,
+    /// Rejections for invalid header or latch boundaries.
+    pub invalid_boundary: u64,
+    /// Rejections for regions over the instruction bound.
+    pub region_too_large: u64,
+    /// Rejections for opcodes outside the first numeric allowlist.
+    pub unsupported_region_opcode: u64,
+    /// Rejections for CFGs outside the canonical single-latch shape.
+    pub invalid_control_flow: u64,
+    /// Rejections for external continuations outside the bounded epilogue.
+    pub unsupported_continuation: u64,
+    /// Rejections for a representation incompatible with static constants.
+    pub representation_mismatch: u64,
+    /// Rejections for entry or exit values without a proven source.
+    pub unproven_value: u64,
+    /// Rejections from native IR construction.
+    pub lowering: u64,
+}
+
+impl JitOsrRejectionCounters {
+    fn record(&mut self, reason: JitOsrRejectionReason) {
+        let counter = match reason {
+            JitOsrRejectionReason::IneligibleCodeBlock => &mut self.ineligible_code_block,
+            JitOsrRejectionReason::InvalidBoundary => &mut self.invalid_boundary,
+            JitOsrRejectionReason::RegionTooLarge => &mut self.region_too_large,
+            JitOsrRejectionReason::UnsupportedRegionOpcode => &mut self.unsupported_region_opcode,
+            JitOsrRejectionReason::InvalidControlFlow => &mut self.invalid_control_flow,
+            JitOsrRejectionReason::UnsupportedContinuation => &mut self.unsupported_continuation,
+            JitOsrRejectionReason::RepresentationMismatch => &mut self.representation_mismatch,
+            JitOsrRejectionReason::UnprovenValue => &mut self.unproven_value,
+            JitOsrRejectionReason::Lowering => &mut self.lowering,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+/// Fixed suppression counts for the three backend-wide OSR circuit breakers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitOsrSuppressionCounters {
+    /// Unseen observations suppressed after the 64-key table filled.
+    pub region_capacity: u64,
+    /// New compilations suppressed by accounted emitted loop code.
+    pub code_bytes: u64,
+    /// New compilations suppressed after a slow synchronous compilation.
+    pub compile_time: u64,
+}
+
+impl JitOsrSuppressionCounters {
+    fn record(&mut self, reason: JitOsrSuppressionReason) {
+        let counter = match reason {
+            JitOsrSuppressionReason::RegionCapacity => &mut self.region_capacity,
+            JitOsrSuppressionReason::CodeBytes => &mut self.code_bytes,
+            JitOsrSuppressionReason::CompileTime => &mut self.compile_time,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+/// Fixed-size source-free loop-OSR counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitOsrCounters {
+    /// Exact typed-region lookup requests.
+    pub cache_requests: u64,
+    /// Lookups for already retained exact keys.
+    pub cache_hits: u64,
+    /// Lookups for previously unseen exact keys.
+    pub cache_misses: u64,
+    /// Region keys that reached their independent backedge threshold.
+    pub hotness_crossings: u64,
+    /// Synchronous native loop compilation attempts.
+    pub compile_attempts: u64,
+    /// Successful native loop compilations.
+    pub compilations: u64,
+    /// Native loop entries invoked by the scheduler.
+    pub entries: u64,
+    /// Guarded loop entries rejected before any native effect or charge.
+    pub entry_rejections: u64,
+    /// Post-effect native loop exits resumed through a proven continuation.
+    pub continuations: u64,
+    /// Pre-effect native loop guards replayed in the interpreter.
+    pub deopts: u64,
+    /// Aggregate synchronous native loop compilation time.
+    pub compile_time_ns: u128,
+    /// Accounted emitted native loop code bytes.
+    pub code_bytes: usize,
+    /// Permanent planner/codegen rejections by fixed reason.
+    pub rejections: JitOsrRejectionCounters,
+    /// Backend-wide suppression observations by fixed circuit breaker.
+    pub suppressions: JitOsrSuppressionCounters,
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 7;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 8;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -321,6 +474,8 @@ pub enum JitExitReason {
     /// A declarative binding could not be read with the compiled entry's
     /// stable locator and value representation.
     BindingRead = 12,
+    /// A native loop completed its single path-proven external edge.
+    LoopExit = 13,
 }
 
 impl JitExitReason {
@@ -339,6 +494,7 @@ impl JitExitReason {
             10 => Some(Self::RuntimeLimit),
             11 => Some(Self::Exception),
             12 => Some(Self::BindingRead),
+            13 => Some(Self::LoopExit),
             _ => None,
         }
     }
@@ -358,6 +514,10 @@ pub enum JitDiagnosticExitKind {
     Completion,
     /// A finite runtime budget ended native execution.
     Budget,
+    /// A loop entry guard rejected the current frame before native effects.
+    EntryRejected,
+    /// A native loop materialized a post-effect interpreter continuation.
+    Continuation,
 }
 
 impl From<JitExitKind> for JitDiagnosticExitKind {
@@ -368,6 +528,8 @@ impl From<JitExitKind> for JitDiagnosticExitKind {
             JitExitKind::Return => Self::Return,
             JitExitKind::Completion => Self::Completion,
             JitExitKind::Budget => Self::Budget,
+            JitExitKind::EntryRejected => Self::EntryRejected,
+            JitExitKind::Continuation => Self::Continuation,
         }
     }
 }
@@ -615,6 +777,9 @@ pub struct JitDiagnosticSnapshot {
     pub storage_records: Vec<JitStorageSiteRecord>,
     /// Fixed native guard/load aggregates from diagnostic artifacts.
     pub native_storage: JitNativeStorageRecord,
+    /// Fixed source-free loop-OSR aggregates collected while diagnostics were
+    /// enabled. No per-site value or source information is retained here.
+    pub osr: JitOsrCounters,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
@@ -660,6 +825,7 @@ struct JitDiagnosticState {
     storage_records: Vec<JitStorageSiteRecord>,
     storage_record_indices: FxHashMap<(u64, u32, JitStorageSiteKind), usize>,
     native_storage: JitNativeStorageRecord,
+    osr: JitOsrCounters,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
@@ -683,6 +849,7 @@ impl JitDiagnosticState {
             storage_records: Vec::with_capacity(limits.storage_records.min(64)),
             storage_record_indices: FxHashMap::default(),
             native_storage: JitNativeStorageRecord::default(),
+            osr: JitOsrCounters::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
@@ -915,6 +1082,7 @@ impl JitDiagnosticState {
             loop_records,
             storage_records,
             native_storage: self.native_storage,
+            osr: self.osr,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
@@ -932,16 +1100,6 @@ struct CachedEntry {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "constructed by the loop-OSR planner before scheduler wiring"
-)]
-enum JitNumericRepresentation {
-    I32,
-    F64,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum JitEntryPoint {
     Function,
     #[allow(
@@ -951,7 +1109,7 @@ enum JitEntryPoint {
     Loop {
         header_pc: u32,
         backedge_pc: u32,
-        representation: JitNumericRepresentation,
+        representation: JitOsrRepresentation,
     },
 }
 
@@ -977,7 +1135,7 @@ impl JitCacheKey {
         code_id: u64,
         header_pc: u32,
         backedge_pc: u32,
-        representation: JitNumericRepresentation,
+        representation: JitOsrRepresentation,
         budgeted: bool,
         diagnostic: bool,
     ) -> Self {
@@ -992,6 +1150,31 @@ impl JitCacheKey {
             diagnostic,
         }
     }
+}
+
+const MAX_LOOP_REGION_STATES: usize = 64;
+const MAX_LOOP_CODE_BYTES: usize = 1024 * 1024;
+const MAX_LOOP_COMPILE_NS: u128 = 10_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopRegionStateKind {
+    Observed,
+    Rejected { reason: JitOsrRejectionReason },
+    Suppressed { reason: JitOsrSuppressionReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoopRegionState {
+    kind: LoopRegionStateKind,
+    backedges: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopRegionAction {
+    Cold,
+    Compile,
+    Closed,
+    Suppressed(JitOsrSuppressionReason),
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -1039,6 +1222,12 @@ pub struct JitBackend {
     /// because a backend is not shared across threads or realms. Budgeted and
     /// unbudgeted entries are distinct so the latter keep their fast path.
     cache: FxHashMap<JitCacheKey, CachedEntry>,
+    /// Bounded per-key loop hotness and terminal admission state. No generated
+    /// loop entry can be stored or invoked until the following compiler slice.
+    loop_regions: FxHashMap<JitCacheKey, LoopRegionState>,
+    loop_code_bytes: usize,
+    loop_code_bytes_exhausted: bool,
+    loop_compile_time_exhausted: bool,
     /// The last ordinary-function target observed at each bytecode call site.
     /// Native call lowering specializes against this identity and deopts when
     /// a later value is a different function, including another ordinary
@@ -1085,6 +1274,10 @@ impl JitBackend {
             module: JITModule::new(builder),
             next_fn_id: 0,
             cache: FxHashMap::default(),
+            loop_regions: FxHashMap::default(),
+            loop_code_bytes: 0,
+            loop_code_bytes_exhausted: false,
+            loop_compile_time_exhausted: false,
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
@@ -1134,6 +1327,190 @@ impl JitBackend {
     #[must_use]
     pub const fn thresholds(&self) -> JitThresholds {
         self.thresholds
+    }
+
+    fn update_osr_counters(&mut self, mut update: impl FnMut(&mut JitOsrCounters)) {
+        update(&mut self.stats.osr);
+        if let Some(diagnostics) = &mut self.diagnostics {
+            update(&mut diagnostics.osr);
+        }
+    }
+
+    fn loop_compilation_breaker(&self) -> Option<JitOsrSuppressionReason> {
+        if self.loop_compile_time_exhausted {
+            Some(JitOsrSuppressionReason::CompileTime)
+        } else if self.loop_code_bytes_exhausted {
+            Some(JitOsrSuppressionReason::CodeBytes)
+        } else {
+            None
+        }
+    }
+
+    fn new_loop_suppression_reason(&self) -> Option<JitOsrSuppressionReason> {
+        self.loop_compilation_breaker().or_else(|| {
+            (self.loop_regions.len() >= MAX_LOOP_REGION_STATES)
+                .then_some(JitOsrSuppressionReason::RegionCapacity)
+        })
+    }
+
+    fn record_loop_suppression(&mut self, reason: JitOsrSuppressionReason) {
+        self.update_osr_counters(|counters| counters.suppressions.record(reason));
+    }
+
+    /// Observe one exact typed loop key without compiling or invoking it.
+    ///
+    /// New keys are retained only while the 64-state table has capacity.
+    /// Once any global circuit breaker trips, unseen keys are rejected without
+    /// allocating negative entries; already-retained keys remain queryable.
+    #[allow(
+        dead_code,
+        reason = "wired into the post-backedge scheduler in Slice 4A1.4"
+    )]
+    fn observe_loop_region(&mut self, key: JitCacheKey) -> LoopRegionAction {
+        debug_assert!(matches!(key.entry_point, JitEntryPoint::Loop { .. }));
+        self.update_osr_counters(|counters| {
+            counters.cache_requests = counters.cache_requests.saturating_add(1);
+        });
+
+        if self.loop_regions.contains_key(&key) {
+            self.update_osr_counters(|counters| {
+                counters.cache_hits = counters.cache_hits.saturating_add(1);
+            });
+            let suppression = self.loop_compilation_breaker();
+            let threshold = self.thresholds.loop_backedges.max(1);
+            let mut crossed_hotness = false;
+            let mut terminal_suppression = None;
+            let Some(state) = self.loop_regions.get_mut(&key) else {
+                return LoopRegionAction::Closed;
+            };
+            let action = match state.kind {
+                LoopRegionStateKind::Observed => {
+                    state.backedges = state.backedges.saturating_add(1);
+                    match state.backedges.cmp(&threshold) {
+                        std::cmp::Ordering::Equal => {
+                            crossed_hotness = true;
+                            if let Some(reason) = suppression {
+                                terminal_suppression = Some(reason);
+                                LoopRegionAction::Suppressed(reason)
+                            } else {
+                                LoopRegionAction::Compile
+                            }
+                        }
+                        std::cmp::Ordering::Less => LoopRegionAction::Cold,
+                        std::cmp::Ordering::Greater => LoopRegionAction::Closed,
+                    }
+                }
+                LoopRegionStateKind::Rejected { .. } | LoopRegionStateKind::Suppressed { .. } => {
+                    LoopRegionAction::Closed
+                }
+            };
+            if crossed_hotness {
+                self.update_osr_counters(|counters| {
+                    counters.hotness_crossings = counters.hotness_crossings.saturating_add(1);
+                });
+            }
+            if let Some(reason) = terminal_suppression {
+                self.loop_regions.insert(
+                    key,
+                    LoopRegionState {
+                        kind: LoopRegionStateKind::Suppressed { reason },
+                        backedges: threshold,
+                    },
+                );
+                self.record_loop_suppression(reason);
+            }
+            return action;
+        }
+
+        self.update_osr_counters(|counters| {
+            counters.cache_misses = counters.cache_misses.saturating_add(1);
+        });
+        if let Some(reason) = self.new_loop_suppression_reason() {
+            self.record_loop_suppression(reason);
+            return LoopRegionAction::Suppressed(reason);
+        }
+
+        let backedges = 1;
+        self.loop_regions.insert(
+            key,
+            LoopRegionState {
+                kind: LoopRegionStateKind::Observed,
+                backedges,
+            },
+        );
+        if backedges == self.thresholds.loop_backedges.max(1) {
+            self.update_osr_counters(|counters| {
+                counters.hotness_crossings = counters.hotness_crossings.saturating_add(1);
+            });
+            LoopRegionAction::Compile
+        } else {
+            LoopRegionAction::Cold
+        }
+    }
+
+    #[allow(dead_code, reason = "called by the loop planner in Slice 4A1.4")]
+    fn reject_loop_region(&mut self, key: JitCacheKey, reason: JitOsrRejectionReason) -> bool {
+        let Some(state) = self.loop_regions.get_mut(&key) else {
+            return false;
+        };
+        if state.kind != LoopRegionStateKind::Observed {
+            return false;
+        }
+        state.kind = LoopRegionStateKind::Rejected { reason };
+        self.update_osr_counters(|counters| counters.rejections.record(reason));
+        true
+    }
+
+    #[allow(dead_code, reason = "called by the loop compiler in Slice 4A1.3")]
+    fn record_loop_compile_attempt(&mut self) {
+        self.update_osr_counters(|counters| {
+            counters.compile_attempts = counters.compile_attempts.saturating_add(1);
+        });
+    }
+
+    /// Account one completed native loop compile attempt and trip future-new-
+    /// site circuit breakers after the unavoidable synchronous work. Failed
+    /// lowering contributes time but never emitted-code bytes or compilations.
+    #[allow(dead_code, reason = "called by the loop compiler in Slice 4A1.3")]
+    fn record_loop_compile_result(&mut self, compiled: bool, code_bytes: usize, compile_ns: u128) {
+        if compiled {
+            self.loop_code_bytes = self.loop_code_bytes.saturating_add(code_bytes);
+            self.loop_code_bytes_exhausted = self.loop_code_bytes >= MAX_LOOP_CODE_BYTES;
+        }
+        self.loop_compile_time_exhausted |= compile_ns > MAX_LOOP_COMPILE_NS;
+        self.update_osr_counters(|counters| {
+            if compiled {
+                counters.compilations = counters.compilations.saturating_add(1);
+                counters.code_bytes = counters.code_bytes.saturating_add(code_bytes);
+            }
+            counters.compile_time_ns = counters.compile_time_ns.saturating_add(compile_ns);
+        });
+    }
+
+    #[allow(dead_code, reason = "called by the loop scheduler in Slice 4A1.4")]
+    fn record_loop_entry(&mut self) {
+        self.update_osr_counters(|counters| {
+            counters.entries = counters.entries.saturating_add(1);
+        });
+    }
+
+    #[allow(dead_code, reason = "called by the loop scheduler in Slice 4A1.4")]
+    fn record_loop_exit(&mut self, kind: JitExitKind) {
+        self.update_osr_counters(|counters| match kind {
+            JitExitKind::EntryRejected => {
+                counters.entry_rejections = counters.entry_rejections.saturating_add(1);
+            }
+            JitExitKind::Continuation => {
+                counters.continuations = counters.continuations.saturating_add(1);
+            }
+            JitExitKind::Deopt => {
+                counters.deopts = counters.deopts.saturating_add(1);
+            }
+            JitExitKind::Return
+            | JitExitKind::Call
+            | JitExitKind::Completion
+            | JitExitKind::Budget => {}
+        });
     }
 
     #[cfg(test)]
@@ -2037,6 +2414,17 @@ mod tests {
             .expect("canonical backward jump")
     }
 
+    fn loop_key(code_id: u64, header_pc: u32) -> JitCacheKey {
+        JitCacheKey::loop_region(
+            code_id,
+            header_pc,
+            header_pc + 1,
+            JitOsrRepresentation::I32,
+            false,
+            false,
+        )
+    }
+
     fn enable_jit_without_admission_floor(context: &mut Context) {
         context.enable_jit();
         context
@@ -2843,7 +3231,7 @@ mod tests {
             &code,
             header_pc,
             backedge_pc,
-            JitNumericRepresentation::F64,
+            JitOsrRepresentation::F64,
             true,
             false,
         )
@@ -2855,7 +3243,7 @@ mod tests {
                 code.debug_id,
                 header_pc,
                 backedge_pc,
-                JitNumericRepresentation::F64,
+                JitOsrRepresentation::F64,
                 true,
                 false,
             )
@@ -2865,17 +3253,17 @@ mod tests {
             vec![
                 native::LoopEntryValue {
                     register: 1,
-                    representation: JitNumericRepresentation::F64,
+                    representation: JitOsrRepresentation::F64,
                     source: native::LoopEntrySource::VmRegister,
                 },
                 native::LoopEntryValue {
                     register: 2,
-                    representation: JitNumericRepresentation::F64,
+                    representation: JitOsrRepresentation::F64,
                     source: native::LoopEntrySource::VmRegister,
                 },
                 native::LoopEntryValue {
                     register: 4,
-                    representation: JitNumericRepresentation::F64,
+                    representation: JitOsrRepresentation::F64,
                     source: native::LoopEntrySource::VmRegister,
                 },
             ]
@@ -2902,7 +3290,7 @@ mod tests {
             &code,
             header_pc,
             backedge_pc,
-            JitNumericRepresentation::I32,
+            JitOsrRepresentation::I32,
             true,
             false,
         )
@@ -2922,7 +3310,7 @@ mod tests {
                 &code,
                 header_pc,
                 backedge_pc,
-                JitNumericRepresentation::F64,
+                JitOsrRepresentation::F64,
                 false,
                 false,
             )
@@ -2941,7 +3329,7 @@ mod tests {
             &code,
             header_pc,
             backedge_pc,
-            JitNumericRepresentation::I32,
+            JitOsrRepresentation::I32,
             false,
             false,
         )
@@ -2971,13 +3359,101 @@ mod tests {
                 &code,
                 header_pc,
                 backedge_pc,
-                JitNumericRepresentation::I32,
+                JitOsrRepresentation::I32,
                 false,
                 false,
             )
             .err(),
             Some(native::LoopPlanRejection::RepresentationMismatch)
         );
+    }
+
+    #[test]
+    fn jit_loop_region_state_is_bounded_without_forgetting_exact_keys() {
+        let mut backend = JitBackend::new();
+        backend.enable_diagnostics(JitDiagnosticLimits::default());
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 2,
+        });
+
+        for code_id in 0..MAX_LOOP_REGION_STATES as u64 {
+            assert_eq!(
+                backend.observe_loop_region(loop_key(code_id, 10)),
+                LoopRegionAction::Cold
+            );
+        }
+        assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+
+        let retained = loop_key(0, 10);
+        assert_eq!(
+            backend.observe_loop_region(retained),
+            LoopRegionAction::Compile,
+            "a full table must not suppress an already-retained exact key"
+        );
+        assert_eq!(
+            backend.observe_loop_region(loop_key(999, 10)),
+            LoopRegionAction::Suppressed(JitOsrSuppressionReason::RegionCapacity)
+        );
+        assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+
+        assert!(backend.reject_loop_region(retained, JitOsrRejectionReason::InvalidControlFlow));
+        assert_eq!(
+            backend.observe_loop_region(retained),
+            LoopRegionAction::Closed
+        );
+        assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+
+        let counters = backend.stats().osr;
+        assert_eq!(counters.cache_requests, 67);
+        assert_eq!(counters.cache_hits, 2);
+        assert_eq!(counters.cache_misses, 65);
+        assert_eq!(counters.hotness_crossings, 1);
+        assert_eq!(counters.suppressions.region_capacity, 1);
+        assert_eq!(counters.rejections.invalid_control_flow, 1);
+        assert_eq!(
+            backend.diagnostic_snapshot().expect("diagnostics").osr,
+            counters
+        );
+    }
+
+    #[test]
+    fn jit_loop_region_circuit_breakers_suppress_only_future_new_sites() {
+        let mut slow = JitBackend::new();
+        slow.enable_diagnostics(JitDiagnosticLimits::default());
+        slow.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let retained = loop_key(1, 10);
+        assert_eq!(
+            slow.observe_loop_region(retained),
+            LoopRegionAction::Compile
+        );
+        slow.record_loop_compile_attempt();
+        slow.record_loop_compile_result(false, 64, MAX_LOOP_COMPILE_NS + 1);
+        assert_eq!(
+            slow.observe_loop_region(loop_key(2, 10)),
+            LoopRegionAction::Suppressed(JitOsrSuppressionReason::CompileTime)
+        );
+        assert!(slow.loop_regions.contains_key(&retained));
+        assert!(!slow.loop_regions.contains_key(&loop_key(2, 10)));
+        assert_eq!(slow.stats().osr.compile_attempts, 1);
+        assert_eq!(slow.stats().osr.compilations, 0);
+        assert_eq!(slow.stats().osr.compile_time_ns, MAX_LOOP_COMPILE_NS + 1);
+        assert_eq!(slow.stats().osr.code_bytes, 0);
+        assert_eq!(slow.stats().osr.suppressions.compile_time, 1);
+
+        let mut bytes = JitBackend::new();
+        bytes.record_loop_compile_result(true, MAX_LOOP_CODE_BYTES + 1, 1);
+        assert_eq!(
+            bytes.observe_loop_region(loop_key(3, 10)),
+            LoopRegionAction::Suppressed(JitOsrSuppressionReason::CodeBytes)
+        );
+        assert!(bytes.loop_regions.is_empty());
+        assert_eq!(bytes.stats().osr.compilations, 1);
+        assert_eq!(bytes.stats().osr.code_bytes, MAX_LOOP_CODE_BYTES + 1);
+        assert_eq!(bytes.stats().osr.suppressions.code_bytes, 1);
     }
 
     #[test]
@@ -4089,6 +4565,8 @@ mod tests {
             (JitExitKind::Call, u32::MAX),
             (JitExitKind::Completion, 42),
             (JitExitKind::Budget, 99),
+            (JitExitKind::EntryRejected, 101),
+            (JitExitKind::Continuation, 103),
         ] {
             let status = JitExit::encode_with_reason(kind, JitExitReason::Unknown, pc);
             assert_eq!(
@@ -4109,6 +4587,17 @@ mod tests {
                 kind: JitExitKind::Deopt,
                 reason: JitExitReason::IntegerOverflow,
                 pc: 31,
+            })
+        );
+
+        let continuation =
+            JitExit::encode_with_reason(JitExitKind::Continuation, JitExitReason::LoopExit, 47);
+        assert_eq!(
+            JitExit::decode(continuation),
+            Some(JitExit {
+                kind: JitExitKind::Continuation,
+                reason: JitExitReason::LoopExit,
+                pc: 47,
             })
         );
 
