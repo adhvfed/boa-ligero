@@ -206,6 +206,10 @@ pub struct JitResourceCounters {
     pub slow_attempt: u64,
     /// Backends retired after a finalized artifact crossed a payload limit.
     pub payload_overrun_retirements: u64,
+    /// Machine-code payload bytes retained by this usable backend.
+    pub retained_code_bytes: usize,
+    /// Aggregate observed wall time of completed compile attempts.
+    pub compile_time_ns: u128,
 }
 
 /// Uniform numeric representation selected for one loop-OSR artifact.
@@ -351,7 +355,7 @@ pub struct JitOsrCounters {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 8;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 9;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -805,6 +809,8 @@ pub struct JitDiagnosticSnapshot {
     /// Fixed source-free loop-OSR aggregates collected while diagnostics were
     /// enabled. No per-site value or source information is retained here.
     pub osr: JitOsrCounters,
+    /// Backend-lifetime resource admission and accounting.
+    pub resources: JitResourceCounters,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
@@ -851,6 +857,7 @@ struct JitDiagnosticState {
     storage_record_indices: FxHashMap<(u64, u32, JitStorageSiteKind), usize>,
     native_storage: JitNativeStorageRecord,
     osr: JitOsrCounters,
+    resources: JitResourceCounters,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
@@ -875,6 +882,7 @@ impl JitDiagnosticState {
             storage_record_indices: FxHashMap::default(),
             native_storage: JitNativeStorageRecord::default(),
             osr: JitOsrCounters::default(),
+            resources: JitResourceCounters::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
@@ -1108,6 +1116,7 @@ impl JitDiagnosticState {
             storage_records,
             native_storage: self.native_storage,
             osr: self.osr,
+            resources: self.resources,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
@@ -1186,6 +1195,16 @@ const MAX_LOOP_COMPILE_NS: u128 = 10_000_000;
 const MAX_FUNCTION_ENTRY_STATES: usize = 192;
 const MAX_FUNCTION_BYTECODE_INSTRUCTIONS: usize = 1_024;
 const MAX_CALL_TARGET_SITES: usize = 1_024;
+const MAX_RETAINED_CODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CUMULATIVE_COMPILE_NS: u128 = 100_000_000;
+const MAX_COMPILE_ATTEMPT_NS: u128 = 10_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JitCompilationSuppressionReason {
+    CodeBytes,
+    CompileTime,
+    SlowAttempt,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopRegionStateKind {
@@ -1261,6 +1280,7 @@ struct LoopCachedEntry {
 enum JitBackendHealth {
     Active,
     Compromised,
+    RetiringResourceOverrun,
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -1324,8 +1344,7 @@ pub struct JitBackend {
     /// revalidation.
     loop_plans: FxHashMap<JitCacheKey, native::LoopRegionPlan>,
     loop_code_bytes: usize,
-    loop_code_bytes_exhausted: bool,
-    loop_compile_time_exhausted: bool,
+    compilation_breakers: JitCompilationBreakers,
     /// The last ordinary-function target observed at each bytecode call site.
     /// Native call lowering specializes against this identity and deopts when
     /// a later value is a different function, including another ordinary
@@ -1336,6 +1355,13 @@ pub struct JitBackend {
     admission_allow_call_boundaries: bool,
     stats: JitStats,
     diagnostics: Option<JitDiagnosticState>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct JitCompilationBreakers {
+    loop_code_bytes: bool,
+    loop_compile_time: bool,
+    slow_attempt: bool,
 }
 
 impl std::fmt::Debug for JitBackend {
@@ -1377,8 +1403,7 @@ impl JitBackend {
             loop_cache: FxHashMap::default(),
             loop_plans: FxHashMap::default(),
             loop_code_bytes: 0,
-            loop_code_bytes_exhausted: false,
-            loop_compile_time_exhausted: false,
+            compilation_breakers: JitCompilationBreakers::default(),
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
@@ -1399,12 +1424,31 @@ impl JitBackend {
         self.id
     }
 
-    pub(crate) const fn is_compromised(&self) -> bool {
+    #[cfg(test)]
+    const fn is_compromised(&self) -> bool {
         matches!(self.health, JitBackendHealth::Compromised)
+    }
+
+    pub(crate) const fn is_retiring_for_resource_overrun(&self) -> bool {
+        matches!(self.health, JitBackendHealth::RetiringResourceOverrun)
+    }
+
+    pub(crate) const fn should_drop(&self) -> bool {
+        !matches!(self.health, JitBackendHealth::Active)
     }
 
     pub(crate) fn mark_compromised(&mut self) {
         self.health = JitBackendHealth::Compromised;
+    }
+
+    fn mark_resource_overrun(&mut self) {
+        if self.health == JitBackendHealth::Active {
+            self.health = JitBackendHealth::RetiringResourceOverrun;
+            self.update_resource_counters(|counters| {
+                counters.payload_overrun_retirements =
+                    counters.payload_overrun_retirements.saturating_add(1);
+            });
+        }
     }
 
     fn invalid_loop_state(&mut self) -> JitLoopScheduleAction {
@@ -1450,10 +1494,85 @@ impl JitBackend {
         }
     }
 
+    fn update_resource_counters(&mut self, mut update: impl FnMut(&mut JitResourceCounters)) {
+        update(&mut self.stats.resources);
+        if let Some(diagnostics) = &mut self.diagnostics {
+            update(&mut diagnostics.resources);
+        }
+    }
+
+    fn compilation_suppression_reason(&self) -> Option<JitCompilationSuppressionReason> {
+        if self.compilation_breakers.slow_attempt {
+            Some(JitCompilationSuppressionReason::SlowAttempt)
+        } else if self.stats.resources.compile_time_ns >= MAX_CUMULATIVE_COMPILE_NS {
+            Some(JitCompilationSuppressionReason::CompileTime)
+        } else if self.stats.resources.retained_code_bytes >= MAX_RETAINED_CODE_BYTES {
+            Some(JitCompilationSuppressionReason::CodeBytes)
+        } else {
+            None
+        }
+    }
+
+    fn record_compilation_suppression(&mut self, reason: JitCompilationSuppressionReason) {
+        self.update_resource_counters(|counters| {
+            let counter = match reason {
+                JitCompilationSuppressionReason::CodeBytes => &mut counters.code_bytes,
+                JitCompilationSuppressionReason::CompileTime => &mut counters.compile_time,
+                JitCompilationSuppressionReason::SlowAttempt => &mut counters.slow_attempt,
+            };
+            *counter = counter.saturating_add(1);
+        });
+    }
+
+    /// Account one bounded synchronous compile attempt. Payload overruns make
+    /// the complete module immediately unusable; time thresholds only suppress
+    /// later unseen work because synchronous Cranelift cannot be cancelled.
+    fn record_compilation_result(
+        &mut self,
+        code_bytes: usize,
+        compile_ns: u128,
+        loop_artifact: bool,
+    ) -> bool {
+        let retained_code_bytes = self
+            .stats
+            .resources
+            .retained_code_bytes
+            .saturating_add(code_bytes);
+        let retained_loop_code_bytes = self.loop_code_bytes.saturating_add(code_bytes);
+        let payload_overrun = retained_code_bytes > MAX_RETAINED_CODE_BYTES
+            || (loop_artifact && retained_loop_code_bytes > MAX_LOOP_CODE_BYTES);
+
+        self.update_resource_counters(|counters| {
+            counters.compile_time_ns = counters.compile_time_ns.saturating_add(compile_ns);
+            if !payload_overrun {
+                counters.retained_code_bytes = retained_code_bytes;
+            }
+        });
+        self.compilation_breakers.slow_attempt |= compile_ns > MAX_COMPILE_ATTEMPT_NS;
+        if payload_overrun {
+            self.mark_resource_overrun();
+            return false;
+        }
+        true
+    }
+
     fn loop_compilation_breaker(&self) -> Option<JitOsrSuppressionReason> {
-        if self.loop_compile_time_exhausted {
+        if self.compilation_breakers.loop_compile_time
+            || matches!(
+                self.compilation_suppression_reason(),
+                Some(
+                    JitCompilationSuppressionReason::CompileTime
+                        | JitCompilationSuppressionReason::SlowAttempt
+                )
+            )
+        {
             Some(JitOsrSuppressionReason::CompileTime)
-        } else if self.loop_code_bytes_exhausted {
+        } else if self.compilation_breakers.loop_code_bytes
+            || matches!(
+                self.compilation_suppression_reason(),
+                Some(JitCompilationSuppressionReason::CodeBytes)
+            )
+        {
             Some(JitOsrSuppressionReason::CodeBytes)
         } else {
             None
@@ -1487,6 +1606,20 @@ impl JitBackend {
 
     fn record_loop_suppression(&mut self, reason: JitOsrSuppressionReason) {
         self.update_osr_counters(|counters| counters.suppressions.record(reason));
+        match reason {
+            JitOsrSuppressionReason::RegionCapacity => {}
+            JitOsrSuppressionReason::CodeBytes => {
+                self.record_compilation_suppression(JitCompilationSuppressionReason::CodeBytes);
+            }
+            JitOsrSuppressionReason::CompileTime => {
+                let reason = if self.compilation_breakers.slow_attempt {
+                    JitCompilationSuppressionReason::SlowAttempt
+                } else {
+                    JitCompilationSuppressionReason::CompileTime
+                };
+                self.record_compilation_suppression(reason);
+            }
+        }
     }
 
     /// Observe one exact typed loop key without compiling or invoking it.
@@ -1499,6 +1632,17 @@ impl JitBackend {
         self.update_osr_counters(|counters| {
             counters.cache_requests = counters.cache_requests.saturating_add(1);
         });
+        match self.health {
+            JitBackendHealth::Active => {}
+            JitBackendHealth::Compromised => return LoopRegionAction::Closed,
+            JitBackendHealth::RetiringResourceOverrun => {
+                self.update_osr_counters(|counters| {
+                    counters.cache_misses = counters.cache_misses.saturating_add(1);
+                });
+                self.record_loop_suppression(JitOsrSuppressionReason::CodeBytes);
+                return LoopRegionAction::Suppressed(JitOsrSuppressionReason::CodeBytes);
+            }
+        }
 
         if self.loop_regions.contains_key(&key) {
             self.update_osr_counters(|counters| {
@@ -1616,7 +1760,9 @@ impl JitBackend {
                     self.record_loop_compile_result(false, 0, compile_ns);
                     return self.reject_loop_region(key, JitOsrRejectionReason::Lowering);
                 };
-                self.record_loop_compile_result(true, compiled.code_bytes, compile_ns);
+                if !self.record_loop_compile_result(true, compiled.code_bytes, compile_ns) {
+                    return false;
+                }
                 self.loop_cache.insert(
                     key,
                     LoopCachedEntry {
@@ -1656,8 +1802,12 @@ impl JitBackend {
         backedge_pc: u32,
         context: &mut Context,
     ) -> JitLoopScheduleAction {
-        if self.is_compromised() {
-            return JitLoopScheduleAction::Invalid;
+        match self.health {
+            JitBackendHealth::Active => {}
+            JitBackendHealth::Compromised => return JitLoopScheduleAction::Invalid,
+            JitBackendHealth::RetiringResourceOverrun => {
+                return JitLoopScheduleAction::Closed;
+            }
         }
         let budgeted = context.instruction_budget_remaining().is_some();
         let diagnostic = self.diagnostics.is_some();
@@ -1821,6 +1971,9 @@ impl JitBackend {
         key: JitCacheKey,
         context: &mut Context,
     ) -> JitLoopScheduleAction {
+        if self.health != JitBackendHealth::Active {
+            return JitLoopScheduleAction::Closed;
+        }
         let Some(cached) = self.loop_cache.get(&key) else {
             return JitLoopScheduleAction::Closed;
         };
@@ -1894,19 +2047,30 @@ impl JitBackend {
     /// Account one completed native loop compile attempt and trip future-new-
     /// site circuit breakers after the unavoidable synchronous work. Failed
     /// lowering contributes time but never emitted-code bytes or compilations.
-    fn record_loop_compile_result(&mut self, compiled: bool, code_bytes: usize, compile_ns: u128) {
-        if compiled {
+    fn record_loop_compile_result(
+        &mut self,
+        compiled: bool,
+        code_bytes: usize,
+        compile_ns: u128,
+    ) -> bool {
+        let retained = self.record_compilation_result(
+            if compiled { code_bytes } else { 0 },
+            compile_ns,
+            compiled,
+        );
+        if compiled && retained {
             self.loop_code_bytes = self.loop_code_bytes.saturating_add(code_bytes);
-            self.loop_code_bytes_exhausted = self.loop_code_bytes >= MAX_LOOP_CODE_BYTES;
+            self.compilation_breakers.loop_code_bytes = self.loop_code_bytes >= MAX_LOOP_CODE_BYTES;
         }
-        self.loop_compile_time_exhausted |= compile_ns > MAX_LOOP_COMPILE_NS;
+        self.compilation_breakers.loop_compile_time |= compile_ns > MAX_LOOP_COMPILE_NS;
         self.update_osr_counters(|counters| {
-            if compiled {
+            if compiled && retained {
                 counters.compilations = counters.compilations.saturating_add(1);
                 counters.code_bytes = counters.code_bytes.saturating_add(code_bytes);
             }
             counters.compile_time_ns = counters.compile_time_ns.saturating_add(compile_ns);
         });
+        retained
     }
 
     fn record_loop_entry(&mut self) {
@@ -2039,8 +2203,9 @@ impl JitBackend {
             .as_ref()
             .is_some_and(|rejection| rejection.kind == JitCompileBlockerKind::InstructionLimit)
         {
-            self.stats.resources.oversized_functions =
-                self.stats.resources.oversized_functions.saturating_add(1);
+            self.update_resource_counters(|counters| {
+                counters.oversized_functions = counters.oversized_functions.saturating_add(1);
+            });
         }
         code.set_jit_admission(self.id, state);
         if !allowed {
@@ -2306,8 +2471,9 @@ impl JitBackend {
         if self.call_targets.contains_key(&key) || self.call_targets.len() < MAX_CALL_TARGET_SITES {
             self.call_targets.insert(key, target_code_id);
         } else {
-            self.stats.resources.call_target_capacity =
-                self.stats.resources.call_target_capacity.saturating_add(1);
+            self.update_resource_counters(|counters| {
+                counters.call_target_capacity = counters.call_target_capacity.saturating_add(1);
+            });
         }
     }
 
@@ -2385,18 +2551,23 @@ impl JitBackend {
         code: &CodeBlock,
         charge_instruction_budget: bool,
     ) -> Option<CachedEntry> {
+        if self.health != JitBackendHealth::Active {
+            return None;
+        }
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
         let cache_key = JitCacheKey::function(code.debug_id, charge_instruction_budget, diagnostic);
 
-        if let Some(state) = self.cache.get(&cache_key) {
+        if let Some(state) = self.cache.get(&cache_key).copied() {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
             return match state {
-                FunctionEntryState::Ready(cached) => Some(*cached),
+                FunctionEntryState::Ready(cached) => Some(cached),
                 #[cfg(test)]
                 FunctionEntryState::TerminalFailure => {
-                    self.stats.resources.terminal_failure_hits =
-                        self.stats.resources.terminal_failure_hits.saturating_add(1);
+                    self.update_resource_counters(|counters| {
+                        counters.terminal_failure_hits =
+                            counters.terminal_failure_hits.saturating_add(1);
+                    });
                     None
                 }
             };
@@ -2404,8 +2575,13 @@ impl JitBackend {
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         if self.cache.len() >= MAX_FUNCTION_ENTRY_STATES {
-            self.stats.resources.function_capacity =
-                self.stats.resources.function_capacity.saturating_add(1);
+            self.update_resource_counters(|counters| {
+                counters.function_capacity = counters.function_capacity.saturating_add(1);
+            });
+            return None;
+        }
+        if let Some(reason) = self.compilation_suppression_reason() {
+            self.record_compilation_suppression(reason);
             return None;
         }
         let started = Instant::now();
@@ -2420,8 +2596,7 @@ impl JitBackend {
             self.stats.shim_compilations = self.stats.shim_compilations.saturating_add(1);
         }
         let cached = CachedEntry { entry, native };
-        self.cache
-            .insert(cache_key, FunctionEntryState::Ready(cached));
+        let retained = self.record_compilation_result(code_bytes, compile_ns, false);
         if let Some(diagnostics) = &mut self.diagnostics {
             let (
                 blocker,
@@ -2487,6 +2662,11 @@ impl JitBackend {
                 code_bytes,
             });
         }
+        if !retained {
+            return None;
+        }
+        self.cache
+            .insert(cache_key, FunctionEntryState::Ready(cached));
         Some(cached)
     }
 
@@ -3149,6 +3329,120 @@ mod tests {
         assert_eq!(backend.call_targets.get(&(0, 0)), Some(&999));
         assert!(!backend.call_targets.contains_key(&(u64::MAX, u32::MAX)));
         assert_eq!(backend.stats().resources.call_target_capacity, 1);
+    }
+
+    #[test]
+    fn jit_backend_resource_thresholds_suppress_unseen_work_and_reuse_ready_entries() {
+        let ready_code = first_function_code("function ready(value) { return value + 1; }");
+        let unseen_code = first_function_code("function unseen(value) { return value + 2; }");
+        let ready = CachedEntry {
+            entry: malformed_loop_untagged,
+            native: true,
+        };
+
+        let mut bytes = JitBackend::new();
+        bytes.enable_diagnostics(JitDiagnosticLimits::default());
+        bytes.cache.insert(
+            JitCacheKey::function(ready_code.debug_id, false, true),
+            FunctionEntryState::Ready(ready),
+        );
+        bytes.stats.resources.retained_code_bytes = MAX_RETAINED_CODE_BYTES;
+        bytes
+            .diagnostics
+            .as_mut()
+            .expect("diagnostics")
+            .resources
+            .retained_code_bytes = MAX_RETAINED_CODE_BYTES;
+        assert!(bytes.cached_entry(&ready_code, false).is_some());
+        assert!(bytes.cached_entry(&unseen_code, false).is_none());
+        assert_eq!(bytes.stats().resources.code_bytes, 1);
+        assert_eq!(
+            bytes.diagnostic_snapshot().expect("diagnostics").resources,
+            bytes.stats().resources
+        );
+
+        let mut cumulative = JitBackend::new();
+        cumulative.stats.resources.compile_time_ns = MAX_CUMULATIVE_COMPILE_NS;
+        assert!(cumulative.cached_entry(&unseen_code, false).is_none());
+        assert_eq!(cumulative.stats().resources.compile_time, 1);
+
+        let mut slow = JitBackend::new();
+        assert!(slow.record_compilation_result(1, MAX_COMPILE_ATTEMPT_NS + 1, false));
+        assert!(slow.cached_entry(&unseen_code, false).is_none());
+        assert_eq!(slow.stats().resources.slow_attempt, 1);
+
+        let mut overrun = JitBackend::new();
+        overrun.stats.resources.retained_code_bytes = MAX_RETAINED_CODE_BYTES - 1;
+        assert!(!overrun.record_compilation_result(2, 1, false));
+        assert!(overrun.is_retiring_for_resource_overrun());
+        assert_eq!(
+            overrun.stats().resources.retained_code_bytes,
+            MAX_RETAINED_CODE_BYTES - 1
+        );
+        assert_eq!(overrun.stats().resources.payload_overrun_retirements, 1);
+        assert!(overrun.cached_entry(&ready_code, false).is_none());
+    }
+
+    #[test]
+    fn context_owned_jit_drops_function_payload_overrun_before_interpreter_continuation() {
+        let mut context = Context::default();
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes("function add(left, right) { return left + right; }"),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define function");
+
+        context.enable_jit();
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        backend.set_thresholds(JitThresholds {
+            function_entries: 1,
+            loop_backedges: u32::MAX,
+        });
+        backend.admission_min_straight_line_instructions = 0;
+        backend.stats.resources.retained_code_bytes = MAX_RETAINED_CODE_BYTES - 1;
+
+        let call =
+            crate::Script::parse(crate::Source::from_bytes("add(20, 22)"), None, &mut context)
+                .expect("parse call");
+        assert_eq!(
+            call.evaluate(&mut context)
+                .expect("interpreter continuation")
+                .as_i32(),
+            Some(42)
+        );
+        assert!(!context.jit_enabled(), "overrun module must be dropped");
+    }
+
+    #[test]
+    fn context_owned_jit_drops_loop_payload_overrun_before_interpreter_continuation() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        backend.loop_code_bytes = MAX_LOOP_CODE_BYTES - 1;
+        backend.compilation_breakers.loop_code_bytes = false;
+
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } sum(4)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse loop");
+        assert_eq!(
+            script
+                .evaluate(&mut context)
+                .expect("interpreter continuation")
+                .as_i32(),
+            Some(6)
+        );
+        assert!(!context.jit_enabled(), "overrun module must be dropped");
     }
 
     #[test]
@@ -5627,7 +5921,11 @@ mod tests {
                 .jit_backend
                 .as_mut()
                 .expect("JIT backend")
-                .loop_compile_time_exhausted = false;
+                .compilation_breakers
+                .loop_compile_time = false;
+            let backend = context.jit_backend.as_mut().expect("JIT backend");
+            backend.compilation_breakers.slow_attempt = false;
+            backend.stats.resources.compile_time_ns = 0;
         }
 
         let suppressed_code_id = function_codes[MAX_LOOP_REGION_STATES].debug_id;
@@ -5697,7 +5995,7 @@ mod tests {
             LoopRegionAction::Compile
         );
         slow.record_loop_compile_attempt();
-        slow.record_loop_compile_result(false, 64, MAX_LOOP_COMPILE_NS + 1);
+        assert!(slow.record_loop_compile_result(false, 64, MAX_LOOP_COMPILE_NS + 1));
         assert_eq!(
             slow.observe_loop_region(loop_key(2, 10)),
             LoopRegionAction::Suppressed(JitOsrSuppressionReason::CompileTime)
@@ -5709,17 +6007,20 @@ mod tests {
         assert_eq!(slow.stats().osr.compile_time_ns, MAX_LOOP_COMPILE_NS + 1);
         assert_eq!(slow.stats().osr.code_bytes, 0);
         assert_eq!(slow.stats().osr.suppressions.compile_time, 1);
+        assert_eq!(slow.stats().resources.slow_attempt, 1);
 
         let mut bytes = JitBackend::new();
-        bytes.record_loop_compile_result(true, MAX_LOOP_CODE_BYTES + 1, 1);
+        assert!(!bytes.record_loop_compile_result(true, MAX_LOOP_CODE_BYTES + 1, 1));
         assert_eq!(
             bytes.observe_loop_region(loop_key(3, 10)),
             LoopRegionAction::Suppressed(JitOsrSuppressionReason::CodeBytes)
         );
         assert!(bytes.loop_regions.is_empty());
-        assert_eq!(bytes.stats().osr.compilations, 1);
-        assert_eq!(bytes.stats().osr.code_bytes, MAX_LOOP_CODE_BYTES + 1);
+        assert_eq!(bytes.stats().osr.compilations, 0);
+        assert_eq!(bytes.stats().osr.code_bytes, 0);
         assert_eq!(bytes.stats().osr.suppressions.code_bytes, 1);
+        assert_eq!(bytes.stats().resources.payload_overrun_retirements, 1);
+        assert_eq!(bytes.stats().resources.code_bytes, 1);
     }
 
     #[test]

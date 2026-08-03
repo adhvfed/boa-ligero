@@ -867,6 +867,12 @@ enum InterpreterJitControl {
     Break(CompletionRecord),
 }
 
+#[cfg(feature = "jit")]
+enum JitRunOutcome {
+    Completed(CompletionRecord),
+    RetireAndInterpret,
+}
+
 impl Context {
     #[inline(always)]
     #[allow(clippy::inline_always)]
@@ -1468,13 +1474,22 @@ impl Context {
 
         self.active_jit_backend_id = backend.id();
         self.active_jit_observes_interpreted_sites = backend.observes_interpreted_sites();
-        let record = self.run_with_jit_backend(&mut backend);
+        let outcome = self.run_with_jit_backend(&mut backend);
         self.active_jit_backend_id = 0;
         self.active_jit_observes_interpreted_sites = false;
-        if !backend.is_compromised() {
-            self.jit_backend = Some(backend);
+        match outcome {
+            JitRunOutcome::Completed(record) => {
+                if !backend.should_drop() {
+                    self.jit_backend = Some(backend);
+                }
+                record
+            }
+            JitRunOutcome::RetireAndInterpret => {
+                debug_assert!(backend.is_retiring_for_resource_overrun());
+                drop(backend);
+                self.run_interpreter()
+            }
         }
-        record
     }
 
     #[cfg(not(feature = "jit"))]
@@ -1483,8 +1498,11 @@ impl Context {
     }
 
     #[cfg(feature = "jit")]
-    fn run_with_jit_backend(&mut self, backend: &mut crate::jit::JitBackend) -> CompletionRecord {
+    fn run_with_jit_backend(&mut self, backend: &mut crate::jit::JitBackend) -> JitRunOutcome {
         'scheduler: loop {
+            if backend.is_retiring_for_resource_overrun() {
+                return JitRunOutcome::RetireAndInterpret;
+            }
             let frame = self.vm.frame();
             let admission_denied = matches!(
                 frame.code_block.jit_admission(backend.id()),
@@ -1522,11 +1540,12 @@ impl Context {
                     };
 
                     if status & crate::jit::JIT_BREAK_BIT != 0 {
-                        return self
-                            .vm
-                            .jit_pending
-                            .take()
-                            .expect("a break status must have stashed a completion record");
+                        return JitRunOutcome::Completed(
+                            self.vm
+                                .jit_pending
+                                .take()
+                                .expect("a break status must have stashed a completion record"),
+                        );
                     }
 
                     if let Some(exit) = crate::jit::JitExit::decode(status) {
@@ -1537,11 +1556,12 @@ impl Context {
                             }
                             crate::jit::JitExitKind::Completion
                             | crate::jit::JitExitKind::Budget => {
-                                return self
-                                    .vm
-                                    .jit_pending
-                                    .take()
-                                    .expect("a completion exit must have stashed a record");
+                                return JitRunOutcome::Completed(
+                                    self.vm
+                                        .jit_pending
+                                        .take()
+                                        .expect("a completion exit must have stashed a record"),
+                                );
                             }
                             crate::jit::JitExitKind::Return | crate::jit::JitExitKind::Call => {
                                 // These transitions are reserved for the native
@@ -1554,8 +1574,8 @@ impl Context {
                                 // function entry. No loop artifact is invokable
                                 // until the dedicated scheduler slice validates
                                 // the exit against its immutable region map.
-                                return CompletionRecord::Throw(JsError::from_native(
-                                    JsNativeError::error(),
+                                return JitRunOutcome::Completed(CompletionRecord::Throw(
+                                    JsError::from_native(JsNativeError::error()),
                                 ));
                             }
                         }
@@ -1573,7 +1593,7 @@ impl Context {
                 if let ControlFlow::Break(value) =
                     self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
                 {
-                    return value;
+                    return JitRunOutcome::Completed(value);
                 }
                 continue 'scheduler;
             }
@@ -1589,7 +1609,9 @@ impl Context {
                 let old_code_id = frame.code_block.debug_id;
                 let old_frame_depth = self.vm.frames.len();
                 let Some(byte) = frame.code_block.bytecode.bytes.get(old_pc as usize) else {
-                    return CompletionRecord::Throw(JsError::from_native(JsNativeError::error()));
+                    return JitRunOutcome::Completed(CompletionRecord::Throw(
+                        JsError::from_native(JsNativeError::error()),
+                    ));
                 };
                 let opcode = Opcode::decode(*byte);
 
@@ -1607,7 +1629,7 @@ impl Context {
                     opcode,
                 ) {
                     ControlFlow::Continue(()) => {}
-                    ControlFlow::Break(value) => return value,
+                    ControlFlow::Break(value) => return JitRunOutcome::Completed(value),
                 }
 
                 if self.vm.frames.len() != old_frame_depth {
@@ -1624,7 +1646,7 @@ impl Context {
                                 backend,
                             )
                         {
-                            return value;
+                            return JitRunOutcome::Completed(value);
                         }
                         if self.vm.frames.len() == old_frame_depth {
                             continue;
@@ -1665,7 +1687,9 @@ impl Context {
                                 }
                                 continue 'scheduler;
                             }
-                            InterpreterJitControl::Break(record) => return record,
+                            InterpreterJitControl::Break(record) => {
+                                return JitRunOutcome::Completed(record);
+                            }
                         }
                     }
 
