@@ -251,3 +251,6 @@ the gate closes only when both are present:
 One further behavior slice may follow the complete D1 slice. The already
 scheduled behavior-neutral refactor is then due before any second ABI or
 default flip.
+
+Implementation status and the remaining acceptance gaps are recorded in the
+[resource-governor checkpoint](32-default-jit-resource-governor-checkpoint-2026-08-03.md).

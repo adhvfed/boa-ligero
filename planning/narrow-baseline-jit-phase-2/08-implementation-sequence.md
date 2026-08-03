@@ -560,6 +560,11 @@ Land capacity/static-admission suppression first, then unified byte/time
 accounting and safe backend retirement. Do not fold either slice into the
 eventual default flip.
 
+Both implementation commits are now landed. The remaining combined-capacity,
+maximum-diagnostic, failure-containment, structural-emitter, and seven-pair
+cold/RSS gates are tracked in the
+[D1 checkpoint](32-default-jit-resource-governor-checkpoint-2026-08-03.md).
+
 Suggested commits:
 
 ```text

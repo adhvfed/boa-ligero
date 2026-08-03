@@ -117,9 +117,13 @@ leaving the PC-zero cache outside those bounds. The selected limits reserve
 8 MiB, stop unseen compilation after one 10 ms attempt or 100 ms cumulative
 codegen, and reject PC-zero bodies above 1,024 decoded instructions before IR
 construction. Ready artifacts remain reusable and finalized code is never
-pretended to be evicted. Exact map cardinalities, post-publication retirement,
+pretended to be evicted. Exact map cardinalities, pre-cache overrun retirement,
 diagnostic overhead, and acceptance tests are in the
 [D1 design record](31-default-jit-resource-bounds-design-2026-08-03.md).
+The governor implementation is landed; the combined capacity, maximum-
+diagnostic, failure-containment, structural-emitter, and process cold/RSS gates
+remain open in the
+[D1 checkpoint](32-default-jit-resource-governor-checkpoint-2026-08-03.md).
 
 ## Cold-start policy
 

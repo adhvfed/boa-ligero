@@ -77,8 +77,14 @@ load by 29.607% with exact sink/paint/memory structure. A separate schema-8 W0
 sample has zero drops and distinguishes 999 PC-zero returns from one OSR
 continuation. Boa `6dc6aa07` now completes the separately revertible 4A1.R
 loop-exit-contract refactor with the full semantic/containment suite green,
-Earley-Boyer at +4.287%, and a clean zero-drop W0 sample. Decision checkpoint B
-is next and must re-profile before selecting any second ABI.
+Earley-Boyer at +4.287%, and a clean zero-drop W0 sample. Decision checkpoint
+B's binding D0 rerun remains open and must use schema 9 after the host passes
+its continuous quiescence preflight. D1's two resource-governor implementation
+commits are now landed in Boa `42623234` and `2888c024`, with Ligero projection
+in `72568c9a` and `dfdc0714`. D1 is not closed: combined capacity/variant
+coverage, maximum-diagnostic saturation, recoverable-failure ownership, an
+automated raw-emitter audit, and the seven-pair cold/RSS gate remain. JIT
+therefore stays opt-in.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -199,6 +205,10 @@ Every Phase 2 entry and exit ABI inherits that rule.
     pass. **Next:** Decision checkpoint B re-profiling.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
+   **Implementation landed, gate open:** Boa `42623234` and `2888c024` bound
+   retained state, body decoding, feedback, payload, and compile time and add
+   safe overrun retirement; the remaining D1 acceptance work is recorded in
+   checkpoint 32.
 12. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
@@ -304,6 +314,10 @@ showing that another boundary dominates.
   — D1's exact backend-lifetime function/loop key, code-byte, compile-time,
   body-size, feedback, and diagnostic bounds; suppression/retirement semantics;
   raw-emitter closure; and the implementation acceptance matrix.
+- [Default-JIT resource governor checkpoint, 2026-08-03](32-default-jit-resource-governor-checkpoint-2026-08-03.md)
+  — landed D1 implementation commits, schema-9 projection, verification
+  evidence, and the exact combined-capacity, diagnostics, failure, structural,
+  cold-start, and RSS work still blocking D1 closure.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
