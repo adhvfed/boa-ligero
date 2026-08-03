@@ -165,7 +165,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 3;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 4;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -219,6 +219,9 @@ pub enum JitAdmissionReason {
     AllowedStraightLineWork,
     /// Static native eligibility rejected the body before code generation.
     DeniedNativeIneligible,
+    /// The body contains a call, but compiled callers cannot yet resume after
+    /// the scheduler transition.
+    DeniedCallBoundary,
     /// A fully native straight-line body is below the measured work floor.
     DeniedStraightLineTooSmall,
 }
@@ -288,6 +291,9 @@ pub enum JitExitReason {
     RuntimeLimit = 10,
     /// A helper produced a JavaScript exception.
     Exception = 11,
+    /// A declarative binding could not be read with the compiled entry's
+    /// stable locator and value representation.
+    BindingRead = 12,
 }
 
 impl JitExitReason {
@@ -305,6 +311,7 @@ impl JitExitReason {
             9 => Some(Self::Return),
             10 => Some(Self::RuntimeLimit),
             11 => Some(Self::Exception),
+            12 => Some(Self::BindingRead),
             _ => None,
         }
     }
@@ -608,6 +615,7 @@ pub struct JitBackend {
     call_targets: FxHashMap<(u64, u32), u64>,
     thresholds: JitThresholds,
     admission_min_straight_line_instructions: u32,
+    admission_allow_call_boundaries: bool,
     stats: JitStats,
     diagnostics: Option<JitDiagnosticState>,
 }
@@ -650,6 +658,7 @@ impl JitBackend {
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
+            admission_allow_call_boundaries: false,
             stats: JitStats::default(),
             diagnostics: None,
         }
@@ -700,6 +709,10 @@ impl JitBackend {
     #[cfg(test)]
     fn allow_small_native_entries_for_tests(&mut self) {
         self.admission_min_straight_line_instructions = 0;
+        // The semantic call-lowering tests intentionally exercise the existing
+        // scheduler exit even though production admission rejects callers that
+        // cannot yet resume natively after it.
+        self.admission_allow_call_boundaries = true;
     }
 
     /// Record an ordinary function entry for tiering.
@@ -726,6 +739,17 @@ impl JitBackend {
 
         let analysis = native::admission_profile(code, self.diagnostics.is_some());
         let (allowed, state, reason, profile, rejection) = match analysis {
+            Ok(profile)
+                if profile.call_instructions > 0 && !self.admission_allow_call_boundaries =>
+            {
+                (
+                    false,
+                    JitAdmissionState::Denied,
+                    JitAdmissionReason::DeniedCallBoundary,
+                    profile,
+                    None,
+                )
+            }
             Ok(profile) if profile.backward_branches > 0 => (
                 true,
                 JitAdmissionState::Allowed,
@@ -1335,7 +1359,7 @@ impl Default for JitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{EngineError, RuntimeLimitError};
+    use crate::error::{EngineError, JsNativeErrorKind, RuntimeLimitError};
     use crate::vm::GlobalFunctionBinding;
     use crate::{JsValue, NativeFunction, js_string};
 
@@ -1486,16 +1510,20 @@ mod tests {
         let unsupported_code = first_function_code(
             "function distinctive_private_blocked(value) { return value & 7; }",
         );
+        let call_boundary_code = first_function_code(
+            "function distinctive_private_call_loop(callback, limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + callback(index); } return total; }",
+        );
 
         let mut backend = JitBackend::new();
         backend.enable_diagnostics(JitDiagnosticLimits::default());
         assert!(!backend.admit_function_entry(&tiny_code));
         assert!(backend.admit_function_entry(&loop_code));
         assert!(!backend.admit_function_entry(&unsupported_code));
+        assert!(!backend.admit_function_entry(&call_boundary_code));
 
         let snapshot = backend.diagnostic_snapshot().expect("diagnostics enabled");
         assert_eq!(snapshot.schema_version, JIT_DIAGNOSTIC_SCHEMA_VERSION);
-        assert_eq!(snapshot.admission_records.len(), 3);
+        assert_eq!(snapshot.admission_records.len(), 4);
         assert_eq!(snapshot.dropped_admission_records, 0);
         assert!(snapshot.compile_records.is_empty());
         assert!(snapshot.admission_records.iter().any(|record| {
@@ -1519,10 +1547,19 @@ mod tests {
                 && record.first_blocking_pc.is_some()
                 && record.supported_prefix_instructions < record.bytecode_instructions
         }));
+        assert!(snapshot.admission_records.iter().any(|record| {
+            !record.allowed
+                && record.reason == JitAdmissionReason::DeniedCallBoundary
+                && !record.leaf_fast_path
+                && record.blocker.is_none()
+                && record.native_backward_branches > 0
+                && record.native_call_instructions > 0
+        }));
         let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
         assert!(!serialized.contains("distinctive_private"));
         assert!(serialized.contains("\"denied_straight_line_too_small\""));
         assert!(serialized.contains("\"denied_native_ineligible\""));
+        assert!(serialized.contains("\"denied_call_boundary\""));
 
         let mut bounded = JitBackend::new();
         bounded.enable_diagnostics(JitDiagnosticLimits {
@@ -1535,6 +1572,38 @@ mod tests {
         let bounded = bounded.diagnostic_snapshot().expect("diagnostics enabled");
         assert_eq!(bounded.admission_records.len(), 1);
         assert_eq!(bounded.dropped_admission_records, 1);
+    }
+
+    #[test]
+    fn context_owned_jit_denies_call_boundary_without_compiling_an_artifact() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function increment(value) { return value + 1; } function sum(callback, limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + callback(index); } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = sum(increment, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(55));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.shim_compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.native_compilations, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.compile_records.is_empty());
+        assert!(diagnostics.admission_records.iter().any(|record| {
+            !record.allowed
+                && record.reason == JitAdmissionReason::DeniedCallBoundary
+                && record.native_backward_branches > 0
+                && record.native_call_instructions > 0
+        }));
     }
 
     #[test]
@@ -2426,6 +2495,218 @@ mod tests {
             record.kind == JitDiagnosticExitKind::Deopt
                 && record.reason == JitExitReason::NamedProperty
         }));
+    }
+
+    #[test]
+    fn context_owned_jit_reads_current_global_declarative_binding() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let limit = 4; function sum() { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + 1.5; } return total; } let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(); } let before = sum(); limit = 2; before + ',' + sum()",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "6.5,3.5"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.compile_records.iter().any(|record| {
+            record.outcome == JitCompileOutcome::Native
+                && record.first_blocking_opcode.is_none()
+                && record.native_backward_branches > 0
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_mismatched_global_binding_read() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let limit = 4; function sum() { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + 1.5; } return total; } let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(); } let before = sum(); limit = '1'; before + ',' + sum()",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "6.5,2"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::BindingRead
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_replays_tdz_binding_read() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: 1,
+            loop_backedges: 1,
+        });
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum() { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + 1.5; } return total; } sum(); let limit = 2;",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let error = script
+            .evaluate(&mut context)
+            .expect_err("TDZ read must throw after native guard fallback");
+        assert_eq!(
+            error.as_native().map(crate::JsNativeError::kind),
+            Some(&JsNativeErrorKind::Reference)
+        );
+
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::BindingRead
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_binding_read_survives_forced_gc() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let holder = { value: 3 }; let limit = 10; function sum() { let total = 0; for (let i = 0; i < limit; i++) { total = total + holder.value; } return total; } let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("warm up");
+
+        boa_gc::force_collect();
+
+        let call = crate::Script::parse(crate::Source::from_bytes("sum()"), None, &mut context)
+            .expect("parse call");
+        let result = call.evaluate(&mut context).expect("evaluate after GC");
+        assert_eq!(result.as_i32(), Some(30));
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_binding_guard_refunds_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+            }
+            let definition = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "let limit = 4; function sum() { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + 1.5; } return total; } let warm = 0; for (let i = 0; i < 80; i++) { warm = sum(); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse definition");
+            definition.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let expected =
+            evaluate_with_instruction_budget(&mut interpreter, "limit = '2'; sum()", 1_000)
+                .expect("interpreter binding fallback");
+        let result = evaluate_with_instruction_budget(&mut context, "limit = '2'; sum()", 1_000)
+            .expect("JIT binding fallback");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "binding guard fallback must not double-charge GetName"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_rejects_direct_eval_binding_scope() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let limit = 3; function sum() { eval(''); let total = 0; for (let index = 0; index < limit; index++) { total = total + 2; } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = sum(); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(6));
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.admission_records.iter().any(|record| {
+            !record.allowed
+                && record.reason == JitAdmissionReason::DeniedNativeIneligible
+                && record.first_blocking_opcode.as_deref() == Some("PushScope")
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_global_binding_reads_are_realm_scoped() {
+        let evaluate = |limit: i32| {
+            let mut context = Context::default();
+            context.enable_jit();
+            let source = format!(
+                "let limit = {limit}; function sum() {{ let total = 0; for (let index = 0; index < limit; index++) {{ total = total + 2; }} return total; }} let answer = 0; for (let index = 0; index < 80; index++) {{ answer = sum(); }} answer"
+            );
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(source.as_bytes()),
+                None,
+                &mut context,
+            )
+            .expect("parse");
+            let result = script.evaluate(&mut context).expect("evaluate");
+            let stats = context.jit_stats().expect("JIT was enabled");
+            assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+            assert!(stats.native_entries >= 1, "stats: {stats:?}");
+            result.as_i32().expect("integer result")
+        };
+
+        assert_eq!(evaluate(2), 4);
+        assert_eq!(evaluate(5), 10);
     }
 
     #[test]
