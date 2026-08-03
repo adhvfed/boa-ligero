@@ -165,7 +165,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 2;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 3;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -178,6 +178,9 @@ pub const MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND: usize = 4_096;
 pub struct JitDiagnosticLimits {
     /// Maximum number of compilation records retained by a context.
     pub compile_records: usize,
+    /// Maximum number of function-entry admission records retained by a
+    /// context.
+    pub admission_records: usize,
     /// Maximum number of distinct exit records retained by a context.
     pub exit_records: usize,
 }
@@ -188,6 +191,9 @@ impl JitDiagnosticLimits {
             compile_records: self
                 .compile_records
                 .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+            admission_records: self
+                .admission_records
+                .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             exit_records: self.exit_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
         }
     }
@@ -197,9 +203,24 @@ impl Default for JitDiagnosticLimits {
     fn default() -> Self {
         Self {
             compile_records: 256,
+            admission_records: 256,
             exit_records: 256,
         }
     }
+}
+
+/// Why context-tier function-entry admission allowed or denied a code block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitAdmissionReason {
+    /// A fully native body contains a validated backward branch.
+    AllowedBackwardBranch,
+    /// A fully native straight-line body meets the measured work floor.
+    AllowedStraightLineWork,
+    /// Static native eligibility rejected the body before code generation.
+    DeniedNativeIneligible,
+    /// A fully native straight-line body is below the measured work floor.
+    DeniedStraightLineTooSmall,
 }
 
 /// Artifact selected for a JIT compilation request.
@@ -373,6 +394,36 @@ pub struct JitCompileRecord {
     pub code_bytes: usize,
 }
 
+/// One bounded, source-free context-tier admission decision.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct JitAdmissionRecord {
+    /// Runtime-local code-block identity. This is not stable across processes.
+    pub code_id: u64,
+    /// Whether the context tier may compile this function entry.
+    pub allowed: bool,
+    /// Static reason for the decision.
+    pub reason: JitAdmissionReason,
+    /// Whether denied calls may use the frame-change interpreter fast path.
+    pub leaf_fast_path: bool,
+    /// First native-eligibility blocker for an ineligible body.
+    pub blocker: Option<JitCompileBlockerKind>,
+    /// Debug name of the first blocking opcode, never source or property data.
+    pub first_blocking_opcode: Option<String>,
+    /// PC of the first blocking opcode or malformed edge.
+    pub first_blocking_pc: Option<u32>,
+    /// Instructions preceding the first blocker that are individually in the
+    /// native allowlist.
+    pub supported_prefix_instructions: u32,
+    /// Total decoded bytecode instructions available to admission.
+    pub bytecode_instructions: u32,
+    /// Static backward branches in a fully native body.
+    pub native_backward_branches: u32,
+    /// Static call instructions in a fully native body.
+    pub native_call_instructions: u32,
+    /// Static property-read instructions in a fully native body.
+    pub native_property_instructions: u32,
+}
+
 /// Stable snapshot of opt-in detailed JIT diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticSnapshot {
@@ -382,10 +433,14 @@ pub struct JitDiagnosticSnapshot {
     pub limits: JitDiagnosticLimits,
     /// Compilation records in deterministic cache-key order.
     pub compile_records: Vec<JitCompileRecord>,
+    /// Function-entry admission decisions in runtime-local code-ID order.
+    pub admission_records: Vec<JitAdmissionRecord>,
     /// Aggregated native exits in deterministic key order.
     pub exit_records: Vec<JitExitRecord>,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
+    /// Admission records omitted after reaching the configured bound.
+    pub dropped_admission_records: u64,
     /// Exit records omitted after reaching the configured bound.
     pub dropped_exit_records: u64,
 }
@@ -394,8 +449,10 @@ pub struct JitDiagnosticSnapshot {
 struct JitDiagnosticState {
     limits: JitDiagnosticLimits,
     compile_records: Vec<JitCompileRecord>,
+    admission_records: Vec<JitAdmissionRecord>,
     exit_records: Vec<JitExitRecord>,
     dropped_compile_records: u64,
+    dropped_admission_records: u64,
     dropped_exit_records: u64,
 }
 
@@ -405,8 +462,10 @@ impl JitDiagnosticState {
         Self {
             limits,
             compile_records: Vec::with_capacity(limits.compile_records.min(64)),
+            admission_records: Vec::with_capacity(limits.admission_records.min(64)),
             exit_records: Vec::with_capacity(limits.exit_records.min(64)),
             dropped_compile_records: 0,
+            dropped_admission_records: 0,
             dropped_exit_records: 0,
         }
     }
@@ -416,6 +475,14 @@ impl JitDiagnosticState {
             self.compile_records.push(record);
         } else {
             self.dropped_compile_records = self.dropped_compile_records.saturating_add(1);
+        }
+    }
+
+    fn record_admission(&mut self, record: JitAdmissionRecord) {
+        if self.admission_records.len() < self.limits.admission_records {
+            self.admission_records.push(record);
+        } else {
+            self.dropped_admission_records = self.dropped_admission_records.saturating_add(1);
         }
     }
 
@@ -451,6 +518,8 @@ impl JitDiagnosticState {
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
         compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
+        let mut admission_records = self.admission_records.clone();
+        admission_records.sort_by_key(|record| record.code_id);
         let mut exit_records = self.exit_records.clone();
         exit_records.sort_by_key(|record| {
             (
@@ -465,8 +534,10 @@ impl JitDiagnosticState {
             schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
             limits: self.limits,
             compile_records,
+            admission_records,
             exit_records,
             dropped_compile_records: self.dropped_compile_records,
+            dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
         }
     }
@@ -653,23 +724,95 @@ impl JitBackend {
             JitAdmissionState::Unknown => {}
         }
 
-        let profile = native::admission_profile(code);
-        let allowed = profile.is_some_and(|profile| {
-            profile.backward_branches > 0
-                || profile.bytecode_instructions >= self.admission_min_straight_line_instructions
-        });
-        let state = if allowed {
-            JitAdmissionState::Allowed
-        } else if profile.is_some_and(|profile| {
-            profile.call_instructions == 0 && profile.property_instructions == 0
-        }) {
-            JitAdmissionState::DeniedLeaf
-        } else {
-            JitAdmissionState::Denied
+        let analysis = native::admission_profile(code, self.diagnostics.is_some());
+        let (allowed, state, reason, profile, rejection) = match analysis {
+            Ok(profile) if profile.backward_branches > 0 => (
+                true,
+                JitAdmissionState::Allowed,
+                JitAdmissionReason::AllowedBackwardBranch,
+                profile,
+                None,
+            ),
+            Ok(profile)
+                if profile.bytecode_instructions
+                    >= self.admission_min_straight_line_instructions =>
+            {
+                (
+                    true,
+                    JitAdmissionState::Allowed,
+                    JitAdmissionReason::AllowedStraightLineWork,
+                    profile,
+                    None,
+                )
+            }
+            Ok(profile) => {
+                let state = if profile.call_instructions == 0 && profile.property_instructions == 0
+                {
+                    JitAdmissionState::DeniedLeaf
+                } else {
+                    JitAdmissionState::Denied
+                };
+                (
+                    false,
+                    state,
+                    JitAdmissionReason::DeniedStraightLineTooSmall,
+                    profile,
+                    None,
+                )
+            }
+            Err(rejection) => (
+                false,
+                JitAdmissionState::Denied,
+                JitAdmissionReason::DeniedNativeIneligible,
+                native::NativeStaticProfile::default(),
+                Some(rejection),
+            ),
         };
         code.set_jit_admission(self.id, state);
         if !allowed {
             self.stats.admission_denials = self.stats.admission_denials.saturating_add(1);
+        }
+        if let Some(diagnostics) = &mut self.diagnostics {
+            let (
+                blocker,
+                first_blocking_opcode,
+                first_blocking_pc,
+                supported_prefix_instructions,
+                bytecode_instructions,
+            ) = rejection.map_or(
+                (
+                    None,
+                    None,
+                    None,
+                    profile.bytecode_instructions,
+                    profile.bytecode_instructions,
+                ),
+                |rejection| {
+                    (
+                        Some(rejection.kind),
+                        rejection
+                            .first_blocking_opcode
+                            .map(|opcode| format!("{opcode:?}")),
+                        rejection.first_blocking_pc,
+                        rejection.supported_prefix_instructions,
+                        rejection.bytecode_instructions,
+                    )
+                },
+            );
+            diagnostics.record_admission(JitAdmissionRecord {
+                code_id: code.debug_id,
+                allowed,
+                reason,
+                leaf_fast_path: state == JitAdmissionState::DeniedLeaf,
+                blocker,
+                first_blocking_opcode,
+                first_blocking_pc,
+                supported_prefix_instructions,
+                bytecode_instructions,
+                native_backward_branches: profile.backward_branches,
+                native_call_instructions: profile.call_instructions,
+                native_property_instructions: profile.property_instructions,
+            });
         }
         allowed
     }
@@ -1304,6 +1447,7 @@ mod tests {
         let mut bounded = JitBackend::new();
         bounded.enable_diagnostics(JitDiagnosticLimits {
             compile_records: 1,
+            admission_records: 0,
             exit_records: 0,
         });
         let _ = bounded.cached_entry(&native_code, false);
@@ -1315,6 +1459,7 @@ mod tests {
         let mut hard_bounded = JitBackend::new();
         hard_bounded.enable_diagnostics(JitDiagnosticLimits {
             compile_records: usize::MAX,
+            admission_records: usize::MAX,
             exit_records: usize::MAX,
         });
         let hard_bounded = hard_bounded
@@ -1324,9 +1469,72 @@ mod tests {
             hard_bounded.limits,
             JitDiagnosticLimits {
                 compile_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+                admission_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 exit_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
             }
         );
+    }
+
+    #[test]
+    fn jit_admission_diagnostics_are_bounded_and_source_free() {
+        let tiny_code = first_function_code(
+            "function distinctive_private_tiny(left, right) { return left + right; }",
+        );
+        let loop_code = first_function_code(
+            "function distinctive_private_loop(limit) { let total = 0; for (let index = 0; index < limit; index++) { total += index; } return total; }",
+        );
+        let unsupported_code = first_function_code(
+            "function distinctive_private_blocked(value) { return value & 7; }",
+        );
+
+        let mut backend = JitBackend::new();
+        backend.enable_diagnostics(JitDiagnosticLimits::default());
+        assert!(!backend.admit_function_entry(&tiny_code));
+        assert!(backend.admit_function_entry(&loop_code));
+        assert!(!backend.admit_function_entry(&unsupported_code));
+
+        let snapshot = backend.diagnostic_snapshot().expect("diagnostics enabled");
+        assert_eq!(snapshot.schema_version, JIT_DIAGNOSTIC_SCHEMA_VERSION);
+        assert_eq!(snapshot.admission_records.len(), 3);
+        assert_eq!(snapshot.dropped_admission_records, 0);
+        assert!(snapshot.compile_records.is_empty());
+        assert!(snapshot.admission_records.iter().any(|record| {
+            !record.allowed
+                && record.reason == JitAdmissionReason::DeniedStraightLineTooSmall
+                && record.leaf_fast_path
+                && record.blocker.is_none()
+                && record.bytecode_instructions > 0
+        }));
+        assert!(snapshot.admission_records.iter().any(|record| {
+            record.allowed
+                && record.reason == JitAdmissionReason::AllowedBackwardBranch
+                && !record.leaf_fast_path
+                && record.native_backward_branches > 0
+        }));
+        assert!(snapshot.admission_records.iter().any(|record| {
+            !record.allowed
+                && record.reason == JitAdmissionReason::DeniedNativeIneligible
+                && record.blocker == Some(JitCompileBlockerKind::UnsupportedOpcode)
+                && record.first_blocking_opcode.as_deref() == Some("BitAnd")
+                && record.first_blocking_pc.is_some()
+                && record.supported_prefix_instructions < record.bytecode_instructions
+        }));
+        let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
+        assert!(!serialized.contains("distinctive_private"));
+        assert!(serialized.contains("\"denied_straight_line_too_small\""));
+        assert!(serialized.contains("\"denied_native_ineligible\""));
+
+        let mut bounded = JitBackend::new();
+        bounded.enable_diagnostics(JitDiagnosticLimits {
+            compile_records: 0,
+            admission_records: 1,
+            exit_records: 0,
+        });
+        assert!(!bounded.admit_function_entry(&tiny_code));
+        assert!(bounded.admit_function_entry(&loop_code));
+        let bounded = bounded.diagnostic_snapshot().expect("diagnostics enabled");
+        assert_eq!(bounded.admission_records.len(), 1);
+        assert_eq!(bounded.dropped_admission_records, 1);
     }
 
     #[test]
@@ -1734,6 +1942,7 @@ mod tests {
             &mut context,
             JitDiagnosticLimits {
                 compile_records: 0,
+                admission_records: 0,
                 exit_records: 1,
             },
         );
