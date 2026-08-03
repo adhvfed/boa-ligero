@@ -526,7 +526,7 @@ pub struct JitLoopSiteRecord {
 }
 
 /// Interpreted storage-read shape observed at one bytecode site.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JitStorageSiteKind {
     /// Static-name property read backed by Boa's named inline cache.
@@ -534,6 +534,7 @@ pub enum JitStorageSiteKind {
     /// Numeric indexed read eligible for Boa's dense-element inline cache.
     Dense,
     /// Computed property read outside the narrow dense numeric shape.
+    #[default]
     Computed,
     /// Specialized `length` read, which has no named/dense cache record.
     Length,
@@ -588,12 +589,6 @@ impl JitNativeStorageRecord {
             .dense_guard_misses
             .saturating_add(other.dense_guard_misses);
         self.dense_loads = self.dense_loads.saturating_add(other.dense_loads);
-    }
-}
-
-impl Default for JitStorageSiteKind {
-    fn default() -> Self {
-        Self::Computed
     }
 }
 
