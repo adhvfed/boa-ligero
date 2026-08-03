@@ -405,8 +405,12 @@ Land the shape through these independently reversible boundaries:
      the sink, record one OSR compile/entry and zero whole-function artifacts,
      and measure 6.120 ms OSR versus 28.078 ms interpreter medians: 4.588×
      including compilation, above the required 2× floor. **Rollback matrix
-     remains:** re-run the checksummed Decision-A micro/engine/W0 matrix with
-     diagnostics off for timings; every negative row remains within 5%, and W0
+     is partially complete in Boa `073c12cd`:** the first attempt exposed and
+     corrected repeated observation/scheduler overhead in denied loop-free
+     helpers. The checksummed nine-row micro matrix now keeps every negative
+     row within 3.635% and the eligible one-shot loop is 4.824× faster.
+     **Remaining:** run Crypto, DeltaBlue, Earley-Boyer, and W0 with diagnostics
+     off for timings; every negative row remains within 5%, and W0
      retains exact sink/paint/accounted-byte structure, its PC-zero entry, and
      at least a 20% paired cold-load win. Diagnostics run separately and must
      have zero dropped records. Record release-binary hashes and raw samples.

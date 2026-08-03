@@ -177,6 +177,16 @@ sample. Median elapsed time is 6.120 ms including 0.418 ms compilation versus
 open. See the
 [admission checkpoint](26-slice-4a1-osr-admission-checkpoint-2026-08-03.md).
 
+**Micro rollback subgate passed 2026-08-03:** the first wider-matrix attempt
+found a 35–50% JIT-enabled regression in denied straight-line property/method
+helpers with zero native artifacts. Boa `073c12cd` caches that these frames
+contain no observable backward edge and bypasses their loop scheduler only
+when diagnostics are off; loop-bearing denied frames remain OSR eligible.
+Seven alternating pairs put every negative/noncandidate micro row within
+3.635% and the eligible one-shot loop at a 4.824× win. Crypto, DeltaBlue,
+Earley-Boyer, W0, and separate zero-drop diagnostics remain binding. See the
+[micro rollback checkpoint](27-slice-4a1-micro-rollback-checkpoint-2026-08-03.md).
+
 ### Gate H — hot-but-unentered tiering
 
 With zero compilations and zero native entries, enabling the tier must remain
@@ -230,6 +240,11 @@ Record the Boa/Ligero commits and SHA-256 hashes of both release binaries in the
 4A1.5c checkpoint. A stale or locally rebuilt binary invalidates the row rather
 than becoming an unexplained rerun. Store raw per-process samples alongside
 medians and paired deltas so the rollback decision is independently auditable.
+
+The nine-row micro portion is complete in Boa `073c12cd`; do not rerun or tune
+it merely to select a better sample. The scheduled remaining order is engine
+controls, clean W0, then separate zero-drop diagnostics. None may be replaced
+by the micro pass, and 4A1.R remains blocked until all three finish.
 
 **Decision checkpoint A now satisfies the selection form of Gate P for one
 narrow branch.** Schema 7 plus corrected 4,096-record runner controls retain

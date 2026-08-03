@@ -63,8 +63,15 @@ entry reuse at capacity. Only 4A1.5c's fixed performance/browser rollback
 matrix remains before the scheduler edge can be accepted. Its isolated cold-
 OSR admission subgate now passes in Boa `229ac2e4`: seven alternating pairs
 measure a 4.588× median speedup including compilation with exact one-entry
-evidence and no PC-zero artifact. The separately revertible 4A1.R refactor
-remains mandatory after that gate and before Decision checkpoint B.
+evidence and no PC-zero artifact. The first wider-matrix attempt then exposed
+a 35–50% tax in denied loop-free property/method helpers. Boa `073c12cd`
+caches that no OSR edge exists and bypasses both per-opcode observation and the
+per-call scheduler round trip only when diagnostics are off. The complete
+nine-row micro matrix now passes: every negative row is within 3.635%, while
+the eligible one-shot loop is 4.824× faster. Engine controls, W0, and separate
+zero-drop diagnostics remain before Gate O closes. The separately revertible
+4A1.R refactor remains mandatory after that gate and before Decision checkpoint
+B.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -268,6 +275,9 @@ showing that another boundary dominates.
 - [Slice 4A1 cold-OSR admission checkpoint, 2026-08-03](26-slice-4a1-osr-admission-checkpoint-2026-08-03.md)
   — isolated production-threshold measurement, raw seven-pair evidence, exact
   entry-kind counters, and the remaining micro/engine/W0 rollback matrix.
+- [Slice 4A1 micro rollback checkpoint, 2026-08-03](27-slice-4a1-micro-rollback-checkpoint-2026-08-03.md)
+  — denied loop-free scheduler correction, the checksummed nine-row pass, raw
+  samples, and the remaining engine/W0/zero-drop gate.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
