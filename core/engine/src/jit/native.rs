@@ -260,7 +260,6 @@ struct LoopDecodedInstruction {
 /// forward continuation. Its continuation is intentionally restricted to the
 /// bytecompiler's register-to-return epilogue so liveness cannot silently
 /// guess at an unmodelled opcode.
-#[allow(dead_code, reason = "called by tests before scheduler wiring")]
 pub(super) fn plan_loop_region(
     code: &CodeBlock,
     header_pc: u32,
@@ -443,10 +442,6 @@ pub(super) fn plan_loop_region(
 }
 
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "invoked by the production scheduler in Slice 4A1.4"
-)]
 pub(super) struct CompiledLoopRegion {
     pub(super) entry: extern "C" fn(*mut Context) -> u64,
     pub(super) code_bytes: usize,
@@ -457,16 +452,11 @@ pub(super) enum LoopNativeCompileResult {
     Rejected(JitOsrRejectionReason),
 }
 
-/// Compile one already-proven loop region without making it reachable from
-/// the production scheduler.
+/// Compile one already-proven loop region for the post-backedge scheduler.
 ///
 /// The immutable plan is revalidated against the live `CodeBlock` before any
 /// Cranelift function is declared. A failure returns a bounded source-free
 /// reason and never exposes a callable entry.
-#[allow(
-    dead_code,
-    reason = "called by the backend and direct harness before scheduler wiring"
-)]
 pub(super) fn compile_loop_region(
     backend: &mut JitBackend,
     code: &CodeBlock,

@@ -867,6 +867,13 @@ enum InterpreterJitObservation {
     After { pc: u32, next_pc: u32 },
 }
 
+#[cfg(feature = "jit")]
+enum InterpreterJitControl {
+    Continue,
+    Reschedule,
+    Break(CompletionRecord),
+}
+
 impl Context {
     #[inline(always)]
     #[allow(clippy::inline_always)]
@@ -1197,7 +1204,7 @@ impl Context {
         mut observe: F,
     ) -> ControlFlow<CompletionRecord>
     where
-        F: FnMut(&mut Self, InterpreterJitObservation),
+        F: FnMut(&mut Self, InterpreterJitObservation) -> InterpreterJitControl,
     {
         while self.vm.frames.len() == frame_depth {
             let frame = self.vm.frame();
@@ -1209,7 +1216,11 @@ impl Context {
                 )));
             };
             let opcode = Opcode::decode(*byte);
-            observe(self, InterpreterJitObservation::Before { opcode, pc });
+            match observe(self, InterpreterJitObservation::Before { opcode, pc }) {
+                InterpreterJitControl::Continue => {}
+                InterpreterJitControl::Reschedule => return ControlFlow::Continue(()),
+                InterpreterJitControl::Break(record) => return ControlFlow::Break(record),
+            }
 
             if let ControlFlow::Break(value) = self.execute_one(
                 |context, opcode| {
@@ -1225,13 +1236,17 @@ impl Context {
 
             if self.vm.frames.len() == frame_depth && self.vm.frame().code_block.debug_id == code_id
             {
-                observe(
+                match observe(
                     self,
                     InterpreterJitObservation::After {
                         pc,
                         next_pc: self.vm.frame().pc,
                     },
-                );
+                ) {
+                    InterpreterJitControl::Continue => {}
+                    InterpreterJitControl::Reschedule => return ControlFlow::Continue(()),
+                    InterpreterJitControl::Break(record) => return ControlFlow::Break(record),
+                }
             }
         }
 
@@ -1243,7 +1258,9 @@ impl Context {
         &mut self,
         frame_depth: usize,
     ) -> ControlFlow<CompletionRecord> {
-        self.run_interpreter_until_frame_change_with(frame_depth, |_, _| {})
+        self.run_interpreter_until_frame_change_with(frame_depth, |_, _| {
+            InterpreterJitControl::Continue
+        })
     }
 
     #[cfg(feature = "jit")]
@@ -1252,28 +1269,70 @@ impl Context {
         frame_depth: usize,
         backend: &mut crate::jit::JitBackend,
     ) -> ControlFlow<CompletionRecord> {
-        if backend.observes_interpreted_sites() {
-            self.run_interpreter_until_frame_change_with(frame_depth, |context, observation| {
-                match observation {
-                    InterpreterJitObservation::Before { opcode, pc } => {
+        if self.vm.frame().jit_osr_closed() && !backend.observes_interpreted_sites() {
+            return self.run_interpreter_until_frame_change(frame_depth);
+        }
+        self.run_interpreter_until_frame_change_with(frame_depth, |context, observation| {
+            match observation {
+                InterpreterJitObservation::Before { opcode, pc } => {
+                    if backend.observes_interpreted_sites() {
                         context.observe_jit_interpreted_site(backend, opcode, pc);
                     }
-                    InterpreterJitObservation::After { pc, next_pc }
-                        if backend.observes_loop_backedges()
-                            && crate::jit::JitBackend::is_observed_loop_backedge(
-                                context.vm.frame().code_block.as_ref(),
-                                pc,
-                                next_pc,
-                            ) =>
-                    {
-                        let code = context.vm.frame().code_block.clone();
+                }
+                InterpreterJitObservation::After { pc, next_pc }
+                    if crate::jit::JitBackend::is_observed_loop_backedge(
+                        context.vm.frame().code_block.as_ref(),
+                        pc,
+                        next_pc,
+                    ) =>
+                {
+                    let code = context.vm.frame().code_block.clone();
+                    if backend.observes_loop_backedges() {
                         backend.record_closed_loop_backedge(&code, next_pc, pc);
                     }
-                    InterpreterJitObservation::After { .. } => {}
+                    if !context.vm.frame().jit_osr_closed() {
+                        return context.schedule_jit_loop_backedge(backend, &code, next_pc, pc);
+                    }
                 }
-            })
-        } else {
-            self.run_interpreter_until_frame_change(frame_depth)
+                InterpreterJitObservation::After { .. } => {}
+            }
+            InterpreterJitControl::Continue
+        })
+    }
+
+    #[cfg(feature = "jit")]
+    fn schedule_jit_loop_backedge(
+        &mut self,
+        backend: &mut crate::jit::JitBackend,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+    ) -> InterpreterJitControl {
+        match backend.schedule_loop_backedge(code, header_pc, backedge_pc, self) {
+            crate::jit::JitLoopScheduleAction::Cold => InterpreterJitControl::Continue,
+            crate::jit::JitLoopScheduleAction::Closed
+            | crate::jit::JitLoopScheduleAction::Resume => {
+                self.vm.frame_mut().mark_jit_osr_closed();
+                InterpreterJitControl::Reschedule
+            }
+            crate::jit::JitLoopScheduleAction::Break => {
+                self.vm.frame_mut().mark_jit_osr_closed();
+                let Some(record) = self.vm.jit_pending.take() else {
+                    return InterpreterJitControl::Break(CompletionRecord::Throw(
+                        JsError::from_native(JsNativeError::error()),
+                    ));
+                };
+                self.vm.jit_exit_pending = None;
+                InterpreterJitControl::Break(record)
+            }
+            crate::jit::JitLoopScheduleAction::Invalid => {
+                self.vm.frame_mut().mark_jit_osr_closed();
+                self.vm.jit_pending = None;
+                self.vm.jit_exit_pending = None;
+                InterpreterJitControl::Break(CompletionRecord::Throw(JsError::from_native(
+                    JsNativeError::error(),
+                )))
+            }
         }
     }
 
@@ -1557,14 +1616,35 @@ impl Context {
                         let code = self.vm.frame().code_block.clone();
                         if backend.record_loop_backedge(&code, header_pc, old_pc) {
                             self.vm.frame_mut().mark_jit_loop_hotness_saturated();
-                            if !backend.observes_loop_backedges()
-                                && !crate::jit::JitBackend::can_reenter_at_pc_zero(&code)
-                            {
-                                self.vm.frame_mut().mark_jit_entry_attempted();
-                                backend.record_dormant_loop_frame();
+                        }
+                    }
+
+                    let code = self.vm.frame().code_block.clone();
+                    if !self.vm.frame().jit_osr_closed() {
+                        match self.schedule_jit_loop_backedge(backend, &code, header_pc, old_pc) {
+                            InterpreterJitControl::Continue => {}
+                            InterpreterJitControl::Reschedule => {
+                                if self.vm.frame().jit_loop_hotness_saturated()
+                                    && !backend.observes_loop_backedges()
+                                    && !crate::jit::JitBackend::can_reenter_at_pc_zero(&code)
+                                {
+                                    self.vm.frame_mut().mark_jit_entry_attempted();
+                                    backend.record_dormant_loop_frame();
+                                }
                                 continue 'scheduler;
                             }
+                            InterpreterJitControl::Break(record) => return record,
                         }
+                    }
+
+                    if self.vm.frame().jit_loop_hotness_saturated()
+                        && self.vm.frame().jit_osr_closed()
+                        && !backend.observes_loop_backedges()
+                        && !crate::jit::JitBackend::can_reenter_at_pc_zero(&code)
+                    {
+                        self.vm.frame_mut().mark_jit_entry_attempted();
+                        backend.record_dormant_loop_frame();
+                        continue 'scheduler;
                     }
 
                     if self.vm.frame().pc == 0 && !self.vm.frame().jit_entry_attempted() {

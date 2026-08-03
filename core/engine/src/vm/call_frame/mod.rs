@@ -46,6 +46,12 @@ bitflags::bitflags! {
         /// later nonzero-PC backedges need only update aggregate counters.
         #[cfg(feature = "jit")]
         const JIT_LOOP_HOTNESS_SATURATED = 0b0100_0000;
+
+        /// This frame has completed its one loop-OSR decision. The flag is
+        /// independent of PC-zero entry admission and CodeBlock hotness so a
+        /// rejected or completed OSR attempt cannot disturb either policy.
+        #[cfg(feature = "jit")]
+        const JIT_OSR_CLOSED = 0b1000_0000;
     }
 }
 
@@ -289,6 +295,19 @@ impl CallFrame {
     pub(crate) fn mark_jit_loop_hotness_saturated(&mut self) {
         self.flags
             .insert(CallFrameFlags::JIT_LOOP_HOTNESS_SATURATED);
+    }
+
+    /// Whether this frame has closed its single loop-OSR decision.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_osr_closed(&self) -> bool {
+        self.flags.contains(CallFrameFlags::JIT_OSR_CLOSED)
+    }
+
+    /// Close this frame's loop-OSR decision without changing PC-zero entry or
+    /// `CodeBlock` hotness state.
+    #[cfg(feature = "jit")]
+    pub(crate) fn mark_jit_osr_closed(&mut self) {
+        self.flags.insert(CallFrameFlags::JIT_OSR_CLOSED);
     }
 }
 

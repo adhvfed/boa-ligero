@@ -1102,10 +1102,6 @@ struct CachedEntry {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum JitEntryPoint {
     Function,
-    #[allow(
-        dead_code,
-        reason = "constructed by the loop-OSR planner before scheduler wiring"
-    )]
     Loop {
         header_pc: u32,
         backedge_pc: u32,
@@ -1178,15 +1174,28 @@ enum LoopRegionAction {
     Suppressed(JitOsrSuppressionReason),
 }
 
-#[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "invoked and validated by the scheduler in Slice 4A1.4"
-)]
+/// Result of observing and, when ready, entering one exact loop region at the
+/// post-backedge scheduler boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JitLoopScheduleAction {
+    /// The exact region has not reached its independent hotness threshold.
+    Cold,
+    /// This frame must remain in the interpreter for the rest of its lifetime.
+    Closed,
+    /// Native execution returned a validated continuation or replay PC.
+    Resume,
+    /// Native execution stored a validated uncatchable completion in VM state.
+    Break,
+    /// Generated code returned a status inconsistent with immutable metadata.
+    Invalid,
+}
+
+#[derive(Clone)]
 struct LoopCachedEntry {
     compiled: native::CompiledLoopRegion,
     header_pc: u32,
     resume_pc: u32,
+    instruction_pcs: Box<[u32]>,
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -1237,10 +1246,14 @@ pub struct JitBackend {
     /// Bounded per-key loop hotness and terminal admission state. No generated
     /// loop entry can be invoked until the following scheduler slice.
     loop_regions: FxHashMap<JitCacheKey, LoopRegionState>,
-    /// Successfully compiled loop regions. The production scheduler has no
-    /// lookup or invocation edge until Slice 4A1.4; direct compiler tests use
-    /// a cfg(test)-only accessor below.
+    /// Successfully compiled loop regions invoked only at the validated
+    /// post-backedge scheduler boundary.
     loop_cache: FxHashMap<JitCacheKey, LoopCachedEntry>,
+    /// Immutable planner output retained only for the same bounded exact keys
+    /// as `loop_regions`. This avoids repeating CFG/liveness analysis on every
+    /// cold backedge while keeping code generation responsible for full-plan
+    /// revalidation.
+    loop_plans: FxHashMap<JitCacheKey, native::LoopRegionPlan>,
     loop_code_bytes: usize,
     loop_code_bytes_exhausted: bool,
     loop_compile_time_exhausted: bool,
@@ -1292,6 +1305,7 @@ impl JitBackend {
             cache: FxHashMap::default(),
             loop_regions: FxHashMap::default(),
             loop_cache: FxHashMap::default(),
+            loop_plans: FxHashMap::default(),
             loop_code_bytes: 0,
             loop_code_bytes_exhausted: false,
             loop_compile_time_exhausted: false,
@@ -1379,10 +1393,6 @@ impl JitBackend {
     /// New keys are retained only while the 64-state table has capacity.
     /// Once any global circuit breaker trips, unseen keys are rejected without
     /// allocating negative entries; already-retained keys remain queryable.
-    #[allow(
-        dead_code,
-        reason = "wired into the post-backedge scheduler in Slice 4A1.4"
-    )]
     fn observe_loop_region(&mut self, key: JitCacheKey) -> LoopRegionAction {
         debug_assert!(matches!(key.entry_point, JitEntryPoint::Loop { .. }));
         self.update_osr_counters(|counters| {
@@ -1465,7 +1475,6 @@ impl JitBackend {
         }
     }
 
-    #[allow(dead_code, reason = "called by the loop planner in Slice 4A1.4")]
     fn reject_loop_region(&mut self, key: JitCacheKey, reason: JitOsrRejectionReason) -> bool {
         let Some(state) = self.loop_regions.get_mut(&key) else {
             return false;
@@ -1478,12 +1487,7 @@ impl JitBackend {
         true
     }
 
-    /// Compile a proven loop plan into the bounded loop cache without adding
-    /// any production scheduler path that can invoke it.
-    #[allow(
-        dead_code,
-        reason = "called by the post-backedge scheduler in Slice 4A1.4"
-    )]
+    /// Compile a proven loop plan into the bounded loop cache.
     fn compile_loop_region(&mut self, code: &CodeBlock, plan: &native::LoopRegionPlan) -> bool {
         let key = plan.key;
         let JitEntryPoint::Loop { header_pc, .. } = key.entry_point else {
@@ -1518,6 +1522,7 @@ impl JitBackend {
                         compiled,
                         header_pc,
                         resume_pc: exit.resume_pc,
+                        instruction_pcs: plan.instruction_pcs.clone().into_boxed_slice(),
                     },
                 );
                 let Some(state) = self.loop_regions.get_mut(&key) else {
@@ -1536,10 +1541,236 @@ impl JitBackend {
 
     #[cfg(test)]
     fn compiled_loop_entry_for_test(&self, key: JitCacheKey) -> Option<LoopCachedEntry> {
-        self.loop_cache.get(&key).copied()
+        self.loop_cache.get(&key).cloned()
     }
 
-    #[allow(dead_code, reason = "called by the loop compiler in Slice 4A1.3")]
+    /// Observe one completed interpreter latch and, when its exact typed
+    /// region is ready, synchronously compile or invoke it. The caller owns
+    /// the post-`execute_one` boundary and must close the current frame's OSR
+    /// decision for every result except [`JitLoopScheduleAction::Cold`].
+    pub(crate) fn schedule_loop_backedge(
+        &mut self,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+        context: &mut Context,
+    ) -> JitLoopScheduleAction {
+        let budgeted = context.instruction_budget_remaining().is_some();
+        let diagnostic = self.diagnostics.is_some();
+        let i32_key = JitCacheKey::loop_region(
+            code.debug_id,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            budgeted,
+            diagnostic,
+        );
+        let f64_key = JitCacheKey::loop_region(
+            code.debug_id,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::F64,
+            budgeted,
+            diagnostic,
+        );
+
+        let mut new_plan = None;
+        let key = if self
+            .loop_plans
+            .get(&i32_key)
+            .is_some_and(|plan| Self::loop_live_ins_match(plan, context, true))
+        {
+            i32_key
+        } else if let Some(plan) = self.loop_plans.get(&f64_key) {
+            let all_i32 = Self::loop_live_ins_match(plan, context, true);
+            if !plan.requires_f64 && all_i32 {
+                let Ok(plan) = native::plan_loop_region(
+                    code,
+                    header_pc,
+                    backedge_pc,
+                    JitOsrRepresentation::I32,
+                    budgeted,
+                    diagnostic,
+                ) else {
+                    return JitLoopScheduleAction::Closed;
+                };
+                new_plan = Some(plan);
+                i32_key
+            } else if Self::loop_live_ins_match(plan, context, false) {
+                f64_key
+            } else {
+                self.record_loop_exit(JitExitKind::EntryRejected);
+                return JitLoopScheduleAction::Closed;
+            }
+        } else {
+            if matches!(
+                self.loop_regions.get(&f64_key),
+                Some(LoopRegionState {
+                    kind: LoopRegionStateKind::Rejected { .. }
+                        | LoopRegionStateKind::Suppressed { .. },
+                    ..
+                })
+            ) {
+                return JitLoopScheduleAction::Closed;
+            }
+            let f64_plan = match native::plan_loop_region(
+                code,
+                header_pc,
+                backedge_pc,
+                JitOsrRepresentation::F64,
+                budgeted,
+                diagnostic,
+            ) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    if !matches!(
+                        self.observe_loop_region(f64_key),
+                        LoopRegionAction::Suppressed(_)
+                    ) {
+                        self.reject_loop_region(f64_key, reason.into());
+                    }
+                    return JitLoopScheduleAction::Closed;
+                }
+            };
+            if !f64_plan.requires_f64 && Self::loop_live_ins_match(&f64_plan, context, true) {
+                let Ok(plan) = native::plan_loop_region(
+                    code,
+                    header_pc,
+                    backedge_pc,
+                    JitOsrRepresentation::I32,
+                    budgeted,
+                    diagnostic,
+                ) else {
+                    return JitLoopScheduleAction::Closed;
+                };
+                new_plan = Some(plan);
+                i32_key
+            } else if Self::loop_live_ins_match(&f64_plan, context, false) {
+                new_plan = Some(f64_plan);
+                f64_key
+            } else {
+                self.record_loop_exit(JitExitKind::EntryRejected);
+                return JitLoopScheduleAction::Closed;
+            }
+        };
+
+        let action = self.observe_loop_region(key);
+        if let Some(plan) = new_plan
+            && self.loop_regions.contains_key(&key)
+        {
+            self.loop_plans.entry(key).or_insert(plan);
+        }
+
+        match action {
+            LoopRegionAction::Cold => JitLoopScheduleAction::Cold,
+            LoopRegionAction::Compile => {
+                let Some(plan) = self.loop_plans.get(&key).cloned() else {
+                    self.reject_loop_region(key, JitOsrRejectionReason::UnprovenValue);
+                    return JitLoopScheduleAction::Closed;
+                };
+                if !self.compile_loop_region(code, &plan) {
+                    return JitLoopScheduleAction::Closed;
+                }
+                self.invoke_loop_region(key, context)
+            }
+            LoopRegionAction::Closed if self.loop_cache.contains_key(&key) => {
+                self.invoke_loop_region(key, context)
+            }
+            LoopRegionAction::Closed | LoopRegionAction::Suppressed(_) => {
+                JitLoopScheduleAction::Closed
+            }
+        }
+    }
+
+    fn loop_live_ins_match(
+        plan: &native::LoopRegionPlan,
+        context: &Context,
+        require_i32: bool,
+    ) -> bool {
+        let frame = context.vm.frame();
+        plan.entry.iter().all(|entry| {
+            context
+                .vm
+                .stack
+                .get_register(frame, entry.register as usize)
+                .is_some_and(|value| {
+                    if require_i32 {
+                        value.as_i32().is_some()
+                    } else {
+                        value.as_number().is_some()
+                    }
+                })
+        })
+    }
+
+    fn invoke_loop_region(
+        &mut self,
+        key: JitCacheKey,
+        context: &mut Context,
+    ) -> JitLoopScheduleAction {
+        let Some(cached) = self.loop_cache.get(&key) else {
+            return JitLoopScheduleAction::Closed;
+        };
+        let entry = cached.compiled.entry;
+        let header_pc = cached.header_pc;
+        let resume_pc = cached.resume_pc;
+        self.record_loop_entry();
+        context.vm.jit_exit_pending = None;
+        let status = entry(std::ptr::from_mut(context));
+
+        if status & JIT_BREAK_BIT != 0 {
+            let valid = context.vm.jit_pending.is_some()
+                && context.vm.jit_exit_pending.is_some_and(|exit| {
+                    exit.kind == JitExitKind::Budget
+                        && exit.reason == JitExitReason::RuntimeLimit
+                        && self
+                            .loop_cache
+                            .get(&key)
+                            .is_some_and(|cached| cached.instruction_pcs.contains(&exit.pc))
+                });
+            if !valid {
+                return JitLoopScheduleAction::Invalid;
+            }
+            self.record_loop_exit(JitExitKind::Budget);
+            return JitLoopScheduleAction::Break;
+        }
+
+        let Some(exit) = JitExit::decode(status) else {
+            return JitLoopScheduleAction::Invalid;
+        };
+        let valid = match exit.kind {
+            JitExitKind::EntryRejected => {
+                matches!(
+                    exit.reason,
+                    JitExitReason::EntryGuard | JitExitReason::ArgumentType
+                ) && exit.pc == header_pc
+                    && context.vm.frame().pc == header_pc
+            }
+            JitExitKind::Continuation => {
+                exit.reason == JitExitReason::LoopExit
+                    && exit.pc == resume_pc
+                    && context.vm.frame().pc == resume_pc
+            }
+            JitExitKind::Deopt => {
+                exit.reason == JitExitReason::IntegerOverflow
+                    && context.vm.frame().pc == exit.pc
+                    && self
+                        .loop_cache
+                        .get(&key)
+                        .is_some_and(|cached| cached.instruction_pcs.contains(&exit.pc))
+            }
+            JitExitKind::Return
+            | JitExitKind::Call
+            | JitExitKind::Completion
+            | JitExitKind::Budget => false,
+        };
+        if !valid {
+            return JitLoopScheduleAction::Invalid;
+        }
+        self.record_loop_exit(exit.kind);
+        JitLoopScheduleAction::Resume
+    }
+
     fn record_loop_compile_attempt(&mut self) {
         self.update_osr_counters(|counters| {
             counters.compile_attempts = counters.compile_attempts.saturating_add(1);
@@ -1549,7 +1780,6 @@ impl JitBackend {
     /// Account one completed native loop compile attempt and trip future-new-
     /// site circuit breakers after the unavoidable synchronous work. Failed
     /// lowering contributes time but never emitted-code bytes or compilations.
-    #[allow(dead_code, reason = "called by the loop compiler in Slice 4A1.3")]
     fn record_loop_compile_result(&mut self, compiled: bool, code_bytes: usize, compile_ns: u128) {
         if compiled {
             self.loop_code_bytes = self.loop_code_bytes.saturating_add(code_bytes);
@@ -1565,15 +1795,17 @@ impl JitBackend {
         });
     }
 
-    #[allow(dead_code, reason = "called by the loop scheduler in Slice 4A1.4")]
     fn record_loop_entry(&mut self) {
+        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         self.update_osr_counters(|counters| {
             counters.entries = counters.entries.saturating_add(1);
         });
     }
 
-    #[allow(dead_code, reason = "called by the loop scheduler in Slice 4A1.4")]
     fn record_loop_exit(&mut self, kind: JitExitKind) {
+        if kind == JitExitKind::Deopt {
+            self.stats.deopts = self.stats.deopts.saturating_add(1);
+        }
         self.update_osr_counters(|counters| match kind {
             JitExitKind::EntryRejected => {
                 counters.entry_rejections = counters.entry_rejections.saturating_add(1);
@@ -3149,12 +3381,16 @@ mod tests {
     }
 
     #[test]
-    fn context_owned_jit_latches_hot_nonzero_backedges_and_enters_on_next_call() {
+    fn context_owned_jit_enters_hot_nonzero_loop_and_reuses_osr_artifact() {
         let mut context = Context::default();
         context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 256,
+        });
         let definition = crate::Script::parse(
             crate::Source::from_bytes(
-                "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+                "function once(limit) { Math.abs(limit); let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
             ),
             None,
             &mut context,
@@ -3174,7 +3410,7 @@ mod tests {
         );
         let first_stats = context.jit_stats().expect("JIT was enabled");
         assert_eq!(first_stats.compilations, 0, "stats: {first_stats:?}");
-        assert_eq!(first_stats.native_entries, 0, "stats: {first_stats:?}");
+        assert_eq!(first_stats.native_entries, 1, "stats: {first_stats:?}");
         assert_eq!(first_stats.loop_backedges, 256, "stats: {first_stats:?}");
         assert_eq!(
             first_stats.hotness_threshold_crossings, 1,
@@ -3185,6 +3421,10 @@ mod tests {
             "stats: {first_stats:?}"
         );
         assert_eq!(first_stats.dormant_loop_frames, 1, "stats: {first_stats:?}");
+        assert_eq!(first_stats.osr.compilations, 1, "stats: {first_stats:?}");
+        assert_eq!(first_stats.osr.entries, 1, "stats: {first_stats:?}");
+        assert_eq!(first_stats.osr.continuations, 1, "stats: {first_stats:?}");
+        assert_eq!(first_stats.osr.deopts, 0, "stats: {first_stats:?}");
 
         let second =
             crate::Script::parse(crate::Source::from_bytes("once(1024)"), None, &mut context)
@@ -3201,11 +3441,218 @@ mod tests {
             second_stats.hotness_threshold_crossings, 1,
             "stats: {second_stats:?}"
         );
-        assert!(
-            second_stats.native_compilations >= 1,
+        assert_eq!(second_stats.compilations, 0, "stats: {second_stats:?}");
+        assert_eq!(
+            second_stats.native_compilations, 0,
             "stats: {second_stats:?}"
         );
-        assert!(second_stats.native_entries >= 1, "stats: {second_stats:?}");
+        assert_eq!(second_stats.native_entries, 2, "stats: {second_stats:?}");
+        assert_eq!(second_stats.loop_backedges, 256, "stats: {second_stats:?}");
+        assert_eq!(
+            second_stats.osr.compile_attempts, 1,
+            "stats: {second_stats:?}"
+        );
+        assert_eq!(second_stats.osr.compilations, 1, "stats: {second_stats:?}");
+        assert_eq!(second_stats.osr.entries, 2, "stats: {second_stats:?}");
+        assert_eq!(second_stats.osr.continuations, 2, "stats: {second_stats:?}");
+        assert_eq!(second_stats.osr.deopts, 0, "stats: {second_stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_keeps_below_threshold_loop_interpreted() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 4,
+        });
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } once(3)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(3)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.cache_requests, 3, "stats: {stats:?}");
+        assert_eq!(stats.osr.hotness_crossings, 0, "stats: {stats:?}");
+        assert_eq!(stats.osr.compile_attempts, 0, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_caches_distinct_i32_and_f64_osr_variants() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit, start) { Math.abs(limit); let total = start; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define function");
+
+        for (source, expected) in [("once(2, 0)", 1.0), ("once(2, 0.5)", 1.5)] {
+            let call = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                .expect("parse call");
+            assert_eq!(
+                call.evaluate(&mut context).expect("evaluate").as_number(),
+                Some(expected)
+            );
+        }
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.hotness_crossings, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.compile_attempts, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.compilations, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.entry_rejections, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_nonnumeric_frame_does_not_poison_cached_osr_variant() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit, start) { Math.abs(limit); let total = start; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define function");
+
+        for (source, expected) in [
+            ("once(2, 0)", JsValue::new(1)),
+            ("once(2, 'x')", JsValue::new(js_string!("x01"))),
+            ("once(2, 0)", JsValue::new(1)),
+        ] {
+            let call = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                .expect("parse call");
+            assert_eq!(call.evaluate(&mut context).expect("evaluate"), expected);
+        }
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.compile_attempts, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 2, "stats: {stats:?}");
+        assert_eq!(stats.osr.entry_rejections, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_replays_osr_i32_overflow_in_interpreter() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 2147483646; for (let i = 0; i < limit; i++) { total = total + 1; } return total; } once(2)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_number(),
+            Some(2_147_483_648.0)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.deopts, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 0, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_propagates_osr_loop_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        context.runtime_limits_mut().set_loop_iteration_limit(1);
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } once(10)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let error = script
+            .evaluate(&mut context)
+            .expect_err("native OSR loop must enforce the runtime limit");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 0, "stats: {stats:?}");
+        assert_eq!(stats.osr.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_osr_charges_exact_interpreter_instruction_budget() {
+        let source = "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } once(10)";
+        let run = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+                context.set_jit_thresholds(JitThresholds {
+                    function_entries: u32::MAX,
+                    loop_backedges: 1,
+                });
+            }
+            let script =
+                crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                    .expect("parse");
+            context.set_instruction_budget(1_000);
+            let result = script
+                .evaluate(&mut context)
+                .expect("budgeted evaluation")
+                .as_i32();
+            (
+                result,
+                context.instruction_budget_remaining(),
+                context.jit_stats(),
+            )
+        };
+
+        let interpreted = run(false);
+        let native = run(true);
+        assert_eq!(native.0, interpreted.0);
+        assert_eq!(native.1, interpreted.1);
+        let stats = native.2.expect("JIT was enabled");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 1, "stats: {stats:?}");
     }
 
     #[test]
@@ -3282,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_loop_diagnostics_classify_static_candidate_without_approving_osr() {
+    fn jit_loop_diagnostics_record_interpreted_prefix_before_osr() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let script = crate::Script::parse(
@@ -3303,12 +3750,16 @@ mod tests {
             .expect("diagnostics enabled");
         assert_eq!(snapshot.loop_records.len(), 1, "snapshot: {snapshot:?}");
         let record = &snapshot.loop_records[0];
-        assert_eq!(record.backedges, 1024, "record: {record:?}");
+        assert_eq!(record.backedges, 256, "record: {record:?}");
         assert_eq!(record.hotness_crossings, 1, "record: {record:?}");
         assert!(record.static_osr_candidate, "record: {record:?}");
         assert_eq!(record.static_osr_blocker, None, "record: {record:?}");
         assert_eq!(record.first_blocking_opcode, None, "record: {record:?}");
         assert!(record.region_instructions > 0, "record: {record:?}");
+        assert_eq!(snapshot.osr.compilations, 1, "snapshot: {snapshot:?}");
+        assert_eq!(snapshot.osr.entries, 1, "snapshot: {snapshot:?}");
+        assert_eq!(snapshot.osr.continuations, 1, "snapshot: {snapshot:?}");
+        assert_eq!(snapshot.osr.deopts, 0, "snapshot: {snapshot:?}");
 
         let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
         assert!(!serialized.contains("once"));
@@ -3826,6 +4277,52 @@ mod tests {
         assert_eq!(backend.stats().osr.compilations, 0);
         assert_eq!(backend.stats().osr.code_bytes, 0);
         assert_eq!(backend.stats().osr.rejections.lowering, 1);
+    }
+
+    #[test]
+    fn jit_loop_scheduler_rejects_status_outside_cached_metadata() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::F64,
+            false,
+            false,
+        )
+        .expect("selected loop plan");
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Compile
+        );
+        assert!(backend.compile_loop_region(&code, &plan));
+        backend
+            .loop_cache
+            .get_mut(&plan.key)
+            .expect("compiled cache entry")
+            .resume_pc = plan.exits[0].resume_pc.saturating_add(1);
+
+        let mut context = Context::default();
+        push_loop_test_frame(&mut context, code);
+        context.vm.frame_mut().pc = header_pc;
+        context.vm.set_register(1, JsValue::new(0.5));
+        context.vm.set_register(2, JsValue::new(2));
+        context.vm.set_register(4, JsValue::new(0));
+        context.active_jit_backend_id = backend.id();
+        assert_eq!(
+            backend.invoke_loop_region(plan.key, &mut context),
+            JitLoopScheduleAction::Invalid
+        );
+        context.active_jit_backend_id = 0;
+        context.vm.pop_frame();
     }
 
     #[test]
