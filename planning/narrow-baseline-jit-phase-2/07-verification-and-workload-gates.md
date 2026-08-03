@@ -169,6 +169,14 @@ deopts, and at least a 2× median speedup including synchronous compilation. The
 but high enough to reject an OSR path whose scheduler/materialization overhead
 erases most of the measured opportunity.
 
+**Cold-OSR admission passed 2026-08-03:** Boa `229ac2e4` adds the isolated
+mode. Seven alternating pairs preserve the sink and record exactly one OSR
+compile/entry/continuation, zero whole-function artifacts, and zero deopts per
+sample. Median elapsed time is 6.120 ms including 0.418 ms compilation versus
+28.078 ms interpreted, a 4.588× speedup. The wider rollback matrix remains
+open. See the
+[admission checkpoint](26-slice-4a1-osr-admission-checkpoint-2026-08-03.md).
+
 ### Gate H — hot-but-unentered tiering
 
 With zero compilations and zero native entries, enabling the tier must remain

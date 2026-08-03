@@ -398,18 +398,18 @@ Land the shape through these independently reversible boundaries:
      ready-key-at-capacity behavior across state/plan/artifact maps. Invalid
      loop state disables the compromised backend, unwinds to the base frame,
      clears paired pending state, and leaves later interpreter execution usable.
-   - **4A1.5c, performance/browser:** seven order-alternating cold one-shot
-     pairs must preserve the sink and deliver at least a 2× median speedup with
-     exactly one expected OSR compile/entry. First add a measurement-only
-     production-threshold cold-OSR runner mode: it must execute no warmup,
-     threshold-1 PC-zero control, or prior native compilation in that process,
-     and must print whole-function plus OSR counters after the timed call. Keep
-     the existing runner mode unchanged for baseline comparison. Re-run the
-     checksummed Decision-A micro/engine/W0 matrix with diagnostics off for
-     timings; every negative row remains within 5%, and W0 retains exact sink/
-     paint/accounted-byte structure, its PC-zero entry, and at least a 20%
-     paired cold-load win. Diagnostics run separately and must have zero
-     dropped records. Record release-binary hashes and raw samples.
+   - **4A1.5c, performance/browser:** **measurement preflight and cold one-shot
+     admission complete in Boa `229ac2e4`.** The new `osr-cold` mode executes
+     no warmup, threshold-1 PC-zero control, or prior native compilation and
+     prints whole-function plus OSR counters. Seven alternating pairs preserve
+     the sink, record one OSR compile/entry and zero whole-function artifacts,
+     and measure 6.120 ms OSR versus 28.078 ms interpreter medians: 4.588×
+     including compilation, above the required 2× floor. **Rollback matrix
+     remains:** re-run the checksummed Decision-A micro/engine/W0 matrix with
+     diagnostics off for timings; every negative row remains within 5%, and W0
+     retains exact sink/paint/accounted-byte structure, its PC-zero entry, and
+     at least a 20% paired cold-load win. Diagnostics run separately and must
+     have zero dropped records. Record release-binary hashes and raw samples.
 
    Any 4A1.5 failure reverts or disables only `55701ef4`'s scheduler edge while
    retaining the unreachable planner/compiler for diagnosis. It blocks 4A1.R,
