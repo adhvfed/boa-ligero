@@ -224,6 +224,39 @@ test(jit): attribute hot execution boundaries
 feat(jit): project boundary diagnostics to ligero
 ```
 
+### Slice 3A1 — interpreted loop sites (complete)
+
+Boa `0233f60f` and Ligero `48573227` add and project schema-6 loop records.
+The eligible and bitwise-ineligible one-shot controls retain exact 2,000,000-
+backedge evidence in explicit diagnostics, including observations after a
+frame becomes dormant, while diagnostics-disabled medians remain inside Gate
+H's 5% parity bound. Static candidacy is not OSR approval. See the
+[dated checkpoint](17-slice-3a-loop-attribution-2026-08-03.md).
+
+### Slice 3A2 — storage attribution (scheduled)
+
+Land interpreted storage-site attribution first. Observe only coarse named,
+dense, computed, and specialized-length categories plus the pre-operation
+state of Boa's existing named/dense inline caches. The observer must not run a
+key conversion or any user-visible operation and must retain no key, name,
+value, object, shape, source, URL, or pointer.
+
+Then add fixed native guard/load aggregates through a distinct diagnostic
+artifact variant. A typed cache key must separate budget mode from diagnostic
+instrumentation; diagnostics-disabled execution must select the production
+artifact and helper ABI with no new counter update. Keep interpreted sites
+bounded with dropped-observation accounting and native counts fixed-size.
+
+**Stop/go:** exact named/dense hit and miss controls, computed/length not-
+applicable controls, dormant denied frames, zero/default/max caps, source-free
+serialization, guard-miss replay, finite budgets, GC, feature-disabled builds,
+and diagnostics-disabled parity all pass. Project schema 7 through Ligero only
+after the engine contract is stable.
+
+After these two behavior slices, land a separately revertible behavior-neutral
+refactor before the matrix rerun. Prefer typed cache-key/profiling plumbing if
+it was not already isolated as the diagnostic-variant prerequisite.
+
 ## Slice 3B — hot-but-unentered tier guardrail (complete)
 
 Add a durable one-shot numeric fixture and a separate ineligible-loop control.
@@ -259,7 +292,7 @@ perf(jit): bound hot nonzero backedge bookkeeping
 
 ## Decision checkpoint A — choose the next boundary
 
-After completing the remaining loop/storage portion of Slice 3A, re-run the
+After completing the remaining storage portion of Slice 3A, re-run the
 fixed matrix and rank attributable lost time:
 
 1. interpreted one-shot loop work after the PC-zero opportunity;

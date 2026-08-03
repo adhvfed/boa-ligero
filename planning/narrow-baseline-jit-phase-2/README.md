@@ -29,8 +29,11 @@ schema 5: the fixed flat and method controls are dynamically monomorphic, but
 their targets are not native-cached. Slice 3B now closes the dormant-tier
 guardrail: eligible and statically ineligible one-shot loops are within 0.94%
 of interpreter medians with zero artifacts, while explicit diagnostics retain
-exact 2,000,000-backedge evidence. Loop/storage attribution remains ahead of
-any execution ABI decision.
+exact 2,000,000-backedge evidence. Loop attribution has now landed in schema 6
+with exact diagnostics-only evidence and a conservative static OSR-candidacy
+screen. Storage attribution remains ahead of any execution ABI decision; its
+interpreted-site records and native-helper aggregates are deliberately
+separate so production artifacts pay no diagnostic counter cost.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -110,8 +113,10 @@ Every Phase 2 entry and exit ABI inherits that rule.
    bounded schema-5 call attribution. **Gate H complete:** Boa `d64fe095` and
    `cc07a908` replace unbounded/map-backed hotness with generation-scoped state
    and a dormant-frame transition; Ligero `6594d5a2` projects the counters.
-   Complete loop/storage attribution, re-run the same matrix, then select
-   exactly one execution ABI.
+   **Loop attribution complete:** Boa `0233f60f` and Ligero `48573227` add and
+   project bounded schema-6 loop-site evidence while preserving Gate H. Finish
+   the two-part storage attribution contract, re-run the same matrix, then
+   select exactly one execution ABI.
 10. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
@@ -170,6 +175,9 @@ showing that another boundary dominates.
   — generation-scoped hotness, the dormant-frame transition, exact-versus-
   bounded counter semantics, paired release measurements, and the remaining
   attribution work before an ABI decision.
+- [Slice 3A loop-attribution checkpoint, 2026-08-03](17-slice-3a-loop-attribution-2026-08-03.md)
+  — schema-6 interpreted loop evidence, diagnostics-off parity, and the
+  refined two-part storage-attribution contract before Decision checkpoint A.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

@@ -36,6 +36,13 @@ If the helper path is already below the workload budget, keep it. Direct loads
 are justified only when they remove a measured hot cost without making guard
 or invalidation behavior fragile.
 
+Helper attribution must not perturb the path it is intended to measure. Count
+native named/dense guard hits, misses, and successful loads only in a distinct
+diagnostic artifact/cache variant. The ordinary production artifact and its
+helper ABI receive no diagnostic counter update. Interpreted-site telemetry is
+separately bounded and records only coarse operation kind plus existing cache
+state before execution; it must not perform conversion or invoke user code.
+
 ## Dense element direct load
 
 The first direct dense load must prove:
