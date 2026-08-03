@@ -49,9 +49,15 @@ diagnostics, capacity/circuit-breaker policy, and the entry/continuation exit
 taxonomy. Neither slice can emit or invoke a loop artifact. Slice 4A1.3 is the
 now complete in Boa `c2885afe`: a separate uniform-mode region compiler
 strictly guards planned live-ins, preserves exact budget/replay state, and
-materializes its validated continuation. Its bounded cache remains unreachable
-from the production scheduler. Slice 4A1.4 is next: connect that artifact only
-at the reviewed post-backedge ownership boundary.
+materializes its validated continuation. Boa `55701ef4` now completes Slice
+4A1.4's production wiring at the reviewed post-backedge ownership boundary. A
+separate per-frame OSR decision, exact cached-metadata validation, and dormant-
+dispatch handoff make the first numeric shape reachable without changing
+opcode eligibility. Slice 4A1 is not closed yet: 4A1.5 must complete the exact
+boundary differential, security/cache containment, fixed performance matrix,
+and browser rollback gates before the scheduler edge is accepted. The
+separately revertible 4A1.R refactor remains mandatory after that gate and
+before Decision checkpoint B.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -151,7 +157,13 @@ Every Phase 2 entry and exit ABI inherits that rule.
     `c2885afe` revalidates the immutable plan, emits guarded uniform-mode loop
     artifacts, and proves entry rejection, continuation materialization,
     finite-budget/replay behavior, and terminal uncached rejection through a
-    direct harness. **Next:** Slice 4A1.4's exact post-backedge invocation edge.
+    direct harness. **Scheduler wiring complete:** Boa `55701ef4` observes the
+    already charged latch, compiles or reuses the exact bounded artifact,
+    enters it under strict live-frame guards, validates every returned status
+    and PC against immutable metadata, and closes one independent OSR decision
+    per frame. **Next:** Slice 4A1.5's verification-only differential,
+    containment, and fixed workload gate; then the behavior-neutral 4A1.R
+    refactor.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -228,6 +240,10 @@ showing that another boundary dominates.
   — the guarded uniform-mode compiler, direct entry/exit harness, exact replay
   and continuation evidence, negative-zero correction, and the remaining
   production non-invocation boundary before Slice 4A1.4.
+- [Slice 4A1 scheduler checkpoint and gate refinement, 2026-08-03](23-slice-4a1-scheduler-checkpoint-2026-08-03.md)
+  — the landed post-backedge invocation edge, production integration evidence,
+  independently reviewed residual risks, and the falsifiable 4A1.5
+  differential/cache/browser rollback gate.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

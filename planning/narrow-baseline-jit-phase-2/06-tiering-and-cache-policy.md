@@ -20,10 +20,15 @@ EntryKind::LoopOsr { header_pc }
 EntryKind::CompiledCall { call_site_pc, target_code_id }
 ```
 
-A key must include realm/runtime identity, code-block identity, entry PC/kind,
-bytecode/ABI version, and the feedback/representation signature that generated
-the assumptions. `debug_id` is useful for diagnostics but is not by itself a
-cross-context ownership contract.
+A key must include every assumption that can vary during the owning backend's
+lifetime. For the first loop-OSR shape this is exactly the runtime-local
+CodeBlock ID, header, canonical latch, uniform numeric representation,
+finite-budget mode, and diagnostic mode. The context-owned backend generation
+and generated entry guard provide runtime/realm isolation, and current
+CodeBlock identity is revalidated at invocation. `debug_id` is never a
+cross-context or cross-process ownership contract. Future mutable feedback or
+bytecode-version assumptions must extend the relevant entry key before the
+artifact can be shared under them.
 
 Each entry records native coverage, code size, compile time, assumptions,
 entry/exit counters, and a reason it was rejected or evicted. The backend owns
@@ -94,9 +99,15 @@ within 0.94% of interpreter medians with zero artifacts and entries. Later
 PC-zero invocation remains eligible and is covered by a native-entry test. See
 the [Gate H closure](16-slice-3b-gate-h-closure-2026-08-03.md).
 
-The first version can use a small bounded cache and no eviction if measurements
-show acceptable memory growth. Add an explicit size/count limit before enabling
-the tier for long-lived browser sessions.
+The first loop-OSR version retains at most 64 exact region states and their
+associated immutable plans/artifacts, with no eviction. Unseen keys are
+allocation-free suppressed when the table is full, while already retained
+ready keys remain usable. The 1 MiB emitted-loop-code and 10 ms compile-time
+limits are post-attempt circuit breakers, not physical-memory or latency caps:
+the unavoidable completed attempt may cross them, after which later unseen
+work is suppressed. Slice 4A1.5 must prove those bounds through the production
+scheduler, including that state, plan, and artifact maps cannot diverge in
+cardinality or retain a suppressed 65th key.
 
 ## Cold-start policy
 
@@ -135,10 +146,12 @@ with bounded entry count, followed by explicit safe-point eviction later.
 ## Tests and gate
 
 Test cache identity across realms and contexts, duplicate compilation
-suppression, rejected-code suppression, variant replacement, backend drop,
-threshold overrides, cache limits, and cold-start accounting. The policy gate
-is met when the selected threshold wins on the complete workload, not only on
-the hottest inner loop.
+suppression, dynamic representation misses without permanent variant
+poisoning, rejected-code suppression, backend drop, threshold overrides,
+cache limits, and cold-start accounting. Exercise diagnostic on/off, I32/F64,
+and budgeted/unbudgeted variants through the production scheduler and prove
+they cannot alias. The policy gate is met when the selected threshold wins on
+the complete workload, not only on the hottest inner loop.
 
 The existing `(code debug ID, budget mode)` key is sufficient only for Phase 1
 PC-zero entries. The first Phase 2 artifact with a different entry PC or

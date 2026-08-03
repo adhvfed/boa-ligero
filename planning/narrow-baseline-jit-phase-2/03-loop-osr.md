@@ -25,16 +25,24 @@ themselves, justify OSR.
 
 ## Region identity
 
-An OSR entry is not the same artifact as a function entry. Key it by:
+An OSR entry is not the same artifact as a function entry. The first-shape
+artifact uses this exact backend-owned key:
 
 ```text
-(realm identity,
- CodeBlock identity,
+(CodeBlock runtime-local ID,
  loop-header PC,
  latch/backedge PC,
- bytecode/ABI version,
- feedback/representation signature)
+ uniform I32/F64 representation,
+ finite-budget mode,
+ diagnostic mode)
 ```
+
+The context-owned backend and its generation guard provide runtime/realm and
+machine-code lifetime isolation. Runtime-local CodeBlock IDs are monotonic for
+that backend lifetime, current CodeBlock identity is rechecked at entry, and
+no artifact is shared across backends or processes. A future entry kind that
+depends on mutable feedback or bytecode versions must add those assumptions to
+its key; 4A1 has neither and must not imply a broader sharing contract.
 
 The entry metadata must record:
 
@@ -60,8 +68,9 @@ Start with loops that satisfy all of these conditions:
   mutation in the region;
 - no calls, allocations, host callbacks, or property writes in the first OSR
   region;
-- all loop-carried values are local registers with a complete `I32`, `F64`, or
-  boxed-stack representation;
+- all loop-carried native values are local registers with a complete uniform
+  `I32` or `F64` representation; untouched boxed values may remain only in
+  proven preserved VM slots and are never loaded into the first native region;
 - the loop condition and backedge are supported native branches;
 - loop and instruction budgets can be charged at the same frequency as the
   interpreter.
@@ -73,15 +82,17 @@ returns to the interpreter rather than being partially entered.
 
 At a safe interpreter backedge boundary:
 
-1. record the backedge and inspect the region cache;
-2. if no entry exists, queue a compile request without borrowing the backend
-   from inside a partially executed helper;
-3. after the current operation completes and the VM owns a stable frame
-   boundary, take the backend, compile synchronously, restore ownership, and
-   install the entry;
-4. materialize the live frame state and set the header PC;
-5. run the entry guard against the current frame and feedback signature;
-6. enter native code or continue interpreting on a miss.
+1. let the interpreter charge and complete the canonical latch;
+2. return to the scheduler-owned post-`execute_one` boundary and inspect the
+   exact bounded region state/plan/artifact key;
+3. when the exact key becomes hot, compile synchronously while the scheduler
+   owns both the backend and stable current frame and no helper is in flight;
+4. install only a complete artifact, then invoke either it or an already cached
+   exact variant from the same boundary;
+5. repeat the backend/code/header/frame/budget/representation entry guards in
+   generated code before loading any native live-in; and
+6. enter native code or close only this frame's OSR decision and continue in
+   the interpreter on a dynamic miss.
 
 The native entry must never assume that the interpreter's previous iteration
 left values in Cranelift registers. Every OSR value comes from the VM stack or
@@ -130,7 +141,9 @@ Add tests for:
 
 - a one-shot loop that reaches OSR and returns the expected value;
 - zero-iteration and one-iteration loops;
-- type change in an induction variable and guard failure at the header;
+- type change in an induction variable, guard failure at the header, and a
+  numeric → nonnumeric → numeric sequence proving one frame cannot poison a
+  reusable numeric artifact;
 - loop and instruction limits during native execution;
 - exception propagation and forced GC around an OSR helper;
 - recursion and nested ordinary frames;

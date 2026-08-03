@@ -35,9 +35,24 @@ interpreter as the reference implementation.
 
 - one-shot loop entry from an interpreter backedge;
 - loop header guard miss and representation change;
-- budget/limit exhaustion during native iterations;
+- cold-compile and cache-hit budget exhaustion one instruction before, at, and
+  one after OSR entry, the first native header opcode, the loop-iteration poll,
+  each pre-effect replay guard, and the external conditional exit; compare
+  remaining budget, sink, completion/error, PC ownership, and OSR counters to
+  the interpreter;
+- unbudgeted then budgeted execution of the same loop, proving distinct cache
+  variants and zero JavaScript budget charge for compilation/entry guards;
+- loop-limit exhaustion during native iterations;
 - exception handler entry after a native helper;
-- forced GC, recursion, nested frames, and host re-entry fallback.
+- forced GC before compile, after compile, before a cache hit, and after native
+  return; recursion, nested frames, and host re-entry fallback;
+- 64 scheduler-reached region keys plus a suppressed 65th unseen key, ready-key
+  reuse at capacity, and no state/plan/artifact retention for the suppressed
+  key;
+- invalid status classes and resume PCs, absent or mismatched pending
+  completion, and stale backend/code/frame/budget guards. The scheduler must
+  never resume at page-controlled metadata, must clear paired pending native
+  state, and must surface the documented engine error.
 
 ### Compiled calls
 
@@ -119,6 +134,27 @@ segments. See the [Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
 A one-shot hot loop enters native code from an interpreter backedge and passes
 all budget, exception, GC, and guard-failure tests.
 
+**Implementation checkpoint 2026-08-03:** Boa `55701ef4` reaches a guarded
+numeric loop from the production post-backedge scheduler, reuses its exact
+artifact in a later frame, preserves a generous-budget control, replays I32
+overflow, propagates the loop limit, rejects a nonnumeric frame without
+poisoning the numeric variant, and validates returned PCs against immutable
+cache metadata. This is necessary but not sufficient for Gate O: the exact
+boundary matrix, scheduler-level malformed-status containment, production
+cache saturation, forced-GC/nested-frame cases, and fixed workload timing are
+Slice 4A1.5 and remain open.
+
+4A1.5 is verification-only: it may add tests, harness controls, measurement
+records, and a direct rollback of 4A1.4, but no opcode widening, threshold
+tuning, new representation, cache-policy redesign, or second execution ABI.
+For the durable 2,000,000-backedge one-shot control, run seven fresh-process,
+order-alternating interpreter/JIT pairs with one cold call and diagnostics off.
+Require identical sink, exactly one OSR compilation and entry, zero unexpected
+deopts, and at least a 2× median speedup including synchronous compilation. The
+2× floor is deliberately below the recorded 3.96× whole-body counterfactual
+but high enough to reject an OSR path whose scheduler/materialization overhead
+erases most of the measured opportunity.
+
 ### Gate H — hot-but-unentered tiering
 
 With zero compilations and zero native entries, enabling the tier must remain
@@ -154,6 +190,19 @@ rank unsupported bytecode, OSR, call, or storage costs. Before default
 enablement, **W2, representative breadth** requires stable wins or a documented
 neutral result across the agreed bundle/site set, with diagnostics disabled in
 headline timings.
+
+Slice 4A1.5 repeats the exact Decision-checkpoint-A matrix: seven micro
+controls plus the eligible/ineligible one-shot controls, Crypto, DeltaBlue,
+Earley-Boyer, and W0. Use the recorded fresh-process/interleaved protocol and
+checksummed inputs; diagnostics remain off for headline timing and run in a
+separate process for counters. Every noncandidate/negative row must preserve
+its sink and remain within 5% of its paired JIT-off median. W0 must preserve
+its sink, 387 display items, 258 paint segments, 8,159,754 accounted bytes,
+PC-zero native entry, and at least a 20% paired cold-load win (the recorded
+baseline is 30.521%). Any failure disables or reverts the 4A1.4 scheduler edge
+while retaining the unreachable planner/compiler for diagnosis; it blocks
+4A1.R, Decision checkpoint B, and every second execution ABI. Passing this
+matrix still does not satisfy W2 or authorize default JIT/remote-script use.
 
 **Decision checkpoint A now satisfies the selection form of Gate P for one
 narrow branch.** Schema 7 plus corrected 4,096-record runner controls retain

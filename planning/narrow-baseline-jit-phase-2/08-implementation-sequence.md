@@ -369,14 +369,42 @@ Land the shape through these independently reversible boundaries:
    I32 overflow and finite-budget replay, negative-zero multiplication,
    malformed-plan terminal rejection, and rejection of a cold exact key. The
    bounded cache still has no production lookup or invocation edge.
-4. **4A1.4 — exact post-backedge scheduler wiring.** Observe the already
-   charged canonical latch, compile synchronously at the reviewed safe
-   boundary, invoke only a complete cached artifact, and use a separate
-   per-frame OSR attempted/closed flag. Rejection must preserve dormant
-   dispatch and ordinary PC-zero entry behavior.
-5. **4A1.5 — differential and workload gate.** Close representation, replay,
-   continuation, budget, loop-limit, GC, recursion, cache-capacity, negative
-   parity, W0, and fixed-matrix evidence before calling Slice 4A1 complete.
+4. **4A1.4 — exact post-backedge scheduler wiring (complete, Boa
+   `55701ef4`).** The production scheduler observes the already charged
+   canonical latch, compiles synchronously at the reviewed safe boundary, and
+   invokes only a complete cached artifact. A separate per-frame closed flag
+   preserves PC-zero admission and dormant dispatch; returned continuation,
+   replay, and runtime-limit status is validated against immutable cached PCs
+   before scheduler handoff. Production tests prove first-call entry, later-
+   frame cache reuse, below-threshold interpretation, distinct I32/F64
+   variants, nonnumeric frame-local rejection without variant poisoning, I32
+   overflow replay, loop-limit propagation, and one generous exact-budget
+   comparison. Gate O remains open until 4A1.5.
+5. **4A1.5 — verification-only differential and workload gate.** Change no
+   opcode eligibility, representation, threshold, cache policy, or execution
+   ABI. Close these independently reviewable evidence groups:
+   - **4A1.5a, semantic/accounting:** cold-compile and cache-hit interpreter
+     differential at one instruction before/at/after OSR entry, first native
+     header opcode, `IncrementLoopIteration`, each pre-effect replay guard, and
+     the external exit; unbudgeted→budgeted variant separation; exact loop-
+     limit/error/remaining-budget/PC/sink state.
+   - **4A1.5b, containment/lifetime:** forced GC around compile/cache entry/
+     return, recursion and nested frames, dynamic representation change,
+     malformed status/resume/pending-completion containment, stale guard
+     rejection, and 64 scheduler-reached keys plus suppressed 65th-key and
+     ready-key-at-capacity behavior across state/plan/artifact maps.
+   - **4A1.5c, performance/browser:** seven order-alternating cold one-shot
+     pairs must preserve the sink and deliver at least a 2× median speedup with
+     exactly one expected OSR compile/entry. Re-run the checksummed Decision-A
+     micro/engine/W0 matrix with diagnostics off for timings; every negative
+     row remains within 5%, and W0 retains exact sink/paint/accounted-byte
+     structure, its PC-zero entry, and at least a 20% paired cold-load win.
+     Diagnostics run separately and must have zero dropped records.
+
+   Any 4A1.5 failure reverts or disables only `55701ef4`'s scheduler edge while
+   retaining the unreachable planner/compiler for diagnosis. It blocks 4A1.R,
+   Decision checkpoint B, and every second ABI. Passing does not authorize
+   default JIT or remote-script execution.
 6. **4A1.R — behavior-neutral refactor.** After the behavior gate, consolidate
    exactly one repeated seam among typed entry keys, materialization emission,
    and exit mapping in a separately revertible commit. Re-run the focused JIT
@@ -395,8 +423,16 @@ revise the ABI rather than folding the exception into scheduler wiring.
 fractional-accumulator result and exact path-specific continuation state,
 proves budget and loop-state materialization at native exits, and leaves
 malformed or cold plans uncached. The complete engine suite remains green and
-strict Clippy has no slice-local delta. 4A1.4 may now add only the reviewed
-production invocation edge.
+strict Clippy has no slice-local delta. This authorized only the reviewed
+production invocation edge now landed by `55701ef4`.
+
+**4A1.4 implementation checkpoint: passed, Gate O still open.** The production
+edge enters and reuses one exact region with validated exits; 66 focused JIT
+tests pass with one ignored benchmark, the full JIT-feature engine library
+passes 1,211 tests with one ignored, feature-disabled/JIT checks pass, and
+strict all-target Clippy has no slice-local delta beyond the 16 recorded
+findings. This establishes the wiring, not the exhaustive boundary or workload
+gate scheduled in 4A1.5.
 
 **Slice 4A1 stop/go:** a one-shot hot loop must show OSR execution and pass the
 full OSR test set; otherwise leave OSR disabled and diagnose the
@@ -405,7 +441,6 @@ materialization gap.
 Remaining suggested commits:
 
 ```text
-perf(jit): enter hot loop regions with guarded OSR
 test(jit): close loop OSR differential gates
 refactor(jit): consolidate loop region exit plumbing
 ```
