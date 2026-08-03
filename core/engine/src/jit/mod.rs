@@ -4927,6 +4927,34 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_osr_preserves_untouched_registers_across_overflow_deopt() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit, tag) { Math.abs(limit); let total = 2147483646; for (let i = 0; i < limit; i++) { total = total + 1; } return tag; } once(2, 'keep')",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate"),
+            JsValue::new(js_string!("keep")),
+            "an integer-overflow deopt must not overwrite a register the region never defined"
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.deopts, 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_propagates_osr_loop_limit() {
         let mut context = Context::default();
         context.enable_jit();
@@ -5675,6 +5703,45 @@ mod tests {
                 .iter()
                 .all(|entry| entry.register != preserved.register),
             "an untouched exit-only register must not be loaded into native state"
+        );
+    }
+
+    /// The budget-exhaustion and loop-iteration-limit exits raise engine errors,
+    /// so their frame state is not observable from JavaScript. They share the
+    /// planner's per-instruction write-back set with the integer-overflow deopt,
+    /// so the set itself is asserted here.
+    #[test]
+    fn jit_loop_planner_excludes_untouched_registers_from_mid_region_exits() {
+        let code = first_function_code(
+            "function preserve(limit, result) { let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return result; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            true,
+            false,
+        )
+        .expect("numeric loop has a provable exit map");
+
+        let preserved = plan.exits[0]
+            .materialize
+            .iter()
+            .find(|value| value.source == native::LoopExitSource::PreservedVmValue)
+            .expect("the returned argument is untouched by the native region");
+        assert_eq!(plan.available.len(), plan.instruction_pcs.len());
+        for (index, registers) in plan.available.iter().enumerate() {
+            assert!(
+                !registers.contains(&preserved.register),
+                "a mid-region exit at index {index} must leave register {} in the VM frame: {registers:?}",
+                preserved.register
+            );
+        }
+        assert!(
+            plan.available.iter().any(|registers| !registers.is_empty()),
+            "the induction and accumulator registers must still be written back"
         );
     }
 

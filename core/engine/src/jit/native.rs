@@ -250,6 +250,15 @@ pub(super) struct LoopRegionPlan {
     pub(super) instruction_pcs: Vec<u32>,
     pub(super) entry: Vec<LoopEntryValue>,
     pub(super) exits: Vec<LoopExitMap>,
+    /// Per region instruction, the registers a mid-region exit must write back
+    /// to the VM frame before the interpreter resumes at that same bytecode.
+    ///
+    /// Every other register is deliberately left alone: it either holds no
+    /// native definition on any path that reaches the instruction, or it is
+    /// dead there, so the VM frame already owns the value the interpreter will
+    /// observe. Writing those registers would replace live non-numeric frame
+    /// values with a numeric zero.
+    pub(super) available: Vec<Vec<u32>>,
     pub(super) requires_f64: bool,
 }
 
@@ -424,6 +433,27 @@ pub(super) fn plan_loop_region(
         });
     }
 
+    // A mid-region exit resumes the interpreter at the very bytecode it left,
+    // so the only registers it may write back are the ones that are live there
+    // *and* carry a native definition. A register that is live at the exit but
+    // never defined by the region has no native definition to write; a register
+    // the region defines but that is dead at the exit has nothing the
+    // interpreter can observe. Both are left in the VM frame untouched.
+    //
+    // Every register in this set provably has a definition reaching the
+    // instruction: if it were only defined on some paths, the undefined path
+    // would make it live at the region entry, which would have placed it in
+    // `entry_registers` and given it a guarded prologue load.
+    let available = live_in
+        .iter()
+        .map(|live| {
+            live.iter()
+                .filter(|register| entry_registers.contains(register) || defined.contains(register))
+                .map(|register| *register as u32)
+                .collect()
+        })
+        .collect();
+
     Ok(LoopRegionPlan {
         key: JitCacheKey::loop_region(
             code.debug_id,
@@ -443,6 +473,7 @@ pub(super) fn plan_loop_region(
             resume_pc: resume_pc as u32,
             materialize,
         }],
+        available,
         requires_f64,
     })
 }
@@ -2776,14 +2807,19 @@ impl<'a> LoopRegionCompiler<'a> {
         for index in 0..self.region.len() {
             let instruction = self.region[index].clone();
             bcx.switch_to_block(code_blocks[index]);
-            if self.plan.key.budgeted {
-                self.emit_budget_guard(&mut bcx, ctx, &helpers, instruction.pc);
+            if self.plan.key.budgeted
+                && self
+                    .emit_budget_guard(&mut bcx, ctx, &helpers, instruction.pc, index)
+                    .is_none()
+            {
+                return Ok(None);
             }
             let Some(()) = self.emit_instruction(
                 &mut bcx,
                 ctx,
                 &helpers,
                 &instruction,
+                index,
                 &code_blocks,
                 loop_exit,
             ) else {
@@ -2971,7 +3007,8 @@ impl<'a> LoopRegionCompiler<'a> {
         ctx: cranelift_codegen::ir::Value,
         helpers: &LoopHelpers,
         pc: usize,
-    ) {
+        index: usize,
+    ) -> Option<()> {
         let helper = bcx.ins().iconst(
             helpers.ptr,
             helpers.consume_instruction_budget.address as i64,
@@ -2989,17 +3026,20 @@ impl<'a> LoopRegionCompiler<'a> {
         let continuation = bcx.create_block();
         bcx.ins().brif(failed, failed_block, &[], continuation, &[]);
         bcx.switch_to_block(failed_block);
-        self.emit_available_materialization(bcx, ctx, helpers);
+        self.emit_available_materialization(bcx, ctx, helpers, index)?;
         bcx.ins().return_(&[status]);
         bcx.switch_to_block(continuation);
+        Some(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_instruction(
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
         helpers: &LoopHelpers,
         decoded: &LoopDecodedInstruction,
+        index: usize,
         blocks: &[Block],
         loop_exit: Block,
     ) -> Option<()> {
@@ -3050,7 +3090,7 @@ impl<'a> LoopRegionCompiler<'a> {
                         let same = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
                         let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
                         let overflow = bcx.ins().band(same, changed);
-                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
                 };
@@ -3069,7 +3109,7 @@ impl<'a> LoopRegionCompiler<'a> {
                         let different = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
                         let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
                         let overflow = bcx.ins().band(different, changed);
-                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
                 };
@@ -3094,7 +3134,7 @@ impl<'a> LoopRegionCompiler<'a> {
                         let signs_differ = bcx.ins().bxor(lhs_negative, rhs_negative);
                         let negative_zero = bcx.ins().band(is_zero, signs_differ);
                         let overflow = bcx.ins().bor(overflow, negative_zero);
-                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
                 };
@@ -3114,7 +3154,7 @@ impl<'a> LoopRegionCompiler<'a> {
                         let result_sign = Self::sign_bit(bcx, result);
                         let not_old_sign = bcx.ins().bnot(old_sign);
                         let overflow = bcx.ins().band(not_old_sign, result_sign);
-                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
                 };
@@ -3193,7 +3233,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 let continuation = bcx.create_block();
                 bcx.ins().brif(failed, failed_block, &[], continuation, &[]);
                 bcx.switch_to_block(failed_block);
-                self.emit_available_materialization(bcx, ctx, helpers);
+                self.emit_available_materialization(bcx, ctx, helpers, index)?;
                 bcx.ins().return_(&[status]);
                 bcx.switch_to_block(continuation);
             }
@@ -3236,14 +3276,16 @@ impl<'a> LoopRegionCompiler<'a> {
         Some(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_overflow_guard(
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
         helpers: &LoopHelpers,
         pc: usize,
+        index: usize,
         overflow: cranelift_codegen::ir::Value,
-    ) {
+    ) -> Option<()> {
         let deopt = bcx.create_block();
         let continuation = bcx.create_block();
         bcx.ins().brif(overflow, deopt, &[], continuation, &[]);
@@ -3256,7 +3298,7 @@ impl<'a> LoopRegionCompiler<'a> {
             bcx.ins()
                 .call_indirect(helpers.refund_instruction_budget.signature, helper, &[ctx]);
         }
-        self.emit_available_materialization(bcx, ctx, helpers);
+        self.emit_available_materialization(bcx, ctx, helpers, index)?;
         Self::emit_set_pc(bcx, ctx, helpers, pc as u32);
         let status = bcx.ins().iconst(
             types::I64,
@@ -3268,20 +3310,29 @@ impl<'a> LoopRegionCompiler<'a> {
         );
         bcx.ins().return_(&[status]);
         bcx.switch_to_block(continuation);
+        Some(())
     }
 
+    /// Write back the registers the planner proved a mid-region exit owns.
+    ///
+    /// The set is taken from the plan rather than from the Cranelift variable
+    /// map: `try_use_var` only rejects *undeclared* variables, and a declared
+    /// variable with no definition on the current path is silently materialized
+    /// as zero. Iterating the variable map would therefore store an integer
+    /// zero over every frame register the region never defined.
     fn emit_available_materialization(
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
         helpers: &LoopHelpers,
-    ) {
-        for (register, variable) in self.variables.iter().enumerate() {
-            let Ok(value) = bcx.try_use_var(*variable) else {
-                continue;
-            };
+        index: usize,
+    ) -> Option<()> {
+        for register in self.plan.available.get(index)? {
+            let register = *register as usize;
+            let value = self.use_register(bcx, register)?;
             self.emit_store(bcx, ctx, helpers, register, value);
         }
+        Some(())
     }
 
     fn emit_exact_materialization(
