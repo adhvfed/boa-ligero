@@ -147,6 +147,16 @@ Thus an infinite interpreter continuation cannot retain the overrun module.
 The counter calls this a finalized-module overrun, not publication, because
 the artifact was never published to the ready cache.
 
+**Amendment, 2026-08-03 (Dragon 2).** Dropping the backend was necessary but
+not sufficient: `JITModule`'s own `Drop` deliberately leaks its allocations so
+that already-obtained function pointers stay valid for the life of the process.
+Until `JitBackend` gained a destructor that calls `JITModule::free_memory`, the
+retirement above dropped the *handle* while the executable pages stayed mapped,
+so the ceilings below bounded emission per backend generation rather than
+process memory across generations. That destructor now exists; see
+`34-dragon-2-executable-memory-reclaimed-2026-08-03.md` for the safety argument
+that no module-owned address outlives it.
+
 A compile that crosses 10 ms or makes cumulative observed compile time cross
 100 ms may retain its otherwise valid payload-in-budget artifact, but closes
 all later unseen compilation. These are non-refilling circuit-breaker
@@ -218,7 +228,18 @@ The implementation does not pass D1 until all of these are reproducible:
    diagnostics fixture is also included in the RSS process gate; this is a
    cardinality bound plus empirical memory gate, not an 8 MiB code claim.
 10. Production builds expose no raw unaccounted emitter. Backend drop frees all
-    owned executable code; cache keys do not cross context/backend generations.
+    owned executable code — `JitBackend`'s destructor calls
+    `JITModule::free_memory`, overriding `JITModule`'s leak-by-default `Drop`,
+    on every release path (retirement, `Context::disable_jit`, context
+    teardown). Reclamation is whole-module only: a live backend never releases
+    an individual artifact, so the ceilings still bound one generation's
+    emission and the destructor is what turns that into a process bound. Cache
+    keys do not cross context/backend generations. Verified behaviourally by
+    `context_owned_jit_retirement_frees_executed_code_and_keeps_interpreting`
+    and, through the governor's own byte accounting, by
+    `jit_backend_drop_releases_accounted_executable_code`. **This item was
+    asserted before it was true; see
+    `34-dragon-2-executable-memory-reclaimed-2026-08-03.md`.**
 11. Focused JIT tests, the full feature/no-feature engine matrix, formatting,
     and strict affected-target Clippy pass without a new finding.
 12. On macOS use `/usr/bin/time -l`'s maximum-resident-set field; on Linux D4

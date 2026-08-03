@@ -319,6 +319,11 @@ showing that another boundary dominates.
   acceptance, release-runner saturation fixture, and automated process gate;
   only the binding seven-pair cold-start/RSS run awaits a quiet host before D1
   closure.
+- [Dragon 2 close-out: executable memory reclaimed, 2026-08-03](34-dragon-2-executable-memory-reclaimed-2026-08-03.md)
+  — `JitBackend`'s destructor now calls `JITModule::free_memory`, overriding
+  cranelift-jit's leak-by-default `Drop`; the safety argument for it, the
+  whole-module-only scope limit, and the correction to acceptance item 10,
+  which had asserted the guarantee before it was true.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
