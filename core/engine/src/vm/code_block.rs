@@ -29,15 +29,23 @@ pub(crate) enum JitAdmissionState {
 
 #[cfg(feature = "jit")]
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct JitAdmissionCache {
+pub(crate) struct JitTieringCache {
     tagged: u64,
+    function_entries: u32,
+    loop_backedges: u32,
 }
 
 #[cfg(feature = "jit")]
-impl JitAdmissionCache {
-    const fn new(backend_id: u64, state: JitAdmissionState) -> Self {
-        Self {
-            tagged: (backend_id << 2) | state as u64,
+impl JitTieringCache {
+    const fn scoped(self, backend_id: u64) -> Self {
+        if self.tagged >> 2 == backend_id {
+            self
+        } else {
+            Self {
+                tagged: backend_id << 2,
+                function_entries: 0,
+                loop_backedges: 0,
+            }
         }
     }
 
@@ -51,6 +59,29 @@ impl JitAdmissionCache {
             3 => JitAdmissionState::DeniedLeaf,
             _ => JitAdmissionState::Unknown,
         }
+    }
+
+    const fn with_state(self, backend_id: u64, state: JitAdmissionState) -> Self {
+        let mut scoped = self.scoped(backend_id);
+        scoped.tagged = (backend_id << 2) | state as u64;
+        scoped
+    }
+
+    const fn hotness(self, backend_id: u64) -> (u32, u32) {
+        let scoped = self.scoped(backend_id);
+        (scoped.function_entries, scoped.loop_backedges)
+    }
+
+    const fn with_function_entry(self, backend_id: u64) -> Self {
+        let mut scoped = self.scoped(backend_id);
+        scoped.function_entries = scoped.function_entries.saturating_add(1);
+        scoped
+    }
+
+    const fn with_loop_backedge(self, backend_id: u64) -> Self {
+        let mut scoped = self.scoped(backend_id);
+        scoped.loop_backedges = scoped.loop_backedges.saturating_add(1);
+        scoped
     }
 }
 
@@ -213,12 +244,13 @@ pub struct CodeBlock {
     // Used for identifying anonymous functions in compiled output and call frames.
     pub(crate) debug_id: u64,
 
-    /// Cached context-tier admission result, scoped to the backend generation
-    /// that selected it. Later frames can bypass tiering maps without carrying
-    /// a decision across disable/re-enable or another context.
+    /// Context-tier admission and hotness, scoped to the backend generation
+    /// that owns them. Keeping both beside the bytecode avoids a hash lookup on
+    /// every interpreted entry/backedge without carrying state across
+    /// disable/re-enable or another context.
     #[cfg(feature = "jit")]
     #[unsafe_ignore_trace]
-    pub(crate) jit_admission: Cell<JitAdmissionCache>,
+    pub(crate) jit_tiering: Cell<JitTieringCache>,
 
     #[cfg(feature = "trace")]
     #[unsafe_ignore_trace]
@@ -255,7 +287,7 @@ impl CodeBlock {
             global_vars: Box::default(),
             debug_id: CodeBlock::get_next_codeblock_id(),
             #[cfg(feature = "jit")]
-            jit_admission: Cell::new(JitAdmissionCache::default()),
+            jit_tiering: Cell::new(JitTieringCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         }
@@ -345,14 +377,35 @@ impl CodeBlock {
     /// Return this code block's admission decision for `backend_id`.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_admission(&self, backend_id: u64) -> JitAdmissionState {
-        self.jit_admission.get().state(backend_id)
+        self.jit_tiering.get().state(backend_id)
     }
 
     /// Cache an admission decision for one backend generation.
     #[cfg(feature = "jit")]
     pub(crate) fn set_jit_admission(&self, backend_id: u64, state: JitAdmissionState) {
-        self.jit_admission
-            .set(JitAdmissionCache::new(backend_id, state));
+        self.jit_tiering
+            .set(self.jit_tiering.get().with_state(backend_id, state));
+    }
+
+    /// Return function-entry and loop-backedge hotness for one backend
+    /// generation.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_hotness(&self, backend_id: u64) -> (u32, u32) {
+        self.jit_tiering.get().hotness(backend_id)
+    }
+
+    /// Record one function entry for one backend generation.
+    #[cfg(feature = "jit")]
+    pub(crate) fn record_jit_function_entry(&self, backend_id: u64) {
+        self.jit_tiering
+            .set(self.jit_tiering.get().with_function_entry(backend_id));
+    }
+
+    /// Record one loop backedge for one backend generation.
+    #[cfg(feature = "jit")]
+    pub(crate) fn record_jit_loop_backedge(&self, backend_id: u64) {
+        self.jit_tiering
+            .set(self.jit_tiering.get().with_loop_backedge(backend_id));
     }
 
     /// Returns true if this function has the `"prototype"` property when function object is created.

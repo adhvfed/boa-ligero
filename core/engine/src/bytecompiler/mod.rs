@@ -2926,7 +2926,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             global_vars: self.global_vars.into_boxed_slice(),
             debug_id: CodeBlock::get_next_codeblock_id(),
             #[cfg(feature = "jit")]
-            jit_admission: Cell::new(crate::vm::JitAdmissionCache::default()),
+            jit_tiering: Cell::new(crate::vm::JitTieringCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         }

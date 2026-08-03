@@ -45,7 +45,7 @@ pub(crate) use call_frame::BindingReference;
 
 pub(crate) use code_block::GlobalFunctionBinding;
 #[cfg(feature = "jit")]
-pub(crate) use code_block::{JitAdmissionCache, JitAdmissionState};
+pub(crate) use code_block::{JitAdmissionState, JitTieringCache};
 
 mod call_frame;
 mod code_block;

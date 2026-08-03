@@ -685,12 +685,6 @@ impl JitDiagnosticState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Hotness {
-    function_entries: u32,
-    loop_backedges: u32,
-}
-
 #[derive(Clone, Copy)]
 struct CachedEntry {
     entry: extern "C" fn(*mut Context) -> u64,
@@ -742,7 +736,6 @@ pub struct JitBackend {
     /// because a backend is not shared across threads or realms. Budgeted and
     /// unbudgeted entries are distinct so the latter keep their fast path.
     cache: FxHashMap<(u64, bool), CachedEntry>,
-    hotness: FxHashMap<u64, Hotness>,
     /// The last ordinary-function target observed at each bytecode call site.
     /// Native call lowering specializes against this identity and deopts when
     /// a later value is a different function, including another ordinary
@@ -789,7 +782,6 @@ impl JitBackend {
             module: JITModule::new(builder),
             next_fn_id: 0,
             cache: FxHashMap::default(),
-            hotness: FxHashMap::default(),
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
@@ -856,8 +848,7 @@ impl JitBackend {
         if code.jit_admission(self.id) != crate::vm::JitAdmissionState::Unknown {
             return;
         }
-        let hotness = self.hotness.entry(code.debug_id).or_default();
-        hotness.function_entries = hotness.function_entries.saturating_add(1);
+        code.record_jit_function_entry(self.id);
     }
 
     /// Apply and cache the context-tier's static native-entry admission rule.
@@ -979,8 +970,7 @@ impl JitBackend {
     /// Record a backward edge for tiering.
     pub(crate) fn record_loop_backedge(&mut self, code: &CodeBlock) {
         self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
-        let hotness = self.hotness.entry(code.debug_id).or_default();
-        hotness.loop_backedges = hotness.loop_backedges.saturating_add(1);
+        code.record_jit_loop_backedge(self.id);
     }
 
     /// Record a native entry that returned to the interpreter.
@@ -1055,12 +1045,9 @@ impl JitBackend {
     /// Whether this code block has enough observed activity for compilation.
     #[must_use]
     pub(crate) fn is_hot(&self, code: &CodeBlock) -> bool {
-        let Some(hotness) = self.hotness.get(&code.debug_id) else {
-            return false;
-        };
-
-        hotness.function_entries >= self.thresholds.function_entries
-            || hotness.loop_backedges >= self.thresholds.loop_backedges
+        let (function_entries, loop_backedges) = code.jit_hotness(self.id);
+        function_entries >= self.thresholds.function_entries
+            || loop_backedges >= self.thresholds.loop_backedges
     }
 
     /// Return a cached entry if one exists, compiling and caching it otherwise.
@@ -2147,6 +2134,37 @@ mod tests {
         let stats = context.jit_stats().expect("second JIT backend");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn hotness_cache_is_scoped_to_backend_generation() {
+        let code = first_function_code(
+            "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; }",
+        );
+        let thresholds = JitThresholds {
+            function_entries: 2,
+            loop_backedges: 3,
+        };
+
+        let mut first = JitBackend::new();
+        first.set_thresholds(thresholds);
+        assert!(!first.is_hot(&code));
+        first.record_function_entry(&code);
+        assert!(!first.is_hot(&code));
+        first.record_function_entry(&code);
+        assert!(first.is_hot(&code));
+
+        let mut replacement = JitBackend::new();
+        replacement.set_thresholds(thresholds);
+        assert!(
+            !replacement.is_hot(&code),
+            "a replacement backend must not inherit the prior generation's hotness"
+        );
+        replacement.record_loop_backedge(&code);
+        replacement.record_loop_backedge(&code);
+        assert!(!replacement.is_hot(&code));
+        replacement.record_loop_backedge(&code);
+        assert!(replacement.is_hot(&code));
     }
 
     #[test]
