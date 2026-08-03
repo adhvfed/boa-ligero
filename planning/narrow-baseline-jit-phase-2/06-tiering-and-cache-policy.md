@@ -51,6 +51,19 @@ measured coverage/size admission floor or another equally explicit suppression
 rule. Validate it against both the positive W0 browser kernel and these negative
 controls; do not infer a threshold from one instruction count.
 
+The subsequent seven-point crossover did find a static boundary: 33 native
+instructions were only at break-even while 45 clearly won, and W0's smaller
+24-instruction body contains a useful loop. However, a loop-or-45 prototype
+that emitted no artifact for rejected code made the losing controls slower.
+The context-owned tier still wrapped every interpreted opcode with scheduler
+bookkeeping. That prototype was reverted and is recorded in
+[the dated admission checkpoint](10-admission-crossover-2026-08-03.md).
+
+Admission is therefore blocked on a dormant-tier interpreter fast path. A
+rejected function must run within 5% of the JIT-disabled control before a work
+floor can be judged on entry/compilation economics. Do not tune the floor or
+expand opcode coverage to compensate for scheduler overhead.
+
 ## Thresholds and hysteresis
 
 Keep function-entry, loop-backedge, OSR, and call-target thresholds separate.

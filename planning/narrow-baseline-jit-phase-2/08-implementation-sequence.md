@@ -30,13 +30,38 @@ Suggested commit:
 test(jit): add native coverage and fallback diagnostics
 ```
 
-## Slice 2A — enforce measured admission before widening coverage
+## Slice 2A1 — remove interpreter-only scheduler tax
+
+The first admission prototype is rejected. Although it emitted neither native
+code nor a shim for losing bodies, those bodies remained roughly 1.8–2.0×
+slower than JIT-disabled interpretation because the context-owned tier wraps
+the full opcode dispatch loop. Record and move only the function-entry, call-
+target, and backward-edge observations needed for tiering so an interpreter-
+only frame can use the ordinary fast path between events.
+
+**Stop/go:** with the JIT enabled and no admitted body, the 0/4/8-addition
+controls must be within 5% of the disabled interpreter while retaining exact
+sinks, budgets, and diagnostics. W0 and the focused deopt/exception/GC tests
+must remain unchanged.
+
+Suggested commit:
+
+```text
+perf(jit): bypass dormant tiering in interpreter frames
+```
+
+## Slice 2A2 — enforce measured admission before widening coverage
 
 Use the Gate P positive and negative controls to select the smallest explicit
 native-admission rule that suppresses known losing tiny/helper-dominated
 entries without excluding W0's winning numeric kernel. Record the crossover
 experiment, keep diagnostic and headline timing separate, and test duplicate
 shim/failure suppression. This slice adds no entry kind or VM ABI.
+
+The source-free crossover and rejected first prototype are recorded in
+[the dated checkpoint](10-admission-crossover-2026-08-03.md). Re-run that
+protocol after Slice 2A1; do not assume the provisional loop-or-45 rule remains
+optimal once scheduler overhead changes.
 
 **Stop/go:** property, flat-call, polymorphic-property, and method controls must
 not regress beyond the recorded noise guardrail, while W0 must retain native
