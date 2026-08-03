@@ -26,8 +26,11 @@ frames are denied before a scheduler exit can be observed, property counts are
 static rather than dynamic, and one-shot loops expose a separate hot-but-
 unentered tiering regression. The call-attribution sub-slice has now landed in
 schema 5: the fixed flat and method controls are dynamically monomorphic, but
-their targets are not native-cached. Loop/storage attribution and the dormant-
-tier guardrail remain ahead of any execution ABI decision.
+their targets are not native-cached. Slice 3B now closes the dormant-tier
+guardrail: eligible and statically ineligible one-shot loops are within 0.94%
+of interpreter medians with zero artifacts, while explicit diagnostics retain
+exact 2,000,000-backedge evidence. Loop/storage attribution remains ahead of
+any execution ABI decision.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -104,8 +107,11 @@ Every Phase 2 entry and exit ABI inherits that rule.
 9. Add bounded source-free site telemetry and close the measured hot-but-
    unentered tiering regression without relaxing production admission.
    **Call sub-slice complete:** Boa `0bc757a2` and Ligero `1d58914a` publish
-   bounded schema-5 call attribution. Loop/storage attribution and Gate H
-   remain. Re-run the same matrix, then select exactly one execution ABI.
+   bounded schema-5 call attribution. **Gate H complete:** Boa `d64fe095` and
+   `cc07a908` replace unbounded/map-backed hotness with generation-scoped state
+   and a dormant-frame transition; Ligero `6594d5a2` projects the counters.
+   Complete loop/storage attribution, re-run the same matrix, then select
+   exactly one execution ABI.
 10. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
@@ -160,6 +166,10 @@ showing that another boundary dominates.
   — schema-5 bounded call-site evidence, diagnostics-off A/B controls, and why
   monomorphic execution without a cached native target does not yet select the
   compiled-call ABI.
+- [Slice 3B Gate H closure, 2026-08-03](16-slice-3b-gate-h-closure-2026-08-03.md)
+  — generation-scoped hotness, the dormant-frame transition, exact-versus-
+  bounded counter semantics, paired release measurements, and the remaining
+  attribution work before an ABI decision.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

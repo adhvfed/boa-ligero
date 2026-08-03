@@ -128,6 +128,13 @@ a nonzero PC does not keep paying unbounded map/scheduler bookkeeping. Report
 executed backedges, threshold crossings, entries, and artifacts so an OSR win
 cannot hide dormant-tier overhead.
 
+**Passed 2026-08-03:** seven fresh-process pairs measured +0.429% for the
+eligible one-shot loop and +0.939% for the statically ineligible loop, both
+with zero artifacts and entries. Production observation stops at 256
+backedges and one dormant-frame handoff; explicit diagnostics still count all
+2,000,000 backedges exactly. See the
+[Gate H closure](16-slice-3b-gate-h-closure-2026-08-03.md).
+
 ### Gate K — calls
 
 Matching ordinary calls use the compiled-call path and show a warm win;

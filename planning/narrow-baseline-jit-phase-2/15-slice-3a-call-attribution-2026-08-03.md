@@ -89,9 +89,10 @@ zero-artifact invariants.
 
 ## Next decision
 
-Do not start a compiled-call ABI from this result alone. Complete the remaining
-bounded loop/storage attribution or close Gate H first, then re-run the fixed
-matrix with timing and diagnostics in separate processes. The new call counts
+Do not start a compiled-call ABI from this result alone. Gate H is now closed
+by Boa `d64fe095`/`cc07a908` and Ligero `6594d5a2`; complete the remaining
+bounded loop/storage attribution, then re-run the fixed matrix with timing and
+diagnostics in separate processes. The new call counts
 must be compared with dynamic loop/storage evidence, and any call design must
 explain how an ordinary monomorphic target becomes native-cached without
 relaxing `denied_call_boundary` prematurely.

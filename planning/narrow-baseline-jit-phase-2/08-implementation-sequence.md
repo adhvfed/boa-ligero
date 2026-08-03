@@ -224,7 +224,7 @@ test(jit): attribute hot execution boundaries
 feat(jit): project boundary diagnostics to ligero
 ```
 
-## Slice 3B — hot-but-unentered tier guardrail
+## Slice 3B — hot-but-unentered tier guardrail (complete)
 
 Add a durable one-shot numeric fixture and a separate ineligible-loop control.
 Measure unreachable thresholds, default hotness with zero native entry, and an
@@ -243,6 +243,14 @@ feasibility evidence; it is not an OSR result.
 **Stop/go:** Gate H passes before a 4A speedup is accepted. Do not implement
 OSR merely to conceal a zero-entry tier regression.
 
+**Passed:** Boa `d64fe095` scopes admission and hotness state to the backend
+generation without a backend hash map. Boa `cc07a908` latches hot frames and
+returns nonzero-PC frames that cannot branch to PC zero to dormant interpreter
+dispatch. Seven-pair release medians are within 0.94% of the interpreter for
+both durable fixtures; explicit diagnostics preserve exact counts. Ligero
+`6594d5a2` projects the new counters. See the
+[Gate H closure](16-slice-3b-gate-h-closure-2026-08-03.md).
+
 Suggested commit:
 
 ```text
@@ -251,7 +259,8 @@ perf(jit): bound hot nonzero backedge bookkeeping
 
 ## Decision checkpoint A — choose the next boundary
 
-Re-run the fixed matrix after Slices 3A and 3B and rank attributable lost time:
+After completing the remaining loop/storage portion of Slice 3A, re-run the
+fixed matrix and rank attributable lost time:
 
 1. interpreted one-shot loop work after the PC-zero opportunity;
 2. scheduler round trips to already-compiled monomorphic callees;

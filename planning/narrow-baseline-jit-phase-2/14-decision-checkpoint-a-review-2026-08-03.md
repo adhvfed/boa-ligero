@@ -2,10 +2,11 @@
 
 ## Decision
 
-Do not approve an execution ABI yet. Phase 2 remains underway, but the next
-scheduled work is bounded attribution plus a hot-but-unentered tiering
-guardrail. Region stitching is moved out of the pre-decision sequence and is
-now an alternative branch alongside OSR, compiled calls, and guarded storage.
+Do not approve an execution ABI yet. Phase 2 remains underway. Gate H's
+hot-but-unentered guardrail has since closed; the next scheduled work is the
+remaining bounded loop/storage attribution and a fixed-matrix rerun. Region
+stitching remains an alternative branch alongside OSR, compiled calls, and
+guarded storage.
 
 This is not indecision caused by noisy timings. The review found that schema 4
 cannot observe the current production opportunity for two candidates, while
@@ -117,7 +118,9 @@ Follow-up: the bounded schema-5 call sub-slice landed in Boa `0bc757a2` and
 Ligero `1d58914a`. The fixed flat and method sites are dynamically monomorphic,
 but neither target is native-cached; see the
 [Slice 3A call-attribution checkpoint](15-slice-3a-call-attribution-2026-08-03.md).
-Loop/storage attribution and Gate H still precede ABI selection.
+Gate H subsequently passed in Boa `d64fe095`/`cc07a908` and Ligero `6594d5a2`;
+see the [Gate H closure](16-slice-3b-gate-h-closure-2026-08-03.md). Loop and
+storage attribution still precede ABI selection.
 
 ## Storage and coverage evidence gap
 
@@ -138,7 +141,7 @@ alternative that requires the same explicit ABI review as the other branches.
 2. Add bounded source-free loop/call/storage attribution with dropped-record
    accounting and a mechanical Ligero projection. Headline timings keep it off.
 3. Close Gate H without changing JavaScript semantics or relaxing
-   `denied_call_boundary`.
+   `denied_call_boundary`. **Complete.**
 4. Re-run the fixed micro, engine, and browser matrix with separate timing and
    diagnostics processes.
 5. Select exactly one of OSR, compiled calls, guarded storage, or region

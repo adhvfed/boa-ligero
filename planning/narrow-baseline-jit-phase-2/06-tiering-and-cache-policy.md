@@ -84,15 +84,15 @@ stable and documented. Avoid immediate recompile loops:
 - keep a failed compilation from being retried on every entry.
 
 Crossing a hotness threshold must also stop expensive eligibility bookkeeping
-that can no longer change the current entry decision. A 2026-08-03 one-shot
-numeric control performed no compilation or native entry yet measured 37.963
-ms with the tier enabled versus 27.455 ms in the interpreter. The current
-code-global backedge map is still updated after the nonzero-PC frame is hot,
-so OSR could mask the loss for eligible loops while leaving ineligible loops
-slower. Before OSR is credited with a win, add a frame/site latch or equivalent
-bounded transition that preserves later PC-zero eligibility and exact
-diagnostics without a hash-table update on every remaining backedge. Gate
-below-threshold, hot-but-unentered, and statically ineligible loops separately.
+that can no longer change the current entry decision. This requirement is now
+implemented by Boa `d64fe095` and `cc07a908`: hotness is backend-generation-
+scoped `CodeBlock` state, and a hot nonzero-PC frame with no static return edge
+to PC zero transitions to dormant interpreter dispatch. Normal mode observes a
+bounded 256 backedges; explicit diagnostics retain exact post-threshold counts.
+Seven fresh-process pairs put eligible and statically ineligible one-shot loops
+within 0.94% of interpreter medians with zero artifacts and entries. Later
+PC-zero invocation remains eligible and is covered by a native-entry test. See
+the [Gate H closure](16-slice-3b-gate-h-closure-2026-08-03.md).
 
 The first version can use a small bounded cache and no eviction if measurements
 show acceptable memory growth. Add an explicit size/count limit before enabling
