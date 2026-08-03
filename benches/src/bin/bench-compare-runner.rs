@@ -8,7 +8,9 @@
 //! `jit` feature, a fourth `jit` mode reports a warm JIT measurement and a
 //! separate first-call measurement that includes native compilation. JIT mode
 //! can also write a bounded diagnostic snapshot after timing via
-//! `--jit-diagnostics-out <path>`.
+//! `--jit-diagnostics-out <path>`. The optional
+//! `--jit-diagnostic-record-limit <count>` applies the same requested bound to
+//! every detailed record kind; Boa still enforces its engine-owned hard cap.
 
 #![allow(clippy::print_stdout, clippy::unwrap_used)]
 
@@ -35,7 +37,7 @@ fn main() {
         .filter(|mode| !mode.is_empty())
         .map(String::as_str)
         .unwrap_or("interp");
-    let diagnostics_out = parse_jit_diagnostics_output(&args[5..]).unwrap_or_else(|error| {
+    let diagnostic_options = parse_jit_diagnostic_options(&args[5..]).unwrap_or_else(|error| {
         eprintln!("{error}");
         print_usage();
         process::exit(2);
@@ -44,7 +46,7 @@ fn main() {
     let code = fs::read_to_string(Path::new(script_path)).expect("read script");
 
     match mode {
-        "interp" if diagnostics_out.is_none() => {
+        "interp" if diagnostic_options == JitDiagnosticOptions::default() => {
             run_interpreter(script_path, &code, runs, warmup);
         }
         "interp" => {
@@ -58,7 +60,8 @@ fn main() {
                 &code,
                 runs,
                 warmup,
-                diagnostics_out.map(Path::new),
+                diagnostic_options.output.map(Path::new),
+                diagnostic_options.record_limit,
             );
             #[cfg(not(feature = "jit"))]
             {
@@ -76,22 +79,55 @@ fn main() {
 fn print_usage() {
     eprintln!(
         "usage: runner-boa <script.js> [runs] [warmup] [interp|jit] \
-         [--jit-diagnostics-out <path>]"
+         [--jit-diagnostics-out <path>] \
+         [--jit-diagnostic-record-limit <count>]"
     );
 }
 
-fn parse_jit_diagnostics_output(args: &[String]) -> Result<Option<&str>, &'static str> {
-    match args {
-        [] => Ok(None),
-        [flag, path] if flag == "--jit-diagnostics-out" && !path.is_empty() => {
-            Ok(Some(path.as_str()))
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JitDiagnosticOptions<'a> {
+    output: Option<&'a str>,
+    record_limit: Option<usize>,
+}
+
+fn parse_jit_diagnostic_options(args: &[String]) -> Result<JitDiagnosticOptions<'_>, String> {
+    let mut options = JitDiagnosticOptions::default();
+    let mut remaining = args;
+
+    while let Some((flag, rest)) = remaining.split_first() {
+        let Some((value, tail)) = rest.split_first() else {
+            return Err(format!("{flag} requires a value"));
+        };
+
+        match flag.as_str() {
+            "--jit-diagnostics-out" if options.output.is_none() && !value.is_empty() => {
+                options.output = Some(value);
+            }
+            "--jit-diagnostics-out" if options.output.is_some() => {
+                return Err("--jit-diagnostics-out may be specified only once".to_owned());
+            }
+            "--jit-diagnostics-out" => {
+                return Err("--jit-diagnostics-out requires a non-empty path".to_owned());
+            }
+            "--jit-diagnostic-record-limit" if options.record_limit.is_none() => {
+                options.record_limit = Some(value.parse().map_err(|_| {
+                    "--jit-diagnostic-record-limit requires an unsigned integer".to_owned()
+                })?);
+            }
+            "--jit-diagnostic-record-limit" => {
+                return Err("--jit-diagnostic-record-limit may be specified only once".to_owned());
+            }
+            _ => return Err(format!("unknown runner option `{flag}`")),
         }
-        [flag, _] if flag != "--jit-diagnostics-out" => Err("unknown runner option"),
-        [flag, _] if flag == "--jit-diagnostics-out" => {
-            Err("--jit-diagnostics-out requires a non-empty path")
-        }
-        _ => Err("expected --jit-diagnostics-out followed by one path"),
+
+        remaining = tail;
     }
+
+    if options.record_limit.is_some() && options.output.is_none() {
+        return Err("--jit-diagnostic-record-limit requires --jit-diagnostics-out".to_owned());
+    }
+
+    Ok(options)
 }
 
 fn run_interpreter(script_path: &str, code: &str, runs: usize, warmup: usize) {
@@ -155,6 +191,7 @@ fn run_jit(
     runs: usize,
     warmup: usize,
     diagnostics_out: Option<&Path>,
+    diagnostic_record_limit: Option<usize>,
 ) {
     // The cold sample starts from a fresh backend and lowers the first main()
     // entry immediately. Script parsing and top-level setup remain outside the
@@ -168,7 +205,7 @@ fn run_jit(
     cold_script.evaluate(cold_context).unwrap();
     let cold_function = main_function(cold_context, script_path);
     if diagnostics_out.is_some() {
-        cold_context.enable_jit_diagnostics(boa_engine::jit::JitDiagnosticLimits::default());
+        cold_context.enable_jit_diagnostics(jit_diagnostic_limits(diagnostic_record_limit));
     } else {
         cold_context.enable_jit();
     }
@@ -200,7 +237,7 @@ fn run_jit(
     script.evaluate(context).unwrap();
     let function = main_function(context, script_path);
     if diagnostics_out.is_some() {
-        context.enable_jit_diagnostics(boa_engine::jit::JitDiagnosticLimits::default());
+        context.enable_jit_diagnostics(jit_diagnostic_limits(diagnostic_record_limit));
     } else {
         context.enable_jit();
     }
@@ -278,6 +315,22 @@ fn run_jit(
 }
 
 #[cfg(feature = "jit")]
+fn jit_diagnostic_limits(record_limit: Option<usize>) -> boa_engine::jit::JitDiagnosticLimits {
+    let Some(record_limit) = record_limit else {
+        return boa_engine::jit::JitDiagnosticLimits::default();
+    };
+
+    boa_engine::jit::JitDiagnosticLimits {
+        compile_records: record_limit,
+        admission_records: record_limit,
+        exit_records: record_limit,
+        call_records: record_limit,
+        loop_records: record_limit,
+        storage_records: record_limit,
+    }
+}
+
+#[cfg(feature = "jit")]
 #[derive(serde::Serialize)]
 struct JitDiagnosticReport {
     schema_version: u32,
@@ -289,22 +342,64 @@ struct JitDiagnosticReport {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_jit_diagnostics_output;
+    use super::{JitDiagnosticOptions, parse_jit_diagnostic_options};
 
     #[test]
-    fn parses_optional_jit_diagnostics_output() {
-        assert_eq!(parse_jit_diagnostics_output(&[]), Ok(None));
+    fn parses_optional_jit_diagnostics() {
         assert_eq!(
-            parse_jit_diagnostics_output(&[
+            parse_jit_diagnostic_options(&[]),
+            Ok(JitDiagnosticOptions::default())
+        );
+        assert_eq!(
+            parse_jit_diagnostic_options(&[
                 "--jit-diagnostics-out".to_owned(),
                 "profile.json".to_owned(),
             ]),
-            Ok(Some("profile.json"))
+            Ok(JitDiagnosticOptions {
+                output: Some("profile.json"),
+                record_limit: None,
+            })
         );
-        assert!(parse_jit_diagnostics_output(&["--unknown".to_owned()]).is_err());
-        assert!(
-            parse_jit_diagnostics_output(&["--jit-diagnostics-out".to_owned(), String::new(),])
-                .is_err()
+        assert_eq!(
+            parse_jit_diagnostic_options(&[
+                "--jit-diagnostic-record-limit".to_owned(),
+                "4096".to_owned(),
+                "--jit-diagnostics-out".to_owned(),
+                "profile.json".to_owned(),
+            ]),
+            Ok(JitDiagnosticOptions {
+                output: Some("profile.json"),
+                record_limit: Some(4096),
+            })
         );
+    }
+
+    #[test]
+    fn rejects_invalid_jit_diagnostic_options() {
+        let cases = [
+            vec!["--unknown".to_owned()],
+            vec!["--jit-diagnostics-out".to_owned(), String::new()],
+            vec![
+                "--jit-diagnostic-record-limit".to_owned(),
+                "not-a-number".to_owned(),
+            ],
+            vec![
+                "--jit-diagnostic-record-limit".to_owned(),
+                "4096".to_owned(),
+            ],
+            vec![
+                "--jit-diagnostics-out".to_owned(),
+                "one.json".to_owned(),
+                "--jit-diagnostics-out".to_owned(),
+                "two.json".to_owned(),
+            ],
+        ];
+
+        for args in cases {
+            assert!(
+                parse_jit_diagnostic_options(&args).is_err(),
+                "accepted {args:?}"
+            );
+        }
     }
 }
