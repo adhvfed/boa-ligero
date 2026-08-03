@@ -96,3 +96,70 @@ Slice 2A is split:
 This is a useful negative result: native-entry admission is necessary for code
 growth and deopt control, but it cannot be evaluated honestly until enabling
 the tier is cheap for code that stays interpreted.
+
+## Landed Slice 2A result
+
+Boa `fcfc2659` moves tiering decisions to frame boundaries and lets ordinary
+interpreter dispatch run continuously within a frame. Boa `f0eeef75` then
+reintroduces the measured loop-or-45 admission rule before context-tier
+compilation. A denied body emits neither native code nor the complete-semantics
+shim; the explicit low-level JIT API retains shim fallback for differential
+coverage.
+
+Admission decisions are cached against a unique backend generation rather than
+globally. Disabling/re-enabling the tier or evaluating the same code in another
+context cannot reuse stale hotness or admission state. The denied-leaf fast
+path excludes property reads and explicit calls, stops on every frame-depth
+change, and is active only while its owning scheduler generation is running.
+Nested accessor/host re-entry clears and restores that token. Regressions cover
+disable/re-enable, execution while disabled, getter re-entry, exception unwind,
+and a denied wrapper that still reaches an eligible child.
+
+The exact crossover was repeated after those lifecycle fixes. Each row used 70
+warmups, five fresh-process timed samples, 100,000 helper calls per sample, and
+matching sinks:
+
+| Additions | Native instructions | Interpreter ns/run | Production JIT ns/run | Result |
+|---:|---:|---:|---:|---:|
+| 0 | 9 | 6,741,875 | 6,923,750 | +2.70% |
+| 4 | 21 | 11,468,250 | 11,794,542 | +2.85% |
+| 8 | 33 | 14,123,208 | 14,369,125 | +1.74% |
+| 12 | 45 | 17,110,375 | 8,407,750 | 2.04× faster |
+| 16 | 57 | 20,231,292 | 8,836,125 | 2.29× faster |
+
+All three denied controls satisfy the ≤5% gate and compile zero artifacts. The
+45- and 57-instruction bodies each compile one native artifact and retain a
+clear complete-workload win.
+
+The bounded engine subset was also repeated under the production rule rather
+than inferred from native-entry counts:
+
+| Workload | Interpreter | Production JIT | Result | Function-entry artifacts |
+|---|---:|---:|---:|---:|
+| Crypto | 11.099 s | 11.241 s | +1.28% | 0 |
+| DeltaBlue | 2.011 s | 2.009 s | −0.12% | 0 |
+| Earley-Boyer | 14.116 s | 13.106 s | −7.16% | 0; one loop-triggered shim |
+
+Crypto's former tiny deopting native body was not a stable causal win; after
+suppression the complete workload is within the parity guardrail. DeltaBlue is
+flat and Earley-Boyer improves. Exact accumulators remain unchanged.
+
+The fresh Ligero W0 release gate still compiles its 24-instruction backward-
+branch kernel: one native artifact, 999 normal returns, zero deopts, checksum
+`499500000`, 387 display items, and 258 paint segments. This closes Slice 2A's
+measured stop/go gate while keeping the JIT build- and runtime-opt-in.
+
+## Required checkpoint before Slice 2B
+
+The scheduler and admission work are two behavior slices, so the next commit
+must be a separately revertible behavior-neutral refactor. Consolidate the two
+frame-change interpreter loops and centralize scheduler-token lifetime only if
+the denied-control parity gate remains green; keep the current specialized
+loops if an abstraction measurably restores dispatch overhead.
+
+After that refactor, add a bounded source-free admission record keyed only by
+runtime-local code ID and static counts/reason. Aggregate `admission_denials`
+is sufficient for the present stop/go result but not for attributing later
+mixed-workload suppressions. Only then begin Slice 2B's guarded `This` design
+review; binding reads, OSR, compiled calls, and direct storage remain separate
+evidence-selected decisions.

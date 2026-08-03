@@ -4,12 +4,13 @@ Status: implementation underway, scheduled 2026-08-03. Phase 1 is landed
 behind the opt-in `jit` feature and its first publisher-neutral Ligero workload
 gate has passed. Slice 1 now has bounded engine diagnostics, standalone JSON
 export, an opt-in Ligero projection, and a completed representative
-micro/engine/browser profile. A measured admission prototype then exposed a
-more fundamental scheduler tax: rejected code still executes through the JIT-
-owned per-opcode interpreter wrapper and regresses the negative controls. The
-prototype was reverted. Phase 2 now schedules an interpreter fast path before
-revisiting admission; guarded receiver loading remains the smallest candidate
-coverage slice after those checkpoints. Each new execution ABI still requires
+micro/engine/browser profile. Slice 2A then measured and removed a dormant-tier
+scheduler tax before landing a conservative loop-or-45-instruction admission
+rule. The rejected controls are now within the recorded 5% interpreter-parity
+gate, the profitable straight-line controls retain clear wins, and the W0
+browser kernel remains native. Before guarded receiver loading, the sequence
+now requires a separately revertible behavior-neutral scheduler refactor and a
+bounded per-code admission diagnostic; each new execution ABI still requires
 its own design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
@@ -55,17 +56,23 @@ Every Phase 2 entry and exit ABI inherits that rule.
 1. Add bounded, opt-in fallback/coverage observability and profile micro,
    engine, and actual `ligero-browser` workloads.
 2. Apply a measured admission guardrail against the positive and negative Gate
-   P controls before exposing more native function entries.
-3. Lower only the smallest measured blocker batch needed to expose useful
+   P controls before exposing more native function entries. **Complete:** Boa
+   `fcfc2659` removes the dormant scheduler tax and `f0eeef75` lands the
+   measured admission rule with backend-generation and re-entrancy guards.
+3. Pay the scheduled refactoring checkpoint: consolidate the duplicated
+   frame-change interpreter loops without changing dispatch semantics, then
+   add bounded source-free per-code admission records so later profiles can
+   distinguish suppression from compilation.
+4. Lower only the smallest measured blocker batch needed to expose useful
    native regions, first deciding whether the current whole-CodeBlock compiler
    can express the result or explicit region metadata is required.
-4. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
+5. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
    helper-backed storage by measured lost time and transition count.
-5. Implement the highest-ranked boundary behind its own ABI review; re-profile
+6. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
-6. Apply cache bounds, failure suppression, and cold-start guardrails throughout
+7. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
-7. Keep direct storage last unless helper attribution proves it dominates and
+8. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
 The first slice is deliberately measurement-only. OSR and compiled calls are
