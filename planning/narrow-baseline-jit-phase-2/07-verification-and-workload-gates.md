@@ -187,6 +187,17 @@ Seven alternating pairs put every negative/noncandidate micro row within
 Earley-Boyer, W0, and separate zero-drop diagnostics remain binding. See the
 [micro rollback checkpoint](27-slice-4a1-micro-rollback-checkpoint-2026-08-03.md).
 
+**Gate O passed 2026-08-03:** the first engine run found an 18% Earley-Boyer
+tax in generic denied-loop observation. Boa `8c8af54c` specializes production
+dispatch and limits post-opcode control-flow checks to branch-capable
+instructions without weakening exact backedge validation. Five fresh-process
+pairs put Crypto at +2.125%, DeltaBlue at -0.403%, and Earley-Boyer at +4.412%,
+with matching sinks and zero artifacts. Seven W0 pairs improve median cold load
+by 29.607% with exact sink/paint/accounted-byte structure. Separate schema-8 W0
+diagnostics at the 4,096 cap have zero drops and prove 999 PC-zero returns plus
+one OSR continuation. See the
+[workload checkpoint](28-slice-4a1-workload-gate-2026-08-03.md).
+
 ### Gate H — hot-but-unentered tiering
 
 With zero compilations and zero native entries, enabling the tier must remain
@@ -241,10 +252,11 @@ Record the Boa/Ligero commits and SHA-256 hashes of both release binaries in the
 than becoming an unexplained rerun. Store raw per-process samples alongside
 medians and paired deltas so the rollback decision is independently auditable.
 
-The nine-row micro portion is complete in Boa `073c12cd`; do not rerun or tune
-it merely to select a better sample. The scheduled remaining order is engine
-controls, clean W0, then separate zero-drop diagnostics. None may be replaced
-by the micro pass, and 4A1.R remains blocked until all three finish.
+The complete 4A1.5 matrix is recorded in Boa `8c8af54c`; do not rerun or tune it
+merely to select better samples. Gate O passes, but representative breadth W2
+does not. The next scheduled implementation slice is only the behavior-neutral
+4A1.R loop-exit-contract refactor, followed by a separate Decision-checkpoint-B
+profile before any second execution ABI is selected.
 
 **Decision checkpoint A now satisfies the selection form of Gate P for one
 narrow branch.** Schema 7 plus corrected 4,096-record runner controls retain
@@ -256,6 +268,29 @@ calls have no cached native targets in broad rows, and counted storage is
 interpreted. This selects an ABI to test, not representative breadth or JIT
 default enablement. See the
 [dated selection](19-decision-checkpoint-a-selection-2026-08-03.md).
+
+### Gate D — default enablement
+
+JIT becomes the default only after all of these are checked in against one
+identified release candidate:
+
+- W2 representative breadth has stable semantic and cold/warm results, with no
+  negative workload above its recorded rollback bound;
+- the older PC-zero pending-completion boundary has the same fail-closed status,
+  frame-unwind, GC, exception, and finite-budget coverage now required of OSR;
+- the supported AArch64 and x86-64 native matrices pass, while unsupported
+  platforms retain a clean interpreter-only build and runtime path;
+- default-on security tests cover malformed native statuses, executable-memory
+  publication/lifetime, backend compromise, runtime limits, host re-entry, and
+  untrusted-script fallback without exposing source or pointer data;
+- a release feature/default flip is separately revertible, retains an explicit
+  runtime opt-out, and passes the full workspace, Ligero integration, browser
+  workload, and rollback suites with diagnostics disabled by default.
+
+Gate D authorizes making the tier build- and runtime-default; it does not make
+remote scripts default. Remote-script policy remains a separate security and
+product decision. If the default-on candidate fails any binding row, revert
+only the feature/default flip and keep the opt-in tier available for diagnosis.
 
 ## Platform matrix
 

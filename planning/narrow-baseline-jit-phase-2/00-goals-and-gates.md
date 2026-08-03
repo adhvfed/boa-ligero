@@ -118,3 +118,8 @@ The gates are comparative and workload-based:
   required before default enablement can be considered.
 - **Regression gate:** JIT-off behavior and all Phase 1 differential tests stay
   green.
+- **Default-enablement gate:** after representative W2 breadth, PC-zero native
+  containment, supported-platform coverage, security review, and the complete
+  release-candidate rollback matrix pass together, make the tier the build and
+  runtime default in a separately revertible commit with an explicit
+  interpreter opt-out. Remote-script defaults remain a separate policy gate.

@@ -55,12 +55,11 @@ separate per-frame OSR decision, exact cached-metadata validation, and dormant-
 dispatch handoff make the first numeric shape reachable without changing
 opcode eligibility. Boa `92acfa22` closes 4A1.5a with exhaustive cold/cache-hit
 instruction-budget and loop-limit differentials through the production path,
-including every first-shape opcode PC and every arithmetic replay guard. Slice
-4A1 is not closed yet. Boa `44d45ca3`, `68d795fd`, `e37f2398`, and `e34f8530`
+including every first-shape opcode PC and every arithmetic replay guard. Boa
+`44d45ca3`, `68d795fd`, `e37f2398`, and `e34f8530`
 now close 4A1.5b with fail-closed malformed-state containment, forced-GC/
 nested-frame lifetime coverage, exact 64+1 production ownership, and cached-
-entry reuse at capacity. Only 4A1.5c's fixed performance/browser rollback
-matrix remains before the scheduler edge can be accepted. Its isolated cold-
+entry reuse at capacity. Its isolated cold-
 OSR admission subgate now passes in Boa `229ac2e4`: seven alternating pairs
 measure a 4.588× median speedup including compilation with exact one-entry
 evidence and no PC-zero artifact. The first wider-matrix attempt then exposed
@@ -68,10 +67,16 @@ a 35–50% tax in denied loop-free property/method helpers. Boa `073c12cd`
 caches that no OSR edge exists and bypasses both per-opcode observation and the
 per-call scheduler round trip only when diagnostics are off. The complete
 nine-row micro matrix now passes: every negative row is within 3.635%, while
-the eligible one-shot loop is 4.824× faster. Engine controls, W0, and separate
-zero-drop diagnostics remain before Gate O closes. The separately revertible
-4A1.R refactor remains mandatory after that gate and before Decision checkpoint
-B.
+the eligible one-shot loop is 4.824× faster. The first engine matrix then
+exposed an 18% Earley-Boyer tax in the generic denied-loop observer. Boa
+`8c8af54c` specializes production dispatch and inspects post-opcode control
+flow only for branch-capable instructions while preserving exact scheduler
+ownership and diagnostic observation. Gate O now passes: Crypto is +2.125%,
+DeltaBlue -0.403%, Earley-Boyer +4.412%, and seven W0 pairs improve median cold
+load by 29.607% with exact sink/paint/memory structure. A separate schema-8 W0
+sample has zero drops and distinguishes 999 PC-zero returns from one OSR
+continuation. The separately revertible 4A1.R loop-exit-contract refactor is
+now the only scheduled implementation slice before Decision checkpoint B.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -166,8 +171,7 @@ Every Phase 2 entry and exit ABI inherits that rule.
     and diagnostics complete:** Boa `7837f0a8` adds the 64-key table,
     allocation-free new-site suppression at capacity, 1 MiB/10 ms post-attempt
     circuit breakers, schema-8 aggregate counters, and inert exit taxonomy;
-    Ligero `c05557ed` projects schema 8. **Next:** Slice 4A1.3's separate region
-    compiler, still without scheduler invocation. **Compiler complete:** Boa
+    Ligero `c05557ed` projects schema 8. **Compiler complete:** Boa
     `c2885afe` revalidates the immutable plan, emits guarded uniform-mode loop
     artifacts, and proves entry rejection, continuation materialization,
     finite-budget/replay behavior, and terminal uncached rejection through a
@@ -183,9 +187,11 @@ Every Phase 2 entry and exit ABI inherits that rule.
     nested-frame/stale-guard safety, exhaust malformed loop status classes,
     and close the production 64+1 ownership matrix. **Cold-OSR admission
     complete:** Boa `229ac2e4` isolates the production-threshold sample and
-    passes the ≥2× gate at 4.588× with no PC-zero artifact. **Next:** run the
-    fixed micro/engine/W0 rollback matrix before the behavior-neutral 4A1.R
-    refactor.
+    passes the ≥2× gate at 4.588× with no PC-zero artifact. **Workload gate
+    complete:** Boa `8c8af54c` removes denied-loop observer overhead without
+    weakening the scheduler boundary; all fixed engine rows remain inside 5%,
+    W0 improves by 29.607%, and separate schema-8 diagnostics have zero drops.
+    **Next:** the behavior-neutral 4A1.R loop-exit-contract refactor.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -278,6 +284,9 @@ showing that another boundary dominates.
 - [Slice 4A1 micro rollback checkpoint, 2026-08-03](27-slice-4a1-micro-rollback-checkpoint-2026-08-03.md)
   — denied loop-free scheduler correction, the checksummed nine-row pass, raw
   samples, and the remaining engine/W0/zero-drop gate.
+- [Slice 4A1 workload gate, 2026-08-03](28-slice-4a1-workload-gate-2026-08-03.md)
+  — the final engine/W0 rollback matrix, denied-loop observer correction,
+  zero-drop schema-8 evidence, Gate O decision, and bounded 4A1.R handoff.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

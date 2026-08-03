@@ -379,12 +379,13 @@ Land the shape through these independently reversible boundaries:
    frame cache reuse, below-threshold interpretation, distinct I32/F64
    variants, nonnumeric frame-local rejection without variant poisoning, I32
    overflow replay, loop-limit propagation, and one generous exact-budget
-   comparison. Gate O remains open until 4A1.5.
+   comparison. This checkpoint left Gate O open until the now-complete 4A1.5.
 5. **4A1.5 — verification-only differential and workload gate.** Change no
    opcode eligibility, representation, threshold, cache policy, or execution
    ABI. Close these independently reviewable evidence groups:
-   - **4A1.5a, semantic/accounting (complete, Boa `92acfa22`):** cold-compile and cache-hit interpreter
-     differential at one instruction before/at/after OSR entry, first native
+   - **4A1.5a, semantic/accounting (complete, Boa `92acfa22`):** cold-compile
+     and cache-hit interpreter differential at one instruction before/at/after
+     OSR entry, first native
      header opcode, `IncrementLoopIteration`, each pre-effect replay guard, and
      the external exit; unbudgeted→budgeted variant separation; exact loop-
      limit/error/remaining-budget/PC/sink state. The landed production-path
@@ -398,8 +399,9 @@ Land the shape through these independently reversible boundaries:
      ready-key-at-capacity behavior across state/plan/artifact maps. Invalid
      loop state disables the compromised backend, unwinds to the base frame,
      clears paired pending state, and leaves later interpreter execution usable.
-   - **4A1.5c, performance/browser:** **measurement preflight and cold one-shot
-     admission complete in Boa `229ac2e4`.** The new `osr-cold` mode executes
+   - **4A1.5c, performance/browser (complete, Boa `8c8af54c`):** **measurement
+     preflight and cold one-shot admission complete in Boa `229ac2e4`.** The
+     new `osr-cold` mode executes
      no warmup, threshold-1 PC-zero control, or prior native compilation and
      prints whole-function plus OSR counters. Seven alternating pairs preserve
      the sink, record one OSR compile/entry and zero whole-function artifacts,
@@ -409,22 +411,31 @@ Land the shape through these independently reversible boundaries:
      corrected repeated observation/scheduler overhead in denied loop-free
      helpers. The checksummed nine-row micro matrix now keeps every negative
      row within 3.635% and the eligible one-shot loop is 4.824× faster.
-     **Remaining:** run Crypto, DeltaBlue, Earley-Boyer, and W0 with diagnostics
-     off for timings; every negative row remains within 5%, and W0
-     retains exact sink/paint/accounted-byte structure, its PC-zero entry, and
-     at least a 20% paired cold-load win. Diagnostics run separately and must
-     have zero dropped records. Record release-binary hashes and raw samples.
+     The first engine attempt exposed an 18% Earley-Boyer observer tax;
+     `8c8af54c` removes the generic production per-opcode diagnostic/decode
+     path while retaining exact branch validation. Crypto (+2.125%), DeltaBlue
+     (-0.403%), and Earley-Boyer (+4.412%) remain inside 5%. Seven W0 pairs
+     retain exact sink/paint/accounted-byte structure and improve median cold
+     load by 29.607%. Separate schema-8 diagnostics have zero drops and prove
+     both the PC-zero and OSR entry kinds. Checkpoint 28 records hashes and raw
+     samples.
 
    Any 4A1.5 failure reverts or disables only `55701ef4`'s scheduler edge while
    retaining the unreachable planner/compiler for diagnosis. It blocks 4A1.R,
    Decision checkpoint B, and every second ABI. Passing does not authorize
    default JIT or remote-script execution.
-6. **4A1.R — behavior-neutral refactor.** After the behavior gate, consolidate
-   exactly one repeated seam among typed entry keys, materialization emission,
-   and exit mapping in a separately revertible commit. Re-run the focused JIT
-   suite and strict lint without changing thresholds, opcode eligibility,
-   diagnostics, or scheduling. Decision checkpoint B and every second ABI wait
-   for this refactor.
+6. **4A1.R — behavior-neutral loop-exit-contract refactor (scheduled).**
+   Extract exactly the status/pending-state/cached-metadata validation and
+   action mapping concentrated in `JitBackend::invoke_loop_region` into a
+   private typed contract. Preserve the public status encoding, generated
+   entry ABI, scheduler ownership, pending-state clearing, backend-compromise
+   policy, and diagnostic counters. Change no threshold, opcode eligibility,
+   representation, cache/admission policy, diagnostic schema, or generated
+   code. Land this as one separately revertible commit. Re-run the focused JIT
+   suite, exhaustive budget/loop-limit differentials, malformed-status table,
+   64+1 ownership tests, feature-disabled check, strict affected-target Clippy,
+   Earley-Boyer sentinel, and one W0 structural/zero-drop sample. Decision
+   checkpoint B and every second ABI wait for this refactor.
 
 The compiler and scheduler commits are deliberately separate. A compiler test
 may execute its generated function through a test-only harness, but production
@@ -448,14 +459,14 @@ strict all-target Clippy has no slice-local delta beyond the 16 recorded
 findings. This establishes the wiring, not the exhaustive boundary or workload
 gate scheduled in 4A1.5.
 
-**Slice 4A1 stop/go:** a one-shot hot loop must show OSR execution and pass the
-full OSR test set; otherwise leave OSR disabled and diagnose the
-materialization gap.
+**Slice 4A1 stop/go: passed.** The one-shot hot loop enters through OSR and the
+full semantic, containment, micro, engine, and browser gate passes. This accepts
+only the first numeric OSR shape and schedules 4A1.R; it does not authorize
+another ABI or default enablement.
 
 Remaining suggested commits:
 
 ```text
-perf(jit): close loop OSR workload gate
 refactor(jit): consolidate loop region exit plumbing
 ```
 
@@ -526,13 +537,17 @@ entry kind, not deferred until here. Run repeated cold/warm browser
 measurements with the sibling workload owner.
 
 **Stop/go:** keep the JIT opt-in and revert any policy that wins only the hot
-loop while worsening complete workload time.
+loop while worsening complete workload time. After W2 and the security,
+cross-platform, PC-zero containment, and release-candidate gates in Gate D all
+pass, land a separate default-feature/runtime-default flip with an explicit
+interpreter opt-out and its own rollback commit.
 
 Suggested commits:
 
 ```text
 perf(jit): add region admission and bounded cache policy
 docs(jit): record Phase 2 workload gate
+feat(jit): enable the validated tier by default
 ```
 
 ## Cross-slice verification

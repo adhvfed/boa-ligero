@@ -133,17 +133,19 @@ publication complexity without proving a throughput win.
 
 ## Invalidations and variants
 
-Prefer guard misses and lazy replacement to global invalidation. A variant may
-be retired when:
+Prefer guard misses and lazy replacement to global invalidation. A future entry
+kind with mutable feedback may be retired when:
 
 - its bytecode/ABI version changes;
-- its feedback signature is stale;
+- its explicitly keyed feedback signature is stale;
 - repeated misses show the assumption is not stable;
 - the cache budget requires eviction.
 
-Retirement must keep existing native pointers valid until no current call can
-return through them. The simplest first policy is backend-lifetime retention
-with bounded entry count, followed by explicit safe-point eviction later.
+The first loop-OSR shape has no feedback signature and uses backend-lifetime
+retention. Any later retirement must keep existing native pointers valid until
+no current call can return through them. The simplest later policy is bounded
+backend-lifetime retention, followed by explicit safe-point eviction only when
+measurement justifies it.
 
 ## Tests and gate
 
