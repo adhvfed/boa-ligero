@@ -16,8 +16,8 @@ use crate::{Context, JsValue};
 
 use super::{
     JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind,
-    JitEntryPoint, JitExit, JitExitKind, JitExitReason, JitOsrRejectionReason,
-    JitOsrRepresentation, MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
+    JitEntryPoint, JitExit, JitExitKind, JitExitReason, JitModuleFailureStage,
+    JitOsrRejectionReason, JitOsrRepresentation, MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -39,6 +39,7 @@ pub(super) enum NativeCompileResult {
         code_bytes: usize,
     },
     Rejected(NativeRejection),
+    ModuleFailure(JitModuleFailureStage),
 }
 
 /// Source-free static shape of a code block accepted by the native baseline.
@@ -455,6 +456,7 @@ pub(super) struct CompiledLoopRegion {
 pub(super) enum LoopNativeCompileResult {
     Compiled(CompiledLoopRegion),
     Rejected(JitOsrRejectionReason),
+    ModuleFailure(JitModuleFailureStage),
 }
 
 /// Compile one already-proven loop region for the post-backedge scheduler.
@@ -505,8 +507,9 @@ pub(super) fn compile_loop_region(
     };
     let mut compiler = LoopRegionCompiler::new(backend, code, plan, region, mode);
     match compiler.compile() {
-        Some(artifact) => LoopNativeCompileResult::Compiled(artifact),
-        None => LoopNativeCompileResult::Rejected(JitOsrRejectionReason::Lowering),
+        Ok(Some(artifact)) => LoopNativeCompileResult::Compiled(artifact),
+        Ok(None) => LoopNativeCompileResult::Rejected(JitOsrRejectionReason::Lowering),
+        Err(stage) => LoopNativeCompileResult::ModuleFailure(stage),
     }
 }
 
@@ -758,21 +761,23 @@ pub(super) fn compile(
             bytecode_instructions,
         ));
     };
-    if let Some((entry, code_bytes)) = compiler.compile() {
-        NativeCompileResult::Compiled {
+    match compiler.compile() {
+        Ok(Some((entry, code_bytes))) => NativeCompileResult::Compiled {
             entry,
             profile,
             code_bytes,
+        },
+        Ok(None) => {
+            let (pc, opcode) = compiler.current_instruction_identity();
+            NativeCompileResult::Rejected(NativeRejection::new(
+                JitCompileBlockerKind::Lowering,
+                opcode,
+                pc,
+                compiler.current_instruction,
+                bytecode_instructions,
+            ))
         }
-    } else {
-        let (pc, opcode) = compiler.current_instruction_identity();
-        NativeCompileResult::Rejected(NativeRejection::new(
-            JitCompileBlockerKind::Lowering,
-            opcode,
-            pc,
-            compiler.current_instruction,
-            bytecode_instructions,
-        ))
+        Err(stage) => NativeCompileResult::ModuleFailure(stage),
     }
 }
 
@@ -1275,7 +1280,9 @@ impl<'a> NativeCompiler<'a> {
         })
     }
 
-    fn compile(&mut self) -> Option<(extern "C" fn(*mut Context) -> u64, usize)> {
+    fn compile(
+        &mut self,
+    ) -> Result<Option<(extern "C" fn(*mut Context) -> u64, usize)>, JitModuleFailureStage> {
         let ptr = self.backend.module.target_config().pointer_type();
         let mut cctx = self.backend.module.make_context();
         let mut fctx = FunctionBuilderContext::new();
@@ -1309,7 +1316,7 @@ impl<'a> NativeCompiler<'a> {
 
         let guard_ok = self.emit_entry_guard(&mut bcx, ctx_val, entry_deopt, &helpers);
         if !guard_ok {
-            return None;
+            return Ok(None);
         }
 
         bcx.ins().jump(code_blocks[0], &[]);
@@ -1350,7 +1357,7 @@ impl<'a> NativeCompiler<'a> {
                 &code_blocks,
                 break_block,
             ) {
-                return None;
+                return Ok(None);
             }
 
             if fallthrough(&instruction) && !has_explicit_edges(&instruction) {
@@ -1358,7 +1365,7 @@ impl<'a> NativeCompiler<'a> {
                     .checked_add(1)
                     .filter(|next| *next < code_blocks.len())
                 else {
-                    return None;
+                    return Ok(None);
                 };
                 bcx.ins().jump(code_blocks[next_index], &[]);
             }
@@ -1368,15 +1375,33 @@ impl<'a> NativeCompiler<'a> {
         bcx.finalize();
 
         let name = self.backend.next_fn_name("jit_native");
+        self.backend
+            .before_module_stage(JitModuleFailureStage::NativeDeclare)?;
         let id = self
             .backend
             .module
             .declare_function(&name, Linkage::Export, &cctx.func.signature)
-            .ok()?;
-        self.backend.module.define_function(id, &mut cctx).ok()?;
-        let code_bytes = cctx.compiled_code()?.code_buffer().len();
+            .map_err(|_| JitModuleFailureStage::NativeDeclare)?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::NativeDefine)?;
+        self.backend
+            .module
+            .define_function(id, &mut cctx)
+            .map_err(|_| JitModuleFailureStage::NativeDefine)?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::NativeCompiledCode)?;
+        let code_bytes = cctx
+            .compiled_code()
+            .ok_or(JitModuleFailureStage::NativeCompiledCode)?
+            .code_buffer()
+            .len();
         self.backend.module.clear_context(&mut cctx);
-        self.backend.module.finalize_definitions().ok()?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::NativeFinalize)?;
+        self.backend
+            .module
+            .finalize_definitions()
+            .map_err(|_| JitModuleFailureStage::NativeFinalize)?;
 
         let code_ptr = self.backend.module.get_finalized_function(id);
         // SAFETY: the signature is declared as `extern "C" fn(*mut Context) ->
@@ -1385,7 +1410,7 @@ impl<'a> NativeCompiler<'a> {
         let entry = unsafe {
             std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
         };
-        Some((entry, code_bytes))
+        Ok(Some((entry, code_bytes)))
     }
 
     fn current_instruction_identity(&self) -> (Option<u32>, Option<crate::vm::Opcode>) {
@@ -2651,14 +2676,14 @@ impl<'a> LoopRegionCompiler<'a> {
         }
     }
 
-    fn compile(&mut self) -> Option<CompiledLoopRegion> {
+    fn compile(&mut self) -> Result<Option<CompiledLoopRegion>, JitModuleFailureStage> {
         let JitEntryPoint::Loop {
             header_pc,
             representation,
             ..
         } = self.plan.key.entry_point
         else {
-            return None;
+            return Ok(None);
         };
         let ptr = self.backend.module.target_config().pointer_type();
         let mut cctx = self.backend.module.make_context();
@@ -2686,7 +2711,7 @@ impl<'a> LoopRegionCompiler<'a> {
             if entry_value.representation != representation
                 || entry_value.source != LoopEntrySource::VmRegister
             {
-                return None;
+                return Ok(None);
             }
             let register = entry_value.register as usize;
             let guard = bcx
@@ -2717,9 +2742,14 @@ impl<'a> LoopRegionCompiler<'a> {
                 .ins()
                 .call_indirect(helper.signature, address, &[ctx, register_value]);
             let value = bcx.inst_results(value)[0];
-            self.define_register(&mut bcx, register, value)?;
+            let Some(()) = self.define_register(&mut bcx, register, value) else {
+                return Ok(None);
+            };
         }
-        bcx.ins().jump(*code_blocks.first()?, &[]);
+        let Some(first_block) = code_blocks.first() else {
+            return Ok(None);
+        };
+        bcx.ins().jump(*first_block, &[]);
 
         bcx.switch_to_block(frame_rejected);
         let status = bcx.ins().iconst(
@@ -2749,24 +2779,34 @@ impl<'a> LoopRegionCompiler<'a> {
             if self.plan.key.budgeted {
                 self.emit_budget_guard(&mut bcx, ctx, &helpers, instruction.pc);
             }
-            self.emit_instruction(
+            let Some(()) = self.emit_instruction(
                 &mut bcx,
                 ctx,
                 &helpers,
                 &instruction,
                 &code_blocks,
                 loop_exit,
-            )?;
+            ) else {
+                return Ok(None);
+            };
             if fallthrough(&instruction.instruction)
                 && !has_explicit_edges(&instruction.instruction)
             {
-                bcx.ins().jump(*code_blocks.get(index + 1)?, &[]);
+                let Some(next_block) = code_blocks.get(index + 1) else {
+                    return Ok(None);
+                };
+                bcx.ins().jump(*next_block, &[]);
             }
         }
 
         bcx.switch_to_block(loop_exit);
-        let exit = self.plan.exits.first()?;
-        self.emit_exact_materialization(&mut bcx, ctx, &helpers, &exit.materialize)?;
+        let Some(exit) = self.plan.exits.first() else {
+            return Ok(None);
+        };
+        let Some(()) = self.emit_exact_materialization(&mut bcx, ctx, &helpers, &exit.materialize)
+        else {
+            return Ok(None);
+        };
         Self::emit_set_pc(&mut bcx, ctx, &helpers, exit.resume_pc);
         let status = bcx.ins().iconst(
             types::I64,
@@ -2782,22 +2822,40 @@ impl<'a> LoopRegionCompiler<'a> {
         bcx.finalize();
 
         let name = self.backend.next_fn_name("jit_loop");
+        self.backend
+            .before_module_stage(JitModuleFailureStage::LoopDeclare)?;
         let id = self
             .backend
             .module
             .declare_function(&name, Linkage::Export, &cctx.func.signature)
-            .ok()?;
-        self.backend.module.define_function(id, &mut cctx).ok()?;
-        let code_bytes = cctx.compiled_code()?.code_buffer().len();
+            .map_err(|_| JitModuleFailureStage::LoopDeclare)?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::LoopDefine)?;
+        self.backend
+            .module
+            .define_function(id, &mut cctx)
+            .map_err(|_| JitModuleFailureStage::LoopDefine)?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::LoopCompiledCode)?;
+        let code_bytes = cctx
+            .compiled_code()
+            .ok_or(JitModuleFailureStage::LoopCompiledCode)?
+            .code_buffer()
+            .len();
         self.backend.module.clear_context(&mut cctx);
-        self.backend.module.finalize_definitions().ok()?;
+        self.backend
+            .before_module_stage(JitModuleFailureStage::LoopFinalize)?;
+        self.backend
+            .module
+            .finalize_definitions()
+            .map_err(|_| JitModuleFailureStage::LoopFinalize)?;
         let code_ptr = self.backend.module.get_finalized_function(id);
         // SAFETY: this function was declared with the exact Context-pointer to
         // u64 C ABI, and the owning backend outlives the returned entry.
         let entry = unsafe {
             std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
         };
-        Some(CompiledLoopRegion { entry, code_bytes })
+        Ok(Some(CompiledLoopRegion { entry, code_bytes }))
     }
 
     fn build_helpers(

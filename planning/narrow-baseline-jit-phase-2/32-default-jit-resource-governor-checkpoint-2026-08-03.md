@@ -5,10 +5,12 @@
 The two D1 implementation commits are landed, but D1 is not closed. Boa
 `42623234` bounds retained function-entry state, decoded PC-zero bodies, legacy
 call-target feedback, and unseen loop planning. Boa `2888c024` adds unified
-payload/time accounting, schema-9 source-free counters, and immediate backend
+payload/time accounting, initial schema-9 source-free counters, and immediate backend
 retirement when a finalized artifact would cross the retained-payload bound.
 Ligero `72568c9a` projects the new instruction-limit blocker and `dfdc0714`
-projects all schema-9 resource counters.
+projects those initial schema-9 resource counters. Returned compiler/module-
+failure containment adds a source-free retirement counter and deliberately
+advances the completed contract to schema 10.
 
 The implementation does not change opcode eligibility, hotness thresholds,
 remote-script policy, the JIT build default, or the runtime default. D0 and the

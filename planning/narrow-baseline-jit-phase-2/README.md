@@ -78,7 +78,7 @@ sample has zero drops and distinguishes 999 PC-zero returns from one OSR
 continuation. Boa `6dc6aa07` now completes the separately revertible 4A1.R
 loop-exit-contract refactor with the full semantic/containment suite green,
 Earley-Boyer at +4.287%, and a clean zero-drop W0 sample. Decision checkpoint
-B's binding D0 rerun remains open and must use schema 9 after the host passes
+B's binding D0 rerun remains open and must use schema 10 after the host passes
 its continuous quiescence preflight. D1's two resource-governor implementation
 commits are now landed in Boa `42623234` and `2888c024`, with Ligero projection
 in `72568c9a` and `dfdc0714`. D1 is not closed: combined capacity/variant
@@ -315,7 +315,7 @@ showing that another boundary dominates.
   body-size, feedback, and diagnostic bounds; suppression/retirement semantics;
   raw-emitter closure; and the implementation acceptance matrix.
 - [Default-JIT resource governor checkpoint, 2026-08-03](32-default-jit-resource-governor-checkpoint-2026-08-03.md)
-  — landed D1 implementation commits, schema-9 projection, verification
+  — landed D1 implementation commits, schema-10 projection, verification
   evidence, and the exact combined-capacity, diagnostics, failure, structural,
   cold-start, and RSS work still blocking D1 closure.
 

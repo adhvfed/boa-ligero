@@ -1485,7 +1485,7 @@ impl Context {
                 record
             }
             JitRunOutcome::RetireAndInterpret => {
-                debug_assert!(backend.is_retiring_for_resource_overrun());
+                debug_assert!(backend.must_retire_before_interpreter());
                 drop(backend);
                 self.run_interpreter()
             }
@@ -1500,7 +1500,7 @@ impl Context {
     #[cfg(feature = "jit")]
     fn run_with_jit_backend(&mut self, backend: &mut crate::jit::JitBackend) -> JitRunOutcome {
         'scheduler: loop {
-            if backend.is_retiring_for_resource_overrun() {
+            if backend.must_retire_before_interpreter() {
                 return JitRunOutcome::RetireAndInterpret;
             }
             let frame = self.vm.frame();

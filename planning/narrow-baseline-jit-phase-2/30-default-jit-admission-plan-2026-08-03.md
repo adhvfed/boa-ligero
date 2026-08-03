@@ -19,7 +19,7 @@ or change script admission.
 Re-run the fixed nine-micro, three-engine, and W0 matrix from Gate O using the
 identified release runner, immutable fixture hashes, fresh processes, and the
 recorded alternating order. Headline timings keep diagnostics off; one
-separate schema-9 process per workload requests the 4,096 hard cap and is valid
+separate schema-10 process per workload requests the 4,096 hard cap and is valid
 only when all six dropped-record/observation counters are zero.
 
 The 2026-08-03 first Decision-B attempt is not selection evidence. Its exact
@@ -90,10 +90,11 @@ The design record is now
 breaker, 10 ms per-attempt and 100 ms cumulative compile breakers, a 1,024-
 instruction PC-zero ceiling, a 1,024-site legacy feedback cap, and the existing
 4,096-per-class diagnostic cap. D1's two implementation commits are landed in
-Boa `42623234` and `2888c024`, with schema-9 Ligero projection in `72568c9a`
-and `dfdc0714`. The combined capacity/variant, maximum-diagnostic,
-recoverable-failure, structural-emitter, and seven-pair cold/RSS evidence
-remain open, so D1 is not closed. See the
+Boa `42623234` and `2888c024`, with the initial schema-9 Ligero projection in
+`72568c9a` and `dfdc0714`. Returned compiler/module-failure containment adds a
+source-free retirement counter and therefore deliberately advances the
+diagnostic contract to schema 10. The seven-pair cold/RSS evidence remains
+open, so D1 is not closed. See the
 [implementation checkpoint](32-default-jit-resource-governor-checkpoint-2026-08-03.md).
 
 - a hard retained-entry and accounted-code bound;

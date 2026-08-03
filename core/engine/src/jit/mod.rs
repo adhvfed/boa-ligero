@@ -206,6 +206,8 @@ pub struct JitResourceCounters {
     pub slow_attempt: u64,
     /// Backends retired after a finalized artifact crossed a payload limit.
     pub payload_overrun_retirements: u64,
+    /// Backends retired after a returned compiler or module error.
+    pub compilation_failure_retirements: u64,
     /// Machine-code payload bytes retained by this usable backend.
     pub retained_code_bytes: usize,
     /// Aggregate observed wall time of completed compile attempts.
@@ -245,6 +247,8 @@ pub enum JitOsrRejectionReason {
     UnprovenValue,
     /// Native IR construction rejected an otherwise planned region.
     Lowering,
+    /// Native module declaration, definition, or finalization failed.
+    CompilerFailure,
 }
 
 /// Why new loop-OSR compilation was suppressed by a backend-wide bound.
@@ -280,6 +284,8 @@ pub struct JitOsrRejectionCounters {
     pub unproven_value: u64,
     /// Rejections from native IR construction.
     pub lowering: u64,
+    /// Rejections from a returned native module failure.
+    pub compiler_failure: u64,
 }
 
 impl JitOsrRejectionCounters {
@@ -294,6 +300,7 @@ impl JitOsrRejectionCounters {
             JitOsrRejectionReason::RepresentationMismatch => &mut self.representation_mismatch,
             JitOsrRejectionReason::UnprovenValue => &mut self.unproven_value,
             JitOsrRejectionReason::Lowering => &mut self.lowering,
+            JitOsrRejectionReason::CompilerFailure => &mut self.compiler_failure,
         };
         *counter = counter.saturating_add(1);
     }
@@ -355,7 +362,7 @@ pub struct JitOsrCounters {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 9;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 10;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -1136,8 +1143,18 @@ struct CachedEntry {
 #[derive(Clone, Copy)]
 enum FunctionEntryState {
     Ready(CachedEntry),
-    #[cfg(test)]
     TerminalFailure,
+}
+
+enum FunctionCompileResult {
+    Compiled {
+        entry: extern "C" fn(*mut Context) -> u64,
+        native: bool,
+        code_bytes: usize,
+        profile: native::NativeStaticProfile,
+        rejection: Option<native::NativeRejection>,
+    },
+    ModuleFailure(JitModuleFailureStage),
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -1281,6 +1298,28 @@ enum JitBackendHealth {
     Active,
     Compromised,
     RetiringResourceOverrun,
+    RetiringCompilationFailure,
+}
+
+/// A source-free point at which the native module returned an error.
+///
+/// Once declaration starts, the module may have retained state that cannot be
+/// individually reclaimed. Callers must retire the complete backend instead
+/// of attempting another producer on that module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JitModuleFailureStage {
+    NativeDeclare,
+    NativeDefine,
+    NativeCompiledCode,
+    NativeFinalize,
+    ShimDeclare,
+    ShimDefine,
+    ShimCompiledCode,
+    ShimFinalize,
+    LoopDeclare,
+    LoopDefine,
+    LoopCompiledCode,
+    LoopFinalize,
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -1355,6 +1394,8 @@ pub struct JitBackend {
     admission_allow_call_boundaries: bool,
     stats: JitStats,
     diagnostics: Option<JitDiagnosticState>,
+    #[cfg(test)]
+    compile_fault: Option<JitModuleFailureStage>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1410,6 +1451,8 @@ impl JitBackend {
             admission_allow_call_boundaries: false,
             stats: JitStats::default(),
             diagnostics: None,
+            #[cfg(test)]
+            compile_fault: None,
         }
     }
 
@@ -1429,8 +1472,17 @@ impl JitBackend {
         matches!(self.health, JitBackendHealth::Compromised)
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_retiring_for_resource_overrun(&self) -> bool {
         matches!(self.health, JitBackendHealth::RetiringResourceOverrun)
+    }
+
+    pub(crate) const fn must_retire_before_interpreter(&self) -> bool {
+        matches!(
+            self.health,
+            JitBackendHealth::RetiringResourceOverrun
+                | JitBackendHealth::RetiringCompilationFailure
+        )
     }
 
     pub(crate) const fn should_drop(&self) -> bool {
@@ -1449,6 +1501,36 @@ impl JitBackend {
                     counters.payload_overrun_retirements.saturating_add(1);
             });
         }
+    }
+
+    fn mark_compilation_failure(&mut self, _stage: JitModuleFailureStage) {
+        if self.health == JitBackendHealth::Active {
+            self.health = JitBackendHealth::RetiringCompilationFailure;
+            self.stats.compilation_failures = self.stats.compilation_failures.saturating_add(1);
+            self.update_resource_counters(|counters| {
+                counters.compilation_failure_retirements =
+                    counters.compilation_failure_retirements.saturating_add(1);
+            });
+        }
+    }
+
+    /// Return a source-free module failure at a deterministic private test
+    /// seam. Production builds contain no injectable emitter path.
+    pub(super) fn before_module_stage(
+        &mut self,
+        _stage: JitModuleFailureStage,
+    ) -> Result<(), JitModuleFailureStage> {
+        #[cfg(test)]
+        if self.compile_fault == Some(_stage) {
+            self.compile_fault = None;
+            return Err(_stage);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_module_stage_for_test(&mut self, stage: JitModuleFailureStage) {
+        self.compile_fault = Some(stage);
     }
 
     fn invalid_loop_state(&mut self) -> JitLoopScheduleAction {
@@ -1635,7 +1717,8 @@ impl JitBackend {
         match self.health {
             JitBackendHealth::Active => {}
             JitBackendHealth::Compromised => return LoopRegionAction::Closed,
-            JitBackendHealth::RetiringResourceOverrun => {
+            JitBackendHealth::RetiringResourceOverrun
+            | JitBackendHealth::RetiringCompilationFailure => {
                 self.update_osr_counters(|counters| {
                     counters.cache_misses = counters.cache_misses.saturating_add(1);
                 });
@@ -1783,6 +1866,12 @@ impl JitBackend {
                 self.reject_loop_region(key, reason);
                 false
             }
+            native::LoopNativeCompileResult::ModuleFailure(stage) => {
+                self.record_loop_compile_result(false, 0, compile_ns);
+                self.reject_loop_region(key, JitOsrRejectionReason::CompilerFailure);
+                self.mark_compilation_failure(stage);
+                false
+            }
         }
     }
 
@@ -1805,7 +1894,8 @@ impl JitBackend {
         match self.health {
             JitBackendHealth::Active => {}
             JitBackendHealth::Compromised => return JitLoopScheduleAction::Invalid,
-            JitBackendHealth::RetiringResourceOverrun => {
+            JitBackendHealth::RetiringResourceOverrun
+            | JitBackendHealth::RetiringCompilationFailure => {
                 return JitLoopScheduleAction::Closed;
             }
         }
@@ -2515,7 +2605,6 @@ impl JitBackend {
                 self.diagnostics.is_some(),
             )) {
                 Some(FunctionEntryState::Ready(entry)) => Some(entry.native),
-                #[cfg(test)]
                 Some(FunctionEntryState::TerminalFailure) => None,
                 None => None,
             };
@@ -2551,9 +2640,6 @@ impl JitBackend {
         code: &CodeBlock,
         charge_instruction_budget: bool,
     ) -> Option<CachedEntry> {
-        if self.health != JitBackendHealth::Active {
-            return None;
-        }
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
         let cache_key = JitCacheKey::function(code.debug_id, charge_instruction_budget, diagnostic);
@@ -2561,8 +2647,10 @@ impl JitBackend {
         if let Some(state) = self.cache.get(&cache_key).copied() {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
             return match state {
-                FunctionEntryState::Ready(cached) => Some(cached),
-                #[cfg(test)]
+                FunctionEntryState::Ready(cached) if self.health == JitBackendHealth::Active => {
+                    Some(cached)
+                }
+                FunctionEntryState::Ready(_) => None,
                 FunctionEntryState::TerminalFailure => {
                     self.update_resource_counters(|counters| {
                         counters.terminal_failure_hits =
@@ -2571,6 +2659,10 @@ impl JitBackend {
                     None
                 }
             };
+        }
+
+        if self.health != JitBackendHealth::Active {
+            return None;
         }
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
@@ -2584,11 +2676,29 @@ impl JitBackend {
             self.record_compilation_suppression(reason);
             return None;
         }
+        // An admitted exact key owns one terminal state before its only
+        // producer runs. This makes a returned module failure non-retryable
+        // without introducing another failure map.
+        self.cache
+            .insert(cache_key, FunctionEntryState::TerminalFailure);
         let started = Instant::now();
-        let (entry, native, code_bytes, native_profile, rejection) =
-            self.compile_codeblock_with_kind(code, charge_instruction_budget, diagnostic);
+        let result = self.compile_codeblock_with_kind(code, charge_instruction_budget, diagnostic);
         let compile_ns = started.elapsed().as_nanos();
         self.stats.compile_time_ns = self.stats.compile_time_ns.saturating_add(compile_ns);
+        let (entry, native, code_bytes, native_profile, rejection) = match result {
+            FunctionCompileResult::Compiled {
+                entry,
+                native,
+                code_bytes,
+                profile,
+                rejection,
+            } => (entry, native, code_bytes, profile, rejection),
+            FunctionCompileResult::ModuleFailure(stage) => {
+                self.record_compilation_result(0, compile_ns, false);
+                self.mark_compilation_failure(stage);
+                return None;
+            }
+        };
         self.stats.compilations = self.stats.compilations.saturating_add(1);
         if native {
             self.stats.native_compilations = self.stats.native_compilations.saturating_add(1);
@@ -2839,7 +2949,12 @@ impl JitBackend {
     #[must_use]
     #[cfg(test)]
     fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
-        self.compile_codeblock_with_kind(code, false, false).0
+        match self.compile_codeblock_with_kind(code, false, false) {
+            FunctionCompileResult::Compiled { entry, .. } => entry,
+            FunctionCompileResult::ModuleFailure(stage) => {
+                panic!("test-only compilation failed at {stage:?}")
+            }
+        }
     }
 
     fn compile_codeblock_with_kind(
@@ -2847,13 +2962,7 @@ impl JitBackend {
         code: &CodeBlock,
         charge_instruction_budget: bool,
         instrument_storage: bool,
-    ) -> (
-        extern "C" fn(*mut Context) -> u64,
-        bool,
-        usize,
-        native::NativeStaticProfile,
-        Option<native::NativeRejection>,
-    ) {
+    ) -> FunctionCompileResult {
         let collect_diagnostic_metadata = self.diagnostics.is_some();
         match native::compile(
             self,
@@ -2866,16 +2975,28 @@ impl JitBackend {
                 entry,
                 profile,
                 code_bytes,
-            } => (entry, true, code_bytes, profile, None),
+            } => FunctionCompileResult::Compiled {
+                entry,
+                native: true,
+                code_bytes,
+                profile,
+                rejection: None,
+            },
             native::NativeCompileResult::Rejected(rejection) => {
-                let (entry, code_bytes) = self.compile_shim_codeblock(code);
-                (
+                let (entry, code_bytes) = match self.compile_shim_codeblock(code) {
+                    Ok(compiled) => compiled,
+                    Err(stage) => return FunctionCompileResult::ModuleFailure(stage),
+                };
+                FunctionCompileResult::Compiled {
                     entry,
-                    false,
+                    native: false,
                     code_bytes,
-                    native::NativeStaticProfile::default(),
-                    Some(rejection),
-                )
+                    profile: native::NativeStaticProfile::default(),
+                    rejection: Some(rejection),
+                }
+            }
+            native::NativeCompileResult::ModuleFailure(stage) => {
+                FunctionCompileResult::ModuleFailure(stage)
             }
         }
     }
@@ -2886,7 +3007,7 @@ impl JitBackend {
     fn compile_shim_codeblock(
         &mut self,
         code: &CodeBlock,
-    ) -> (extern "C" fn(*mut Context) -> u64, usize) {
+    ) -> Result<(extern "C" fn(*mut Context) -> u64, usize), JitModuleFailureStage> {
         let ptr = self.module.target_config().pointer_type();
 
         // Walk the bytecode into (pc, opcode index, linear-next pc, jump target)
@@ -3017,18 +3138,26 @@ impl JitBackend {
         }
 
         let name = self.next_fn_name("jit_codeblock");
+        self.before_module_stage(JitModuleFailureStage::ShimDeclare)?;
         let id = self
             .module
             .declare_function(&name, Linkage::Export, &cctx.func.signature)
-            .expect("declare");
-        self.module.define_function(id, &mut cctx).expect("define");
+            .map_err(|_| JitModuleFailureStage::ShimDeclare)?;
+        self.before_module_stage(JitModuleFailureStage::ShimDefine)?;
+        self.module
+            .define_function(id, &mut cctx)
+            .map_err(|_| JitModuleFailureStage::ShimDefine)?;
+        self.before_module_stage(JitModuleFailureStage::ShimCompiledCode)?;
         let code_bytes = cctx
             .compiled_code()
-            .expect("defined function has compiled code")
+            .ok_or(JitModuleFailureStage::ShimCompiledCode)?
             .code_buffer()
             .len();
         self.module.clear_context(&mut cctx);
-        self.module.finalize_definitions().expect("finalize");
+        self.before_module_stage(JitModuleFailureStage::ShimFinalize)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|_| JitModuleFailureStage::ShimFinalize)?;
 
         let code_ptr = self.module.get_finalized_function(id);
         // SAFETY: the compiled function matches this signature, and `self` owns
@@ -3036,7 +3165,7 @@ impl JitBackend {
         let entry = unsafe {
             std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
         };
-        (entry, code_bytes)
+        Ok((entry, code_bytes))
     }
 
     /// Compile `code` and run it against the current (already-entered) frame on
@@ -3626,6 +3755,200 @@ mod tests {
             Some(42)
         );
         assert!(!context.jit_enabled(), "overrun module must be dropped");
+    }
+
+    #[test]
+    fn jit_returned_module_failures_are_terminal_and_source_free() {
+        let native_code = first_function_code("function add(left, right) { return left + right; }");
+        for stage in [
+            JitModuleFailureStage::NativeDeclare,
+            JitModuleFailureStage::NativeDefine,
+            JitModuleFailureStage::NativeCompiledCode,
+            JitModuleFailureStage::NativeFinalize,
+        ] {
+            let mut backend = JitBackend::new();
+            backend.fail_next_module_stage_for_test(stage);
+            assert!(
+                backend.cached_entry(&native_code, false).is_none(),
+                "{stage:?}"
+            );
+            assert!(matches!(
+                backend
+                    .cache
+                    .get(&JitCacheKey::function(native_code.debug_id, false, false)),
+                Some(FunctionEntryState::TerminalFailure)
+            ));
+            assert!(backend.must_retire_before_interpreter());
+            assert_eq!(backend.stats().compilation_failures, 1, "{stage:?}");
+            assert_eq!(
+                backend.stats().resources.compilation_failure_retirements,
+                1,
+                "{stage:?}"
+            );
+            let attempts = backend.stats().compilation_failures;
+            assert!(
+                backend.cached_entry(&native_code, false).is_none(),
+                "{stage:?}"
+            );
+            assert_eq!(backend.stats().compilation_failures, attempts, "{stage:?}");
+            assert_eq!(
+                backend.stats().resources.terminal_failure_hits,
+                1,
+                "{stage:?}"
+            );
+        }
+
+        let shim_code = first_function_code("function bitwise(value) { return value | 0; }");
+        for stage in [
+            JitModuleFailureStage::ShimDeclare,
+            JitModuleFailureStage::ShimDefine,
+            JitModuleFailureStage::ShimCompiledCode,
+            JitModuleFailureStage::ShimFinalize,
+        ] {
+            let mut backend = JitBackend::new();
+            backend.fail_next_module_stage_for_test(stage);
+            assert!(
+                backend.cached_entry(&shim_code, false).is_none(),
+                "{stage:?}"
+            );
+            assert!(matches!(
+                backend
+                    .cache
+                    .get(&JitCacheKey::function(shim_code.debug_id, false, false)),
+                Some(FunctionEntryState::TerminalFailure)
+            ));
+            assert!(backend.must_retire_before_interpreter());
+            assert_eq!(backend.stats().compilation_failures, 1, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn jit_returned_loop_module_failures_are_terminal_and_source_free() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            false,
+            false,
+        )
+        .expect("selected loop plan");
+
+        for stage in [
+            JitModuleFailureStage::LoopDeclare,
+            JitModuleFailureStage::LoopDefine,
+            JitModuleFailureStage::LoopCompiledCode,
+            JitModuleFailureStage::LoopFinalize,
+        ] {
+            let mut backend = JitBackend::new();
+            backend.set_thresholds(JitThresholds {
+                function_entries: u32::MAX,
+                loop_backedges: 1,
+            });
+            assert_eq!(
+                backend.observe_loop_region(plan.key),
+                LoopRegionAction::Compile,
+                "{stage:?}"
+            );
+            backend.fail_next_module_stage_for_test(stage);
+            assert!(!backend.compile_loop_region(&code, &plan), "{stage:?}");
+            assert!(matches!(
+                backend.loop_regions.get(&plan.key),
+                Some(LoopRegionState {
+                    kind: LoopRegionStateKind::Rejected {
+                        reason: JitOsrRejectionReason::CompilerFailure
+                    },
+                    ..
+                })
+            ));
+            assert!(backend.compiled_loop_entry_for_test(plan.key).is_none());
+            assert!(backend.must_retire_before_interpreter());
+            assert_eq!(backend.stats().compilation_failures, 1, "{stage:?}");
+            assert_eq!(backend.stats().osr.compile_attempts, 1, "{stage:?}");
+            assert_eq!(
+                backend.stats().osr.rejections.compiler_failure,
+                1,
+                "{stage:?}"
+            );
+            assert!(!backend.compile_loop_region(&code, &plan), "{stage:?}");
+            assert_eq!(backend.stats().osr.compile_attempts, 1, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn context_owned_jit_drops_returned_function_module_failure_before_interpreter() {
+        let mut context = Context::default();
+        crate::Script::parse(
+            crate::Source::from_bytes("function add(left, right) { return left + right; }"),
+            None,
+            &mut context,
+        )
+        .expect("parse definition")
+        .evaluate(&mut context)
+        .expect("define function");
+        context.enable_jit();
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        backend.set_thresholds(JitThresholds {
+            function_entries: 1,
+            loop_backedges: u32::MAX,
+        });
+        backend.admission_min_straight_line_instructions = 0;
+        backend.fail_next_module_stage_for_test(JitModuleFailureStage::NativeDefine);
+
+        let call =
+            crate::Script::parse(crate::Source::from_bytes("add(20, 22)"), None, &mut context)
+                .expect("parse call");
+        assert_eq!(
+            call.evaluate(&mut context)
+                .expect("interpreter continuation")
+                .as_i32(),
+            Some(42)
+        );
+        assert!(!context.jit_enabled(), "failed module must be dropped");
+        assert_eq!(
+            crate::Script::parse(crate::Source::from_bytes("40 + 2"), None, &mut context)
+                .expect("parse recovery")
+                .evaluate(&mut context)
+                .expect("interpreter recovery")
+                .as_i32(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_drops_returned_loop_module_failure_before_interpreter() {
+        let mut context = Context::default();
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition")
+        .evaluate(&mut context)
+        .expect("define function");
+        context.enable_jit();
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        backend.fail_next_module_stage_for_test(JitModuleFailureStage::LoopDefine);
+
+        let call = crate::Script::parse(crate::Source::from_bytes("once(3)"), None, &mut context)
+            .expect("parse call");
+        assert_eq!(
+            call.evaluate(&mut context)
+                .expect("interpreter continuation")
+                .as_i32(),
+            Some(3)
+        );
+        assert!(!context.jit_enabled(), "failed module must be dropped");
     }
 
     #[test]
