@@ -317,3 +317,11 @@ mapping discovered in the preceding work. Refactoring commits must be behavior
 neutral and separately revertible. Formatting plus warning-denying Clippy on
 affected JIT/VM targets is required for each slice; pre-existing wider warnings
 must be recorded rather than silently normalized into a growing baseline.
+
+**4A1.R passed 2026-08-03:** Boa `6dc6aa07` consolidates loop status,
+pending-state, cached-PC, and materialized-frame validation behind one private
+typed contract and deduplicates accepted-exit accounting. The complete focused
+and full engine suites pass; strict lint has no slice-local finding;
+Earley-Boyer remains inside 5%; and a clean W0 sample retains exact structure,
+entry taxonomy, and zero-drop schema-8 diagnostics. See the
+[refactor checkpoint](29-slice-4a1-exit-contract-refactor-2026-08-03.md).

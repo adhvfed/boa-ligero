@@ -75,8 +75,10 @@ ownership and diagnostic observation. Gate O now passes: Crypto is +2.125%,
 DeltaBlue -0.403%, Earley-Boyer +4.412%, and seven W0 pairs improve median cold
 load by 29.607% with exact sink/paint/memory structure. A separate schema-8 W0
 sample has zero drops and distinguishes 999 PC-zero returns from one OSR
-continuation. The separately revertible 4A1.R loop-exit-contract refactor is
-now the only scheduled implementation slice before Decision checkpoint B.
+continuation. Boa `6dc6aa07` now completes the separately revertible 4A1.R
+loop-exit-contract refactor with the full semantic/containment suite green,
+Earley-Boyer at +4.287%, and a clean zero-drop W0 sample. Decision checkpoint B
+is next and must re-profile before selecting any second ABI.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -191,7 +193,10 @@ Every Phase 2 entry and exit ABI inherits that rule.
     complete:** Boa `8c8af54c` removes denied-loop observer overhead without
     weakening the scheduler boundary; all fixed engine rows remain inside 5%,
     W0 improves by 29.607%, and separate schema-8 diagnostics have zero drops.
-    **Next:** the behavior-neutral 4A1.R loop-exit-contract refactor.
+    **Refactor complete:** Boa `6dc6aa07` consolidates native loop-exit
+    validation/accounting behind a private typed contract without changing the
+    ABI or policy; the focused/full engine, Earley-Boyer, and clean W0 gates
+    pass. **Next:** Decision checkpoint B re-profiling.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -287,6 +292,10 @@ showing that another boundary dominates.
 - [Slice 4A1 workload gate, 2026-08-03](28-slice-4a1-workload-gate-2026-08-03.md)
   — the final engine/W0 rollback matrix, denied-loop observer correction,
   zero-drop schema-8 evidence, Gate O decision, and bounded 4A1.R handoff.
+- [Slice 4A1 exit-contract refactor, 2026-08-03](29-slice-4a1-exit-contract-refactor-2026-08-03.md)
+  — the separately revertible typed exit-validation cleanup, semantic and
+  containment reruns, Earley sentinel, clean W0 evidence, and checkpoint-B
+  handoff.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

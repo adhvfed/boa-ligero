@@ -424,7 +424,8 @@ Land the shape through these independently reversible boundaries:
    retaining the unreachable planner/compiler for diagnosis. It blocks 4A1.R,
    Decision checkpoint B, and every second ABI. Passing does not authorize
    default JIT or remote-script execution.
-6. **4A1.R — behavior-neutral loop-exit-contract refactor (scheduled).**
+6. **4A1.R — behavior-neutral loop-exit-contract refactor (complete, Boa
+   `6dc6aa07`).**
    Extract exactly the status/pending-state/cached-metadata validation and
    action mapping concentrated in `JitBackend::invoke_loop_region` into a
    private typed contract. Preserve the public status encoding, generated
@@ -435,7 +436,9 @@ Land the shape through these independently reversible boundaries:
    suite, exhaustive budget/loop-limit differentials, malformed-status table,
    64+1 ownership tests, feature-disabled check, strict affected-target Clippy,
    Earley-Boyer sentinel, and one W0 structural/zero-drop sample. Decision
-   checkpoint B and every second ABI wait for this refactor.
+   checkpoint B and every second ABI waited for this refactor. Checkpoint 29
+   records 73/1 focused and 1,219/1 full engine results, unchanged strict-lint
+   findings, Earley-Boyer at +4.287%, and a clean zero-drop W0 sample.
 
 The compiler and scheduler commits are deliberately separate. A compiler test
 may execute its generated function through a test-only harness, but production
@@ -459,12 +462,13 @@ strict all-target Clippy has no slice-local delta beyond the 16 recorded
 findings. This establishes the wiring, not the exhaustive boundary or workload
 gate scheduled in 4A1.5.
 
-**Slice 4A1 stop/go: passed.** The one-shot hot loop enters through OSR and the
-full semantic, containment, micro, engine, and browser gate passes. This accepts
-only the first numeric OSR shape and schedules 4A1.R; it does not authorize
-another ABI or default enablement.
+**Slice 4A1 stop/go and refactor gate: passed.** The one-shot hot loop enters
+through OSR; the full semantic, containment, micro, engine, and browser gate
+passes; and 4A1.R preserves the result. This accepts only the first numeric OSR
+shape. Decision checkpoint B must re-profile before another ABI is selected,
+and default enablement remains gated separately.
 
-Remaining suggested commits:
+Completed refactor commit:
 
 ```text
 refactor(jit): consolidate loop region exit plumbing
