@@ -24,12 +24,33 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use rustc_hash::FxHashMap;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 mod native;
 
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Accounted `code_buffer` bytes released by [`JitBackend`]'s destructor on
+    /// this thread, and the number of destructors that ran.
+    ///
+    /// Test-only witness that the reclamation path ran for a backend that
+    /// really held emitted code. The byte total is the governor's own
+    /// accounting at the moment of release — the only number the governor can
+    /// attribute — not a count of unmapped pages, which the process cannot
+    /// observe portably. Thread-local rather than global so the parallel test
+    /// harness cannot perturb a measurement.
+    static RELEASED_CODE: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Snapshot of this thread's reclamation witnesses: `(bytes, modules)`.
+#[cfg(test)]
+fn released_code_totals() -> (usize, u64) {
+    RELEASED_CODE.with(std::cell::Cell::get)
+}
 
 /// High bit of a shim's `u64` return value: set means the op broke (a
 /// [`CompletionRecord`] was stashed in `vm.jit_pending`); clear means continue,
@@ -1351,16 +1372,22 @@ fn same_frame_jump_target(instr: &Instruction) -> Option<u32> {
 
 /// A JIT backend bound to the host machine.
 ///
-/// Owns the [`JITModule`]; dropping it frees the emitted code, so callers must
-/// keep it alive for as long as any compiled function pointer is in use. The
-/// real tier will hold one of these per realm.
+/// Owns the [`JITModule`]. Dropping the backend releases every executable page
+/// the module allocated (see the [`Drop`] impl), so callers must keep it alive
+/// for as long as any compiled function pointer is in use. The compiled
+/// pointers never leave this type, which is what makes that release sound; see
+/// the destructor's safety argument. The real tier will hold one of these per
+/// realm.
 pub struct JitBackend {
     id: u64,
     /// Set after generated code returns metadata that cannot be reconciled
     /// with the immutable artifact contract. A compromised backend is never
     /// retained or entered again by the context-owned scheduler.
     health: JitBackendHealth,
-    pub(super) module: JITModule,
+    /// `ManuallyDrop` because reclamation needs `JITModule` by value:
+    /// `JITModule::free_memory` consumes it, while `JITModule`'s own `Drop`
+    /// deliberately leaks the pages. The destructor below is the only consumer.
+    pub(super) module: ManuallyDrop<JITModule>,
     /// Monotonic counter for unique symbol names. `JITModule::declare_function`
     /// deduplicates by name, so reusing a fixed name (e.g. "`jit_codeblock`")
     /// across compilations makes the second `define_function` fail with
@@ -1411,6 +1438,80 @@ impl std::fmt::Debug for JitBackend {
     }
 }
 
+impl Drop for JitBackend {
+    /// Release every executable page this backend's module allocated.
+    ///
+    /// `JITModule`'s own `Drop` deliberately leaks its allocations so that
+    /// function pointers stay valid for the rest of the process. That default
+    /// makes the resource governor's payload ceilings bound only how much code
+    /// *one* generation emits, not how much a process retains across
+    /// generations: every `RetireAndInterpret` retirement, every
+    /// [`Context::disable_jit`], and every context teardown would strand up to
+    /// `MAX_RETAINED_CODE_BYTES` of executable pages permanently. Reclaiming
+    /// them is what makes the governor a memory bound rather than a
+    /// per-generation emission bound.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let released = self.stats.resources.retained_code_bytes;
+            RELEASED_CODE.with(|cell| {
+                let (bytes, modules) = cell.get();
+                cell.set((bytes.saturating_add(released), modules.saturating_add(1)));
+            });
+        }
+
+        // SAFETY: `JITModule::free_memory` requires that no function from this
+        // module is executing and that no pointer obtained from it is called
+        // afterwards. Both hold for every `JitBackend`, by construction:
+        //
+        // 1. No module-owned address escapes this type. The only pointers
+        //    `get_finalized_function` yields are stored in the private
+        //    `cache` (`CachedEntry::entry`) and `loop_cache`
+        //    (`LoopCachedEntry::compiled.entry`) maps, which this same
+        //    destructor drops. `JitBackend`'s entire public surface is
+        //    `new`, `stats`, `thresholds`, `set_thresholds`, and the three
+        //    diagnostic methods; none returns a code address, and `JitStats`
+        //    and `JitDiagnosticSnapshot` are counters and `(pc, kind, reason)`
+        //    exit records. Nothing durable — `CodeBlock` admission state,
+        //    `call_targets` (bytecode `debug_id`s, not addresses),
+        //    `vm.jit_pending`, `vm.jit_exit_pending` — holds a native address.
+        //
+        // 2. Compiled code contains no cross-module or self-referential code
+        //    pointers. Every call the lowering emits is an indirect call
+        //    through an absolute constant naming a *Rust* function
+        //    (`JIT_OP_SHIMS[..] as usize`, and the runtime helpers in
+        //    `native.rs`), never `declare_func_in_func`. There are no data
+        //    objects. Each compiled body is therefore a leaf with respect to
+        //    this module, and no other module can hold a reference into it.
+        //
+        // 3. Nothing can be executing. A compiled entry is only ever called
+        //    from `invoke_cached_entry` and `invoke_loop_region`, both
+        //    `&mut self` methods, so the borrow checker keeps this value alive
+        //    and undroppable for the whole native call — including when a
+        //    shim re-enters the interpreter, calls an embedder host function,
+        //    or unwinds, since all of those pop the native frames before the
+        //    frame owning this backend. Native code receives only
+        //    `*mut Context`, and `Context::jit_backend` is `None` for the
+        //    entire duration of a native call (`Context::run` moves the
+        //    backend into a local before entering), so no re-entrant
+        //    `disable_jit`, `enable_jit`, or nested `Context::run` reachable
+        //    from that pointer can observe or drop the executing backend.
+        //    `Script::evaluate_jit` borrows a caller-owned backend `&mut` for
+        //    the same reason, and that backend is unreachable from `Context`.
+        //
+        // 4. Deopts and OSR continuations do not resume into freed code. Every
+        //    exit is an ordinary `return` of a `u64` status; the interpreter
+        //    continues from `frame.pc`, and re-entry requires a fresh cache
+        //    lookup on a live backend.
+        //
+        // `ManuallyDrop::take` moves the module out exactly once, and the field
+        // is never touched again.
+        unsafe {
+            ManuallyDrop::take(&mut self.module).free_memory();
+        }
+    }
+}
+
 impl JitBackend {
     /// Straight-line native bodies below this size did not amortize their
     /// entry transition in the measured Phase 2 crossover. Backward-branch
@@ -1437,7 +1538,7 @@ impl JitBackend {
         Self {
             id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
             health: JitBackendHealth::Active,
-            module: JITModule::new(builder),
+            module: ManuallyDrop::new(JITModule::new(builder)),
             next_fn_id: 0,
             cache: FxHashMap::default(),
             loop_regions: FxHashMap::default(),
@@ -3723,6 +3824,103 @@ mod tests {
         );
         assert_eq!(overrun.stats().resources.payload_overrun_retirements, 1);
         assert!(overrun.cached_entry(&ready_code, false).is_none());
+    }
+
+    /// D1 acceptance item 10: dropping a backend releases the executable code
+    /// it owns. Measured through the governor's own accounting — the bytes it
+    /// charged against `MAX_RETAINED_CODE_BYTES` are the bytes it reports
+    /// released — rather than RSS, which is too noisy and too coarse to
+    /// attribute a [`MAX_RETAINED_CODE_BYTES`] ceiling to.
+    #[test]
+    fn jit_backend_drop_releases_accounted_executable_code() {
+        let code = first_function_code("function add(left, right) { return left + right; }");
+
+        let (bytes_before, modules_before) = released_code_totals();
+
+        let mut backend = JitBackend::new();
+        backend.admission_min_straight_line_instructions = 0;
+        assert!(
+            backend.cached_entry(&code, false).is_some(),
+            "the witness is only meaningful for a backend that emitted code"
+        );
+        let accounted = backend.stats().resources.retained_code_bytes;
+        assert!(accounted > 0, "compilation must have charged code bytes");
+
+        assert_eq!(
+            released_code_totals(),
+            (bytes_before, modules_before),
+            "nothing is released while the backend is live"
+        );
+
+        drop(backend);
+
+        assert_eq!(
+            released_code_totals(),
+            (bytes_before + accounted, modules_before + 1),
+            "backend drop must release every accounted code byte it owned"
+        );
+    }
+
+    /// The retirement path drops a module whose pages a compiled entry has
+    /// already executed from. Nothing may reach into that code afterwards: the
+    /// interpreter has to keep producing correct results for the very function
+    /// whose native entry was just freed.
+    #[test]
+    fn context_owned_jit_retirement_frees_executed_code_and_keeps_interpreting() {
+        let mut context = Context::default();
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function add(left, right) { return left + right; }
+                 function mul(left, right) { return left * right; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definitions")
+        .evaluate(&mut context)
+        .expect("define functions");
+
+        context.enable_jit();
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        backend.set_thresholds(JitThresholds {
+            function_entries: 1,
+            loop_backedges: u32::MAX,
+        });
+        backend.admission_min_straight_line_instructions = 0;
+
+        let eval = |context: &mut Context, source: &str| {
+            crate::Script::parse(crate::Source::from_bytes(source), None, context)
+                .expect("parse call")
+                .evaluate(context)
+                .expect("evaluate")
+                .as_i32()
+        };
+
+        // Prime a real compiled entry and execute it, so the module that is
+        // about to be freed holds pages this thread has actually run from.
+        assert_eq!(eval(&mut context, "add(20, 22)"), Some(42));
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        assert!(backend.stats().resources.retained_code_bytes > 0);
+        assert!(backend.stats().compilations > 0);
+
+        // Push the next compile over the payload ceiling. It retires the whole
+        // backend, which frees `add`'s entry along with the overrun artifact.
+        backend.stats.resources.retained_code_bytes = MAX_RETAINED_CODE_BYTES - 1;
+        let (bytes_before, modules_before) = released_code_totals();
+
+        assert_eq!(eval(&mut context, "mul(6, 7)"), Some(42));
+        assert!(!context.jit_enabled(), "overrun module must be retired");
+
+        let (bytes_after, modules_after) = released_code_totals();
+        assert_eq!(modules_after, modules_before + 1, "one module was released");
+        assert_eq!(bytes_after, bytes_before + MAX_RETAINED_CODE_BYTES - 1);
+
+        // The interpreter continues from the proven VM state, including for
+        // the function whose native code no longer exists.
+        for _ in 0..4 {
+            assert_eq!(eval(&mut context, "add(20, 22)"), Some(42));
+            assert_eq!(eval(&mut context, "mul(6, 7)"), Some(42));
+        }
     }
 
     #[test]
