@@ -139,16 +139,30 @@ numeric loop from the production post-backedge scheduler, reuses its exact
 artifact in a later frame, preserves a generous-budget control, replays I32
 overflow, propagates the loop limit, rejects a nonnumeric frame without
 poisoning the numeric variant, and validates returned PCs against immutable
-cache metadata. This is necessary but not sufficient for Gate O: the exact
-boundary matrix, scheduler-level malformed-status containment, production
-cache saturation, forced-GC/nested-frame cases, and fixed workload timing are
-Slice 4A1.5 and remain open.
+cache metadata. This is necessary but not sufficient for Gate O. Slice 4A1.5a
+closes the exact semantic/accounting boundary matrix, and Slice 4A1.5b closes
+scheduler-level malformed-status containment, production cache saturation,
+and forced-GC/nested-frame lifetime checks. The fixed workload timing in
+4A1.5c remains open. See the
+[accounting checkpoint](24-slice-4a1-accounting-checkpoint-2026-08-03.md) and
+[containment checkpoint](25-slice-4a1-containment-checkpoint-2026-08-03.md).
 
 4A1.5 is verification-only: it may add tests, harness controls, measurement
 records, and a direct rollback of 4A1.4, but no opcode widening, threshold
 tuning, new representation, cache-policy redesign, or second execution ABI.
+Before timing, add an explicit production-threshold-only cold-OSR runner mode.
+The existing JIT runner is not this control: it first executes a threshold-1
+PC-zero native sample in another context, warming compilation in the process,
+and its stdout omits OSR compilation/entry counters. The new mode must parse and
+perform top-level setup before timing, enable the JIT without overriding
+production thresholds, execute no warmup or PC-zero control, time exactly one
+`main()` call, and report sink, elapsed/compile time, whole-function artifacts,
+and OSR attempts/compilations/entries/deopts/continuations. Keep the existing
+mode unchanged for Decision-A baseline comparability.
+
 For the durable 2,000,000-backedge one-shot control, run seven fresh-process,
-order-alternating interpreter/JIT pairs with one cold call and diagnostics off.
+order-alternating interpreter/isolated-OSR pairs with one cold call and
+diagnostics off.
 Require identical sink, exactly one OSR compilation and entry, zero unexpected
 deopts, and at least a 2× median speedup including synchronous compilation. The
 2× floor is deliberately below the recorded 3.96× whole-body counterfactual
@@ -203,6 +217,11 @@ baseline is 30.521%). Any failure disables or reverts the 4A1.4 scheduler edge
 while retaining the unreachable planner/compiler for diagnosis; it blocks
 4A1.R, Decision checkpoint B, and every second execution ABI. Passing this
 matrix still does not satisfy W2 or authorize default JIT/remote-script use.
+
+Record the Boa/Ligero commits and SHA-256 hashes of both release binaries in the
+4A1.5c checkpoint. A stale or locally rebuilt binary invalidates the row rather
+than becoming an unexplained rerun. Store raw per-process samples alongside
+medians and paired deltas so the rollback decision is independently auditable.
 
 **Decision checkpoint A now satisfies the selection form of Gate P for one
 narrow branch.** Schema 7 plus corrected 4,096-record runner controls retain

@@ -105,9 +105,11 @@ allocation-free suppressed when the table is full, while already retained
 ready keys remain usable. The 1 MiB emitted-loop-code and 10 ms compile-time
 limits are post-attempt circuit breakers, not physical-memory or latency caps:
 the unavoidable completed attempt may cross them, after which later unseen
-work is suppressed. Slice 4A1.5 must prove those bounds through the production
-scheduler, including that state, plan, and artifact maps cannot diverge in
-cardinality or retain a suppressed 65th key.
+work is suppressed. Slice 4A1.5b now proves those bounds through the production
+scheduler: state, plan, and artifact maps remain at exactly 64 retained keys,
+the suppressed 65th key leaves no partial state, and a retained ready key still
+enters its cached artifact at capacity. See the
+[containment checkpoint](25-slice-4a1-containment-checkpoint-2026-08-03.md).
 
 ## Cold-start policy
 

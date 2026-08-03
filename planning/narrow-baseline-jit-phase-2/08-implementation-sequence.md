@@ -390,18 +390,26 @@ Land the shape through these independently reversible boundaries:
      limit/error/remaining-budget/PC/sink state. The landed production-path
      harness sweeps every budget boundary rather than only the three required
      points and covers Add/Sub/Mul/Inc overflow replay in both cache modes.
-   - **4A1.5b, containment/lifetime:** forced GC around compile/cache entry/
+   - **4A1.5b, containment/lifetime (complete, Boa `44d45ca3`, `68d795fd`,
+     `e37f2398`, and `e34f8530`):** forced GC around compile/cache entry/
      return, recursion and nested frames, dynamic representation change,
      malformed status/resume/pending-completion containment, stale guard
      rejection, and 64 scheduler-reached keys plus suppressed 65th-key and
-     ready-key-at-capacity behavior across state/plan/artifact maps.
+     ready-key-at-capacity behavior across state/plan/artifact maps. Invalid
+     loop state disables the compromised backend, unwinds to the base frame,
+     clears paired pending state, and leaves later interpreter execution usable.
    - **4A1.5c, performance/browser:** seven order-alternating cold one-shot
      pairs must preserve the sink and deliver at least a 2× median speedup with
-     exactly one expected OSR compile/entry. Re-run the checksummed Decision-A
-     micro/engine/W0 matrix with diagnostics off for timings; every negative
-     row remains within 5%, and W0 retains exact sink/paint/accounted-byte
-     structure, its PC-zero entry, and at least a 20% paired cold-load win.
-     Diagnostics run separately and must have zero dropped records.
+     exactly one expected OSR compile/entry. First add a measurement-only
+     production-threshold cold-OSR runner mode: it must execute no warmup,
+     threshold-1 PC-zero control, or prior native compilation in that process,
+     and must print whole-function plus OSR counters after the timed call. Keep
+     the existing runner mode unchanged for baseline comparison. Re-run the
+     checksummed Decision-A micro/engine/W0 matrix with diagnostics off for
+     timings; every negative row remains within 5%, and W0 retains exact sink/
+     paint/accounted-byte structure, its PC-zero entry, and at least a 20%
+     paired cold-load win. Diagnostics run separately and must have zero
+     dropped records. Record release-binary hashes and raw samples.
 
    Any 4A1.5 failure reverts or disables only `55701ef4`'s scheduler edge while
    retaining the unreachable planner/compiler for diagnosis. It blocks 4A1.R,
@@ -443,7 +451,7 @@ materialization gap.
 Remaining suggested commits:
 
 ```text
-test(jit): close loop OSR differential gates
+perf(jit): close loop OSR workload gate
 refactor(jit): consolidate loop region exit plumbing
 ```
 

@@ -56,10 +56,13 @@ dispatch handoff make the first numeric shape reachable without changing
 opcode eligibility. Boa `92acfa22` closes 4A1.5a with exhaustive cold/cache-hit
 instruction-budget and loop-limit differentials through the production path,
 including every first-shape opcode PC and every arithmetic replay guard. Slice
-4A1 is not closed yet: 4A1.5b must close security/cache containment and 4A1.5c
-must close the fixed performance/browser rollback matrix before the scheduler
-edge is accepted. The separately revertible 4A1.R refactor remains mandatory
-after that gate and before Decision checkpoint B.
+4A1 is not closed yet. Boa `44d45ca3`, `68d795fd`, `e37f2398`, and `e34f8530`
+now close 4A1.5b with fail-closed malformed-state containment, forced-GC/
+nested-frame lifetime coverage, exact 64+1 production ownership, and cached-
+entry reuse at capacity. Only 4A1.5c's fixed performance/browser rollback
+matrix remains before the scheduler edge can be accepted. The separately
+revertible 4A1.R refactor remains mandatory after that gate and before Decision
+checkpoint B.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -166,8 +169,12 @@ Every Phase 2 entry and exit ABI inherits that rule.
     per frame. **Semantic/accounting complete:** Boa `92acfa22` exhaustively
     compares cold and cache-hit instruction budgets, loop limits, exact exit
     PCs, replay guards, and budget-mode cache separation through the real
-    scheduler. **Next:** Slice 4A1.5b containment/lifetime, then 4A1.5c's fixed
-    workload gate and the behavior-neutral 4A1.R refactor.
+    scheduler. **Containment/lifetime complete:** Boa `44d45ca3`, `68d795fd`,
+    `e37f2398`, and `e34f8530` disable compromised loop backends, prove GC/
+    nested-frame/stale-guard safety, exhaust malformed loop status classes,
+    and close the production 64+1 ownership matrix. **Next:** Slice 4A1.5c
+    first adds an isolated production-threshold cold-OSR runner mode, then runs
+    the fixed workload gate before the behavior-neutral 4A1.R refactor.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -248,6 +255,12 @@ showing that another boundary dominates.
   — the landed post-backedge invocation edge, production integration evidence,
   independently reviewed residual risks, and the falsifiable 4A1.5
   differential/cache/browser rollback gate.
+- [Slice 4A1 semantic/accounting checkpoint, 2026-08-03](24-slice-4a1-accounting-checkpoint-2026-08-03.md)
+  — exhaustive production cold/cache-hit budget and loop-limit differentials,
+  replay ownership, exact nonzero diagnostic PCs, and cache-mode separation.
+- [Slice 4A1 containment/lifetime checkpoint, 2026-08-03](25-slice-4a1-containment-checkpoint-2026-08-03.md)
+  — fail-closed malformed loop state, forced-GC and nested-frame lifetime
+  coverage, exact 64+1 scheduler ownership, and the remaining workload gate.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
