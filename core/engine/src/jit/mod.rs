@@ -175,7 +175,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 5;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 6;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -196,6 +196,9 @@ pub struct JitDiagnosticLimits {
     /// Maximum number of distinct interpreted call-site records retained by a
     /// context.
     pub call_records: usize,
+    /// Maximum number of distinct interpreted loop-backedge records retained
+    /// by a context.
+    pub loop_records: usize,
 }
 
 impl JitDiagnosticLimits {
@@ -209,6 +212,7 @@ impl JitDiagnosticLimits {
                 .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             exit_records: self.exit_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             call_records: self.call_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+            loop_records: self.loop_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
         }
     }
 }
@@ -220,6 +224,7 @@ impl Default for JitDiagnosticLimits {
             admission_records: 256,
             exit_records: 256,
             call_records: 256,
+            loop_records: 256,
         }
     }
 }
@@ -479,6 +484,40 @@ pub struct JitCallSiteRecord {
     pub cached_shim_target_calls: u64,
 }
 
+/// One bounded, source-free interpreted loop-backedge record.
+///
+/// Static candidacy means only that the observed loop range satisfies the
+/// deliberately narrow Phase 2 opcode/metadata screen. It is not an OSR
+/// compilation promise: live-state materialization, a typed nonzero-PC cache
+/// key, and the entry/deopt ABI remain separate reviewed work.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitLoopSiteRecord {
+    /// Runtime-local code-block identity.
+    pub code_id: u64,
+    /// Bytecode PC reached by the backward edge.
+    pub header_pc: u32,
+    /// Bytecode PC of the branch that produced the backward edge.
+    pub backedge_pc: u32,
+    /// Total interpreted backedges observed at this site.
+    pub backedges: u64,
+    /// Backedges that made the code block cross a configured hotness
+    /// threshold. A code block can cross at most once per backend generation.
+    pub hotness_crossings: u64,
+    /// Backedges observed after the frame's native-entry decision was closed.
+    pub closed_entry_backedges: u64,
+    /// Whether the observed loop range passes the conservative static OSR
+    /// screen described above.
+    pub static_osr_candidate: bool,
+    /// Static blocker when the observed loop range is not a candidate.
+    pub static_osr_blocker: Option<JitCompileBlockerKind>,
+    /// Static opcode name for the first blocker, never source text.
+    pub first_blocking_opcode: Option<String>,
+    /// Bytecode PC of the first blocker.
+    pub first_blocking_pc: Option<u32>,
+    /// Number of decoded instructions in the observed loop range.
+    pub region_instructions: u32,
+}
+
 /// Stable snapshot of opt-in detailed JIT diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticSnapshot {
@@ -494,6 +533,9 @@ pub struct JitDiagnosticSnapshot {
     pub exit_records: Vec<JitExitRecord>,
     /// Aggregated interpreted calls in deterministic caller/PC order.
     pub call_records: Vec<JitCallSiteRecord>,
+    /// Aggregated interpreted loop backedges in deterministic code/header/
+    /// backedge order.
+    pub loop_records: Vec<JitLoopSiteRecord>,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
@@ -503,6 +545,9 @@ pub struct JitDiagnosticSnapshot {
     /// Call observations omitted because their site was not retained after
     /// reaching the configured bound.
     pub dropped_call_observations: u64,
+    /// Loop observations omitted because their site was not retained after
+    /// reaching the configured bound.
+    pub dropped_loop_observations: u64,
 }
 
 #[derive(Debug)]
@@ -528,10 +573,13 @@ struct JitDiagnosticState {
     exit_records: Vec<JitExitRecord>,
     call_records: Vec<JitCallSiteDiagnosticState>,
     call_record_indices: FxHashMap<(u64, u32), usize>,
+    loop_records: Vec<JitLoopSiteRecord>,
+    loop_record_indices: FxHashMap<(u64, u32, u32), usize>,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
     dropped_call_observations: u64,
+    dropped_loop_observations: u64,
 }
 
 impl JitDiagnosticState {
@@ -544,10 +592,13 @@ impl JitDiagnosticState {
             exit_records: Vec::with_capacity(limits.exit_records.min(64)),
             call_records: Vec::with_capacity(limits.call_records.min(64)),
             call_record_indices: FxHashMap::default(),
+            loop_records: Vec::with_capacity(limits.loop_records.min(64)),
+            loop_record_indices: FxHashMap::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
             dropped_call_observations: 0,
+            dropped_loop_observations: 0,
         }
     }
 
@@ -657,6 +708,46 @@ impl JitDiagnosticState {
         }
     }
 
+    fn has_loop_site(&self, code_id: u64, header_pc: u32, backedge_pc: u32) -> bool {
+        self.loop_record_indices
+            .contains_key(&(code_id, header_pc, backedge_pc))
+    }
+
+    fn record_loop_site(
+        &mut self,
+        mut new_record: JitLoopSiteRecord,
+        crossed_hotness: bool,
+        entry_decision_closed: bool,
+    ) {
+        let key = (
+            new_record.code_id,
+            new_record.header_pc,
+            new_record.backedge_pc,
+        );
+        let record = if let Some(index) = self.loop_record_indices.get(&key).copied() {
+            &mut self.loop_records[index]
+        } else if self.loop_records.len() < self.limits.loop_records {
+            let index = self.loop_records.len();
+            new_record.backedges = 0;
+            new_record.hotness_crossings = 0;
+            new_record.closed_entry_backedges = 0;
+            self.loop_records.push(new_record);
+            self.loop_record_indices.insert(key, index);
+            &mut self.loop_records[index]
+        } else {
+            self.dropped_loop_observations = self.dropped_loop_observations.saturating_add(1);
+            return;
+        };
+
+        record.backedges = record.backedges.saturating_add(1);
+        if crossed_hotness {
+            record.hotness_crossings = record.hotness_crossings.saturating_add(1);
+        }
+        if entry_decision_closed {
+            record.closed_entry_backedges = record.closed_entry_backedges.saturating_add(1);
+        }
+    }
+
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
         compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
@@ -678,6 +769,8 @@ impl JitDiagnosticState {
             .map(|state| state.record)
             .collect::<Vec<_>>();
         call_records.sort_by_key(|record| (record.caller_code_id, record.pc));
+        let mut loop_records = self.loop_records.clone();
+        loop_records.sort_by_key(|record| (record.code_id, record.header_pc, record.backedge_pc));
         JitDiagnosticSnapshot {
             schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
             limits: self.limits,
@@ -685,10 +778,12 @@ impl JitDiagnosticState {
             admission_records,
             exit_records,
             call_records,
+            loop_records,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
             dropped_call_observations: self.dropped_call_observations,
+            dropped_loop_observations: self.dropped_loop_observations,
         }
     }
 }
@@ -981,23 +1076,95 @@ impl JitBackend {
     }
 
     /// Record a backward edge for tiering.
-    pub(crate) fn record_loop_backedge(&mut self, code: &CodeBlock) -> bool {
+    pub(crate) fn record_loop_backedge(
+        &mut self,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+    ) -> bool {
         self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
         let was_hot = self.is_hot(code);
         code.record_jit_loop_backedge(self.id);
         let is_hot = self.is_hot(code);
-        if !was_hot && is_hot {
+        let crossed_hotness = !was_hot && is_hot;
+        if crossed_hotness {
             self.stats.hotness_threshold_crossings =
                 self.stats.hotness_threshold_crossings.saturating_add(1);
         }
+        self.record_loop_site(code, header_pc, backedge_pc, crossed_hotness, false);
         is_hot
     }
 
     /// Count one backedge after the current frame no longer needs to mutate
     /// code-block hotness.
-    pub(crate) fn record_saturated_loop_backedge(&mut self) {
+    pub(crate) fn record_saturated_loop_backedge(
+        &mut self,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+    ) {
         self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
         self.stats.saturated_loop_backedges = self.stats.saturated_loop_backedges.saturating_add(1);
+        self.record_loop_site(code, header_pc, backedge_pc, false, false);
+    }
+
+    /// Count a diagnostic-only backedge in a frame whose native-entry
+    /// decision was already closed before dormant interpreter dispatch.
+    pub(crate) fn record_closed_loop_backedge(
+        &mut self,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+    ) {
+        self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
+        self.record_loop_site(code, header_pc, backedge_pc, false, true);
+    }
+
+    fn record_loop_site(
+        &mut self,
+        code: &CodeBlock,
+        header_pc: u32,
+        backedge_pc: u32,
+        crossed_hotness: bool,
+        entry_decision_closed: bool,
+    ) {
+        let Some(diagnostics) = &self.diagnostics else {
+            return;
+        };
+        let record = if diagnostics.has_loop_site(code.debug_id, header_pc, backedge_pc) {
+            JitLoopSiteRecord {
+                code_id: code.debug_id,
+                header_pc,
+                backedge_pc,
+                ..JitLoopSiteRecord::default()
+            }
+        } else {
+            match native::loop_admission_profile(code, header_pc, backedge_pc) {
+                Ok(profile) => JitLoopSiteRecord {
+                    code_id: code.debug_id,
+                    header_pc,
+                    backedge_pc,
+                    static_osr_candidate: true,
+                    region_instructions: profile.bytecode_instructions,
+                    ..JitLoopSiteRecord::default()
+                },
+                Err(rejection) => JitLoopSiteRecord {
+                    code_id: code.debug_id,
+                    header_pc,
+                    backedge_pc,
+                    static_osr_blocker: Some(rejection.kind),
+                    first_blocking_opcode: rejection
+                        .first_blocking_opcode
+                        .map(|opcode| format!("{opcode:?}")),
+                    first_blocking_pc: rejection.first_blocking_pc,
+                    region_instructions: rejection.bytecode_instructions,
+                    ..JitLoopSiteRecord::default()
+                },
+            }
+        };
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.record_loop_site(record, crossed_hotness, entry_decision_closed);
+        }
     }
 
     /// Count one hot nonzero-PC frame handed to dormant interpreter dispatch.
@@ -1009,6 +1176,26 @@ impl JitBackend {
     /// Headline timing keeps diagnostics disabled and may use dormant dispatch.
     pub(crate) const fn observes_loop_backedges(&self) -> bool {
         self.diagnostics.is_some()
+    }
+
+    /// Whether an interpreter PC decrease was produced by an explicit
+    /// same-frame branch to the reported target rather than exception unwind,
+    /// frame replacement, or another VM transition.
+    pub(crate) fn is_observed_loop_backedge(
+        code: &CodeBlock,
+        backedge_pc: u32,
+        header_pc: u32,
+    ) -> bool {
+        if header_pc >= backedge_pc {
+            return false;
+        }
+        let (instruction, _) = code.bytecode.next_instruction(backedge_pc as usize);
+        match &instruction {
+            Instruction::JumpTable { addresses, .. } => addresses
+                .iter()
+                .any(|address| address.as_u32() == header_pc),
+            _ => same_frame_jump_target(&instruction) == Some(header_pc),
+        }
     }
 
     /// Whether any same-frame branch can make a nonzero-PC frame eligible for
@@ -1690,6 +1877,7 @@ mod tests {
             admission_records: 0,
             exit_records: 0,
             call_records: 0,
+            loop_records: 0,
         });
         let _ = bounded.cached_entry(&native_code, false);
         let _ = bounded.cached_entry(&unsupported_code, false);
@@ -1703,6 +1891,7 @@ mod tests {
             admission_records: usize::MAX,
             exit_records: usize::MAX,
             call_records: usize::MAX,
+            loop_records: usize::MAX,
         });
         let hard_bounded = hard_bounded
             .diagnostic_snapshot()
@@ -1714,6 +1903,7 @@ mod tests {
                 admission_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 exit_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 call_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+                loop_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
             }
         );
     }
@@ -1786,6 +1976,7 @@ mod tests {
             admission_records: 1,
             exit_records: 0,
             call_records: 0,
+            loop_records: 0,
         });
         assert!(!bounded.admit_function_entry(&tiny_code));
         assert!(bounded.admit_function_entry(&loop_code));
@@ -2213,10 +2404,10 @@ mod tests {
             !replacement.is_hot(&code),
             "a replacement backend must not inherit the prior generation's hotness"
         );
-        assert!(!replacement.record_loop_backedge(&code));
-        assert!(!replacement.record_loop_backedge(&code));
+        assert!(!replacement.record_loop_backedge(&code, 1, 2));
+        assert!(!replacement.record_loop_backedge(&code, 1, 2));
         assert!(!replacement.is_hot(&code));
-        assert!(replacement.record_loop_backedge(&code));
+        assert!(replacement.record_loop_backedge(&code, 1, 2));
         assert!(replacement.is_hot(&code));
         assert_eq!(replacement.stats().hotness_threshold_crossings, 1);
     }
@@ -2333,6 +2524,94 @@ mod tests {
             "stats: {stats:?}"
         );
         assert_eq!(stats.dormant_loop_frames, 0, "stats: {stats:?}");
+
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        assert_eq!(snapshot.loop_records.len(), 1, "snapshot: {snapshot:?}");
+        let record = &snapshot.loop_records[0];
+        assert_eq!(record.backedges, 1024, "record: {record:?}");
+        assert_eq!(record.hotness_crossings, 1, "record: {record:?}");
+        assert_eq!(record.closed_entry_backedges, 0, "record: {record:?}");
+        assert!(!record.static_osr_candidate, "record: {record:?}");
+        assert_eq!(
+            record.static_osr_blocker,
+            Some(JitCompileBlockerKind::UnsupportedOpcode),
+            "record: {record:?}"
+        );
+        assert_eq!(record.first_blocking_opcode.as_deref(), Some("BitOr"));
+        assert!(record.first_blocking_pc.is_some(), "record: {record:?}");
+        assert!(record.region_instructions > 0, "record: {record:?}");
+        assert_eq!(snapshot.dropped_loop_observations, 0);
+    }
+
+    #[test]
+    fn jit_loop_diagnostics_classify_static_candidate_without_approving_osr() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; } once(1024)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_number(),
+            Some(523_776.5)
+        );
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        assert_eq!(snapshot.loop_records.len(), 1, "snapshot: {snapshot:?}");
+        let record = &snapshot.loop_records[0];
+        assert_eq!(record.backedges, 1024, "record: {record:?}");
+        assert_eq!(record.hotness_crossings, 1, "record: {record:?}");
+        assert!(record.static_osr_candidate, "record: {record:?}");
+        assert_eq!(record.static_osr_blocker, None, "record: {record:?}");
+        assert_eq!(record.first_blocking_opcode, None, "record: {record:?}");
+        assert!(record.region_instructions > 0, "record: {record:?}");
+
+        let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
+        assert!(!serialized.contains("once"));
+    }
+
+    #[test]
+    fn jit_loop_diagnostics_observe_denied_dormant_frames_and_respect_zero_cap() {
+        let source = "function blocked(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = (total + i) | 0; } return total; } let answer = 0; for (let call = 0; call < 40; call++) answer = blocked(10); answer";
+        let run = |loop_records| {
+            let mut context = Context::default();
+            context.enable_jit_diagnostics(JitDiagnosticLimits {
+                loop_records,
+                ..JitDiagnosticLimits::default()
+            });
+            let script =
+                crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                    .expect("parse");
+            assert_eq!(
+                script.evaluate(&mut context).expect("evaluate").as_i32(),
+                Some(45)
+            );
+            context
+                .jit_diagnostic_snapshot()
+                .expect("diagnostics enabled")
+        };
+
+        let retained = run(8);
+        let blocked = retained
+            .loop_records
+            .iter()
+            .find(|record| record.first_blocking_opcode.as_deref() == Some("BitOr"))
+            .expect("blocked callee loop record");
+        assert_eq!(blocked.backedges, 400, "record: {blocked:?}");
+        assert!(blocked.closed_entry_backedges > 0, "record: {blocked:?}");
+        assert_eq!(retained.dropped_loop_observations, 0);
+
+        let zero = run(0);
+        assert!(zero.loop_records.is_empty());
+        assert_eq!(zero.dropped_loop_observations, 440);
     }
 
     #[test]
@@ -2484,6 +2763,7 @@ mod tests {
                 admission_records: 0,
                 exit_records: 1,
                 call_records: 0,
+                loop_records: 0,
             },
         );
         let overflow = crate::Script::parse(

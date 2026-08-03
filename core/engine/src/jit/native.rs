@@ -90,6 +90,87 @@ pub(super) fn admission_profile(
     decode(code, collect_diagnostic_metadata).map(|instructions| instructions.static_profile())
 }
 
+/// Apply the conservative static screen for a first loop-OSR candidate.
+///
+/// This intentionally does not perform live-state analysis or promise that a
+/// nonzero-PC entry can be compiled. It answers the narrower profiling
+/// question: whether the decoded range from an observed header through its
+/// backedge contains only the Phase 1 numeric/control-flow subset and none of
+/// the calls or property helpers excluded from the first OSR ABI review.
+pub(super) fn loop_admission_profile(
+    code: &CodeBlock,
+    header_pc: u32,
+    backedge_pc: u32,
+) -> Result<NativeStaticProfile, NativeRejection> {
+    if let Some(kind) = eligibility_blocker(code) {
+        return Err(NativeRejection::new(kind, None, None, 0, 0));
+    }
+
+    let mut region = Vec::new();
+    let mut found_header = false;
+    let mut found_backedge = false;
+    let mut iterator = InstructionIterator::new(&code.bytecode);
+    while let Some((pc, opcode, instruction)) = iterator.next() {
+        let pc = pc as u32;
+        found_header |= pc == header_pc;
+        found_backedge |= pc == backedge_pc;
+        if pc >= header_pc && pc <= backedge_pc {
+            region.push((pc as usize, iterator.pc(), instruction));
+            let instruction = &region.last().expect("just pushed").2;
+            let property_or_call = matches!(
+                instruction,
+                Instruction::Call { .. }
+                    | Instruction::GetLengthProperty { .. }
+                    | Instruction::GetPropertyByName { .. }
+                    | Instruction::GetPropertyByNameWithThis { .. }
+                    | Instruction::GetPropertyByValue { .. }
+                    | Instruction::GetPropertyByValuePush { .. }
+            );
+            if property_or_call || !is_supported(code, opcode, instruction) {
+                return Err(NativeRejection::new(
+                    JitCompileBlockerKind::UnsupportedOpcode,
+                    Some(opcode),
+                    Some(pc),
+                    region.len() - 1,
+                    region.len(),
+                ));
+            }
+        }
+    }
+
+    if !found_header || !found_backedge || region.is_empty() {
+        return Err(NativeRejection::new(
+            JitCompileBlockerKind::InvalidBranchTarget,
+            None,
+            Some(if found_header { backedge_pc } else { header_pc }),
+            0,
+            region.len(),
+        ));
+    }
+    let (_, _, backedge) = region.last().expect("nonempty region");
+    if branch_target(backedge) != Some(header_pc as usize) {
+        return Err(NativeRejection::new(
+            JitCompileBlockerKind::InvalidBranchTarget,
+            Some(crate::vm::Opcode::decode(
+                code.bytecode.bytes[backedge_pc as usize],
+            )),
+            Some(backedge_pc),
+            region.len().saturating_sub(1),
+            region.len(),
+        ));
+    }
+
+    Ok(DecodedInstructions {
+        pc_to_index: region
+            .iter()
+            .enumerate()
+            .map(|(index, (pc, _, _))| (*pc, index))
+            .collect(),
+        instructions: region,
+    }
+    .static_profile())
+}
+
 impl NativeRejection {
     fn new(
         kind: JitCompileBlockerKind,

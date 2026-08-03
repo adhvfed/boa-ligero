@@ -853,6 +853,13 @@ impl Context {
     }
 }
 
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy)]
+enum InterpreterJitObservation {
+    Before { opcode: Opcode, pc: u32 },
+    After { pc: u32, next_pc: u32 },
+}
+
 impl Context {
     #[inline(always)]
     #[allow(clippy::inline_always)]
@@ -1180,21 +1187,22 @@ impl Context {
     fn run_interpreter_until_frame_change_with<F>(
         &mut self,
         frame_depth: usize,
-        mut before_execute: F,
+        mut observe: F,
     ) -> ControlFlow<CompletionRecord>
     where
-        F: FnMut(&mut Self, Opcode, u32),
+        F: FnMut(&mut Self, InterpreterJitObservation),
     {
         while self.vm.frames.len() == frame_depth {
             let frame = self.vm.frame();
             let pc = frame.pc;
+            let code_id = frame.code_block.debug_id;
             let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
                 return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
                     JsNativeError::error(),
                 )));
             };
             let opcode = Opcode::decode(*byte);
-            before_execute(self, opcode, pc);
+            observe(self, InterpreterJitObservation::Before { opcode, pc });
 
             if let ControlFlow::Break(value) = self.execute_one(
                 |context, opcode| {
@@ -1207,6 +1215,17 @@ impl Context {
             ) {
                 return ControlFlow::Break(value);
             }
+
+            if self.vm.frames.len() == frame_depth && self.vm.frame().code_block.debug_id == code_id
+            {
+                observe(
+                    self,
+                    InterpreterJitObservation::After {
+                        pc,
+                        next_pc: self.vm.frame().pc,
+                    },
+                );
+            }
         }
 
         ControlFlow::Continue(())
@@ -1217,7 +1236,7 @@ impl Context {
         &mut self,
         frame_depth: usize,
     ) -> ControlFlow<CompletionRecord> {
-        self.run_interpreter_until_frame_change_with(frame_depth, |_, _, _| {})
+        self.run_interpreter_until_frame_change_with(frame_depth, |_, _| {})
     }
 
     #[cfg(feature = "jit")]
@@ -1227,8 +1246,24 @@ impl Context {
         backend: &mut crate::jit::JitBackend,
     ) -> ControlFlow<CompletionRecord> {
         if backend.observes_call_sites() {
-            self.run_interpreter_until_frame_change_with(frame_depth, |context, opcode, pc| {
-                context.observe_jit_call_site(backend, opcode, pc);
+            self.run_interpreter_until_frame_change_with(frame_depth, |context, observation| {
+                match observation {
+                    InterpreterJitObservation::Before { opcode, pc } => {
+                        context.observe_jit_call_site(backend, opcode, pc);
+                    }
+                    InterpreterJitObservation::After { pc, next_pc }
+                        if backend.observes_loop_backedges()
+                            && crate::jit::JitBackend::is_observed_loop_backedge(
+                                context.vm.frame().code_block.as_ref(),
+                                pc,
+                                next_pc,
+                            ) =>
+                    {
+                        let code = context.vm.frame().code_block.clone();
+                        backend.record_closed_loop_backedge(&code, next_pc, pc);
+                    }
+                    InterpreterJitObservation::After { .. } => {}
+                }
             })
         } else {
             self.run_interpreter_until_frame_change(frame_depth)
@@ -1412,13 +1447,20 @@ impl Context {
                     continue 'scheduler;
                 }
 
-                if self.vm.frame().code_block.debug_id == old_code_id && self.vm.frame().pc < old_pc
+                if self.vm.frame().code_block.debug_id == old_code_id
+                    && crate::jit::JitBackend::is_observed_loop_backedge(
+                        self.vm.frame().code_block.as_ref(),
+                        old_pc,
+                        self.vm.frame().pc,
+                    )
                 {
+                    let header_pc = self.vm.frame().pc;
                     if self.vm.frame().jit_loop_hotness_saturated() {
-                        backend.record_saturated_loop_backedge();
+                        let code = self.vm.frame().code_block.clone();
+                        backend.record_saturated_loop_backedge(&code, header_pc, old_pc);
                     } else {
                         let code = self.vm.frame().code_block.clone();
-                        if backend.record_loop_backedge(&code) {
+                        if backend.record_loop_backedge(&code, header_pc, old_pc) {
                             self.vm.frame_mut().mark_jit_loop_hotness_saturated();
                             if !backend.observes_loop_backedges()
                                 && !crate::jit::JitBackend::can_reenter_at_pc_zero(&code)
