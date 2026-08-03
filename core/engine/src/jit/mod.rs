@@ -2131,6 +2131,29 @@ impl JitBackend {
         }
     }
 
+    /// Whether an opcode can explicitly branch within its current frame.
+    /// Non-branch bytecodes cannot form loop backedges and need no post-op VM
+    /// frame/PC inspection in the production interpreter path.
+    pub(crate) const fn can_observe_loop_backedge_opcode(opcode: Opcode) -> bool {
+        matches!(
+            opcode,
+            Opcode::Jump
+                | Opcode::JumpIfTrue
+                | Opcode::JumpIfFalse
+                | Opcode::JumpIfNotUndefined
+                | Opcode::JumpIfNullOrUndefined
+                | Opcode::JumpIfNotLessThan
+                | Opcode::JumpIfNotLessThanOrEqual
+                | Opcode::JumpIfNotGreaterThan
+                | Opcode::JumpIfNotGreaterThanOrEqual
+                | Opcode::JumpIfNotEqual
+                | Opcode::LogicalAnd
+                | Opcode::LogicalOr
+                | Opcode::Coalesce
+                | Opcode::JumpTable
+        )
+    }
+
     /// Whether any same-frame branch can make a nonzero-PC frame eligible for
     /// the existing whole-function entry by returning to PC zero.
     pub(crate) fn can_reenter_at_pc_zero(code: &CodeBlock) -> bool {

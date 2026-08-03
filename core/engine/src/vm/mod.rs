@@ -861,13 +861,6 @@ impl Context {
 }
 
 #[cfg(feature = "jit")]
-#[derive(Clone, Copy)]
-enum InterpreterJitObservation {
-    Before { opcode: Opcode, pc: u32 },
-    After { pc: u32, next_pc: u32 },
-}
-
-#[cfg(feature = "jit")]
 enum InterpreterJitControl {
     Continue,
     Reschedule,
@@ -1198,14 +1191,61 @@ impl Context {
     /// soon as the depth changes so the tiering scheduler owns the new frame
     /// before its next bytecode executes.
     #[cfg(feature = "jit")]
-    fn run_interpreter_until_frame_change_with<F>(
+    pub(crate) fn run_interpreter_until_frame_change(
         &mut self,
         frame_depth: usize,
-        mut observe: F,
-    ) -> ControlFlow<CompletionRecord>
-    where
-        F: FnMut(&mut Self, InterpreterJitObservation) -> InterpreterJitControl,
-    {
+    ) -> ControlFlow<CompletionRecord> {
+        while self.vm.frames.len() == frame_depth {
+            let frame = self.vm.frame();
+            let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
+                return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
+                    JsNativeError::error(),
+                )));
+            };
+            let opcode = Opcode::decode(*byte);
+
+            if let ControlFlow::Break(value) = self.execute_one(
+                |context, opcode| {
+                    let frame = context.vm.frame();
+                    let pc = frame.pc as usize;
+
+                    OPCODE_HANDLERS[opcode as usize](context, pc)
+                },
+                opcode,
+            ) {
+                return ControlFlow::Break(value);
+            }
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_interpreter_until_frame_change_with_jit(
+        &mut self,
+        frame_depth: usize,
+        backend: &mut crate::jit::JitBackend,
+    ) -> ControlFlow<CompletionRecord> {
+        if backend.observes_interpreted_sites() {
+            return self
+                .run_interpreter_until_frame_change_with_backend::<true>(frame_depth, backend);
+        }
+        if self.vm.frame().jit_osr_closed() {
+            return self.run_interpreter_until_frame_change(frame_depth);
+        }
+        self.run_interpreter_until_frame_change_with_backend::<false>(frame_depth, backend)
+    }
+
+    /// Run a scheduler-owned interpreter frame while checking only explicit PC
+    /// decreases for loop OSR. The const diagnostic mode gives production a
+    /// branch-free pre-op path; otherwise a runtime diagnostics check on every
+    /// bytecode materially regresses large denied workloads.
+    #[cfg(feature = "jit")]
+    fn run_interpreter_until_frame_change_with_backend<const OBSERVE_SITES: bool>(
+        &mut self,
+        frame_depth: usize,
+        backend: &mut crate::jit::JitBackend,
+    ) -> ControlFlow<CompletionRecord> {
         while self.vm.frames.len() == frame_depth {
             let frame = self.vm.frame();
             let pc = frame.pc;
@@ -1216,10 +1256,11 @@ impl Context {
                 )));
             };
             let opcode = Opcode::decode(*byte);
-            match observe(self, InterpreterJitObservation::Before { opcode, pc }) {
-                InterpreterJitControl::Continue => {}
-                InterpreterJitControl::Reschedule => return ControlFlow::Continue(()),
-                InterpreterJitControl::Break(record) => return ControlFlow::Break(record),
+            let can_observe_loop_backedge =
+                crate::jit::JitBackend::can_observe_loop_backedge_opcode(opcode);
+
+            if OBSERVE_SITES {
+                self.observe_jit_interpreted_site(backend, opcode, pc);
             }
 
             if let ControlFlow::Break(value) = self.execute_one(
@@ -1234,70 +1275,38 @@ impl Context {
                 return ControlFlow::Break(value);
             }
 
-            if self.vm.frames.len() == frame_depth && self.vm.frame().code_block.debug_id == code_id
-            {
-                match observe(
-                    self,
-                    InterpreterJitObservation::After {
-                        pc,
-                        next_pc: self.vm.frame().pc,
-                    },
-                ) {
-                    InterpreterJitControl::Continue => {}
-                    InterpreterJitControl::Reschedule => return ControlFlow::Continue(()),
-                    InterpreterJitControl::Break(record) => return ControlFlow::Break(record),
+            let observed_backedge =
+                if can_observe_loop_backedge && self.vm.frames.len() == frame_depth {
+                    let frame = self.vm.frame();
+                    (frame.pc < pc
+                        && frame.code_block.debug_id == code_id
+                        && crate::jit::JitBackend::is_observed_loop_backedge(
+                            frame.code_block.as_ref(),
+                            pc,
+                            frame.pc,
+                        ))
+                    .then_some(frame.pc)
+                } else {
+                    None
+                };
+            if let Some(next_pc) = observed_backedge {
+                let code = self.vm.frame().code_block.clone();
+                if OBSERVE_SITES && backend.observes_loop_backedges() {
+                    backend.record_closed_loop_backedge(&code, next_pc, pc);
+                }
+                if !self.vm.frame().jit_osr_closed() {
+                    match self.schedule_jit_loop_backedge(backend, &code, next_pc, pc) {
+                        InterpreterJitControl::Continue => {}
+                        InterpreterJitControl::Reschedule => return ControlFlow::Continue(()),
+                        InterpreterJitControl::Break(record) => {
+                            return ControlFlow::Break(record);
+                        }
+                    }
                 }
             }
         }
 
         ControlFlow::Continue(())
-    }
-
-    #[cfg(feature = "jit")]
-    pub(crate) fn run_interpreter_until_frame_change(
-        &mut self,
-        frame_depth: usize,
-    ) -> ControlFlow<CompletionRecord> {
-        self.run_interpreter_until_frame_change_with(frame_depth, |_, _| {
-            InterpreterJitControl::Continue
-        })
-    }
-
-    #[cfg(feature = "jit")]
-    fn run_interpreter_until_frame_change_with_jit(
-        &mut self,
-        frame_depth: usize,
-        backend: &mut crate::jit::JitBackend,
-    ) -> ControlFlow<CompletionRecord> {
-        if self.vm.frame().jit_osr_closed() && !backend.observes_interpreted_sites() {
-            return self.run_interpreter_until_frame_change(frame_depth);
-        }
-        self.run_interpreter_until_frame_change_with(frame_depth, |context, observation| {
-            match observation {
-                InterpreterJitObservation::Before { opcode, pc } => {
-                    if backend.observes_interpreted_sites() {
-                        context.observe_jit_interpreted_site(backend, opcode, pc);
-                    }
-                }
-                InterpreterJitObservation::After { pc, next_pc }
-                    if crate::jit::JitBackend::is_observed_loop_backedge(
-                        context.vm.frame().code_block.as_ref(),
-                        pc,
-                        next_pc,
-                    ) =>
-                {
-                    let code = context.vm.frame().code_block.clone();
-                    if backend.observes_loop_backedges() {
-                        backend.record_closed_loop_backedge(&code, next_pc, pc);
-                    }
-                    if !context.vm.frame().jit_osr_closed() {
-                        return context.schedule_jit_loop_backedge(backend, &code, next_pc, pc);
-                    }
-                }
-                InterpreterJitObservation::After { .. } => {}
-            }
-            InterpreterJitControl::Continue
-        })
     }
 
     #[cfg(feature = "jit")]
