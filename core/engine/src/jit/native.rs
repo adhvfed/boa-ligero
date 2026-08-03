@@ -15,8 +15,9 @@ use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
 use crate::{Context, JsValue};
 
 use super::{
-    JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind, JitExit,
-    JitExitKind, JitExitReason, JitOsrRejectionReason, JitOsrRepresentation,
+    JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind,
+    JitEntryPoint, JitExit, JitExitKind, JitExitReason, JitOsrRejectionReason,
+    JitOsrRepresentation,
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -237,7 +238,7 @@ pub(super) struct LoopExitMap {
 /// This is deliberately not executable yet. The scheduler and compiler slices
 /// consume this immutable plan only after the planner has proved every entry
 /// value and the single path-specific continuation map.
-#[allow(dead_code, reason = "consumed by the next loop-OSR compiler slice")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LoopRegionPlan {
     pub(super) key: JitCacheKey,
     pub(super) instruction_pcs: Vec<u32>,
@@ -246,6 +247,7 @@ pub(super) struct LoopRegionPlan {
     pub(super) requires_f64: bool,
 }
 
+#[derive(Clone)]
 struct LoopDecodedInstruction {
     pc: usize,
     next_pc: usize,
@@ -438,6 +440,79 @@ pub(super) fn plan_loop_region(
         }],
         requires_f64,
     })
+}
+
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "invoked by the production scheduler in Slice 4A1.4"
+)]
+pub(super) struct CompiledLoopRegion {
+    pub(super) entry: extern "C" fn(*mut Context) -> u64,
+    pub(super) code_bytes: usize,
+}
+
+pub(super) enum LoopNativeCompileResult {
+    Compiled(CompiledLoopRegion),
+    Rejected(JitOsrRejectionReason),
+}
+
+/// Compile one already-proven loop region without making it reachable from
+/// the production scheduler.
+///
+/// The immutable plan is revalidated against the live `CodeBlock` before any
+/// Cranelift function is declared. A failure returns a bounded source-free
+/// reason and never exposes a callable entry.
+#[allow(
+    dead_code,
+    reason = "called by the backend and direct harness before scheduler wiring"
+)]
+pub(super) fn compile_loop_region(
+    backend: &mut JitBackend,
+    code: &CodeBlock,
+    plan: &LoopRegionPlan,
+) -> LoopNativeCompileResult {
+    let JitEntryPoint::Loop {
+        header_pc,
+        backedge_pc,
+        representation,
+    } = plan.key.entry_point
+    else {
+        return LoopNativeCompileResult::Rejected(JitOsrRejectionReason::Lowering);
+    };
+    let expected = match plan_loop_region(
+        code,
+        header_pc,
+        backedge_pc,
+        representation,
+        plan.key.budgeted,
+        plan.key.diagnostic,
+    ) {
+        Ok(expected) => expected,
+        Err(reason) => return LoopNativeCompileResult::Rejected(reason.into()),
+    };
+    if &expected != plan {
+        return LoopNativeCompileResult::Rejected(JitOsrRejectionReason::Lowering);
+    }
+
+    let region = match decode_loop_region(code, header_pc, backedge_pc) {
+        Ok(region) => region,
+        Err(reason) => return LoopNativeCompileResult::Rejected(reason.into()),
+    };
+    let mode = match representation {
+        JitOsrRepresentation::I32 if !plan.requires_f64 => NativeMode::I32,
+        JitOsrRepresentation::F64 => NativeMode::F64,
+        JitOsrRepresentation::I32 => {
+            return LoopNativeCompileResult::Rejected(
+                JitOsrRejectionReason::RepresentationMismatch,
+            );
+        }
+    };
+    let mut compiler = LoopRegionCompiler::new(backend, code, plan, region, mode);
+    match compiler.compile() {
+        Some(artifact) => LoopNativeCompileResult::Compiled(artifact),
+        None => LoopNativeCompileResult::Rejected(JitOsrRejectionReason::Lowering),
+    }
 }
 
 fn decode_loop_region(
@@ -2046,6 +2121,13 @@ impl<'a> NativeCompiler<'a> {
                     let result = bcx.ins().ireduce(types::I32, wide_result);
                     let round_trip = bcx.ins().sextend(types::I64, result);
                     let overflow = bcx.ins().icmp(IntCC::NotEqual, wide_result, round_trip);
+                    let zero = bcx.ins().iconst(types::I32, 0);
+                    let is_zero = bcx.ins().icmp(IntCC::Equal, result, zero);
+                    let lhs_negative = self.sign_bit(bcx, lhs);
+                    let rhs_negative = self.sign_bit(bcx, rhs);
+                    let signs_differ = bcx.ins().bxor(lhs_negative, rhs_negative);
+                    let negative_zero = bcx.ins().band(is_zero, signs_differ);
+                    let overflow = bcx.ins().bor(overflow, negative_zero);
                     let deopt = bcx.create_block();
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
@@ -2511,6 +2593,727 @@ impl<'a> NativeCompiler<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LoopHelpers {
+    ptr: cranelift_codegen::ir::Type,
+    entry_guard: Helper,
+    register_guard: Helper,
+    get_register_i32: Helper,
+    get_register_f64: Helper,
+    set_pc: Helper,
+    store_i32: Helper,
+    store_f64: Helper,
+    increment_loop: Helper,
+    consume_instruction_budget: Helper,
+    refund_instruction_budget: Helper,
+}
+
+struct LoopRegionCompiler<'a> {
+    backend: &'a mut JitBackend,
+    code: &'a CodeBlock,
+    plan: &'a LoopRegionPlan,
+    region: Vec<LoopDecodedInstruction>,
+    pc_to_index: HashMap<usize, usize>,
+    mode: NativeMode,
+    variables: Vec<Variable>,
+}
+
+impl<'a> LoopRegionCompiler<'a> {
+    fn new(
+        backend: &'a mut JitBackend,
+        code: &'a CodeBlock,
+        plan: &'a LoopRegionPlan,
+        region: Vec<LoopDecodedInstruction>,
+        mode: NativeMode,
+    ) -> Self {
+        let pc_to_index = region
+            .iter()
+            .enumerate()
+            .map(|(index, instruction)| (instruction.pc, index))
+            .collect();
+        Self {
+            backend,
+            code,
+            plan,
+            region,
+            pc_to_index,
+            mode,
+            variables: Vec::new(),
+        }
+    }
+
+    fn compile(&mut self) -> Option<CompiledLoopRegion> {
+        let JitEntryPoint::Loop {
+            header_pc,
+            representation,
+            ..
+        } = self.plan.key.entry_point
+        else {
+            return None;
+        };
+        let ptr = self.backend.module.target_config().pointer_type();
+        let mut cctx = self.backend.module.make_context();
+        let mut fctx = FunctionBuilderContext::new();
+        cctx.func.signature.params.push(AbiParam::new(ptr));
+        cctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+        let mut bcx = FunctionBuilder::new(&mut cctx.func, &mut fctx);
+        self.variables = (0..self.code.register_count)
+            .map(|_| bcx.declare_var(self.mode.value_type()))
+            .collect();
+        let code_blocks: Vec<Block> = self.region.iter().map(|_| bcx.create_block()).collect();
+        let entry = bcx.create_block();
+        let frame_rejected = bcx.create_block();
+        let representation_rejected = bcx.create_block();
+        let loop_exit = bcx.create_block();
+
+        bcx.append_block_params_for_function_params(entry);
+        bcx.switch_to_block(entry);
+        let ctx = bcx.block_params(entry)[0];
+        let helpers = self.build_helpers(&mut bcx, ptr);
+        self.emit_frame_guard(&mut bcx, ctx, &helpers, header_pc, frame_rejected);
+
+        for entry_value in &self.plan.entry {
+            if entry_value.representation != representation
+                || entry_value.source != LoopEntrySource::VmRegister
+            {
+                return None;
+            }
+            let register = entry_value.register as usize;
+            let guard = bcx
+                .ins()
+                .iconst(helpers.ptr, helpers.register_guard.address as i64);
+            let register_value = bcx.ins().iconst(types::I32, register as i64);
+            let representation_value = bcx.ins().iconst(
+                types::I32,
+                i64::from(representation == JitOsrRepresentation::F64),
+            );
+            let matches = bcx.ins().call_indirect(
+                helpers.register_guard.signature,
+                guard,
+                &[ctx, register_value, representation_value],
+            );
+            let matches = bcx.inst_results(matches)[0];
+            let load = bcx.create_block();
+            bcx.ins()
+                .brif(matches, load, &[], representation_rejected, &[]);
+            bcx.switch_to_block(load);
+
+            let helper = match self.mode {
+                NativeMode::I32 => helpers.get_register_i32,
+                NativeMode::F64 => helpers.get_register_f64,
+            };
+            let address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+            let value = bcx
+                .ins()
+                .call_indirect(helper.signature, address, &[ctx, register_value]);
+            let value = bcx.inst_results(value)[0];
+            self.define_register(&mut bcx, register, value)?;
+        }
+        bcx.ins().jump(*code_blocks.first()?, &[]);
+
+        bcx.switch_to_block(frame_rejected);
+        let status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(
+                JitExitKind::EntryRejected,
+                JitExitReason::EntryGuard,
+                header_pc,
+            ) as i64,
+        );
+        bcx.ins().return_(&[status]);
+
+        bcx.switch_to_block(representation_rejected);
+        let status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(
+                JitExitKind::EntryRejected,
+                JitExitReason::ArgumentType,
+                header_pc,
+            ) as i64,
+        );
+        bcx.ins().return_(&[status]);
+
+        for index in 0..self.region.len() {
+            let instruction = self.region[index].clone();
+            bcx.switch_to_block(code_blocks[index]);
+            if self.plan.key.budgeted {
+                self.emit_budget_guard(&mut bcx, ctx, &helpers, instruction.pc);
+            }
+            self.emit_instruction(
+                &mut bcx,
+                ctx,
+                &helpers,
+                &instruction,
+                &code_blocks,
+                loop_exit,
+            )?;
+            if fallthrough(&instruction.instruction)
+                && !has_explicit_edges(&instruction.instruction)
+            {
+                bcx.ins().jump(*code_blocks.get(index + 1)?, &[]);
+            }
+        }
+
+        bcx.switch_to_block(loop_exit);
+        let exit = self.plan.exits.first()?;
+        self.emit_exact_materialization(&mut bcx, ctx, &helpers, &exit.materialize)?;
+        Self::emit_set_pc(&mut bcx, ctx, &helpers, exit.resume_pc);
+        let status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(
+                JitExitKind::Continuation,
+                JitExitReason::LoopExit,
+                exit.resume_pc,
+            ) as i64,
+        );
+        bcx.ins().return_(&[status]);
+
+        bcx.seal_all_blocks();
+        bcx.finalize();
+
+        let name = self.backend.next_fn_name("jit_loop");
+        let id = self
+            .backend
+            .module
+            .declare_function(&name, Linkage::Export, &cctx.func.signature)
+            .ok()?;
+        self.backend.module.define_function(id, &mut cctx).ok()?;
+        let code_bytes = cctx.compiled_code()?.code_buffer().len();
+        self.backend.module.clear_context(&mut cctx);
+        self.backend.module.finalize_definitions().ok()?;
+        let code_ptr = self.backend.module.get_finalized_function(id);
+        // SAFETY: this function was declared with the exact Context-pointer to
+        // u64 C ABI, and the owning backend outlives the returned entry.
+        let entry = unsafe {
+            std::mem::transmute::<*const u8, extern "C" fn(*mut Context) -> u64>(code_ptr)
+        };
+        Some(CompiledLoopRegion { entry, code_bytes })
+    }
+
+    fn build_helpers(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ptr: cranelift_codegen::ir::Type,
+    ) -> LoopHelpers {
+        let mut make = |address: usize,
+                        params: &[cranelift_codegen::ir::Type],
+                        result: cranelift_codegen::ir::Type| {
+            let mut signature = self.backend.module.make_signature();
+            for param in params {
+                signature.params.push(AbiParam::new(*param));
+            }
+            signature.returns.push(AbiParam::new(result));
+            Helper {
+                address,
+                signature: bcx.import_signature(signature),
+            }
+        };
+        LoopHelpers {
+            ptr,
+            entry_guard: make(
+                jit_loop_entry_guard as *const () as usize,
+                &[
+                    ptr,
+                    types::I64,
+                    types::I64,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I64,
+            ),
+            register_guard: make(
+                jit_loop_register_guard as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I64,
+            ),
+            get_register_i32: make(
+                jit_get_register_i32 as *const () as usize,
+                &[ptr, types::I32],
+                types::I32,
+            ),
+            get_register_f64: make(
+                jit_get_register_f64 as *const () as usize,
+                &[ptr, types::I32],
+                types::F64,
+            ),
+            set_pc: make(
+                jit_set_pc as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            store_i32: make(
+                jit_store_i32 as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I64,
+            ),
+            store_f64: make(
+                jit_store_f64 as *const () as usize,
+                &[ptr, types::I32, types::F64],
+                types::I64,
+            ),
+            increment_loop: make(jit_increment_loop as *const () as usize, &[ptr], types::I64),
+            consume_instruction_budget: make(
+                jit_consume_instruction_budget as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            refund_instruction_budget: make(
+                jit_refund_instruction_budget as *const () as usize,
+                &[ptr],
+                types::I64,
+            ),
+        }
+    }
+
+    fn emit_frame_guard(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        header_pc: u32,
+        rejected: Block,
+    ) {
+        let helper = bcx
+            .ins()
+            .iconst(helpers.ptr, helpers.entry_guard.address as i64);
+        let backend_id = bcx.ins().iconst(types::I64, self.backend.id as i64);
+        let code_id = bcx.ins().iconst(types::I64, self.plan.key.code_id as i64);
+        let header = bcx.ins().iconst(types::I32, i64::from(header_pc));
+        let budgeted = bcx
+            .ins()
+            .iconst(types::I32, i64::from(self.plan.key.budgeted));
+        let registers = bcx
+            .ins()
+            .iconst(types::I32, i64::from(self.code.register_count));
+        let result = bcx.ins().call_indirect(
+            helpers.entry_guard.signature,
+            helper,
+            &[ctx, backend_id, code_id, header, budgeted, registers],
+        );
+        let result = bcx.inst_results(result)[0];
+        let accepted = bcx.create_block();
+        bcx.ins().brif(result, accepted, &[], rejected, &[]);
+        bcx.switch_to_block(accepted);
+    }
+
+    fn emit_budget_guard(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        pc: usize,
+    ) {
+        let helper = bcx.ins().iconst(
+            helpers.ptr,
+            helpers.consume_instruction_budget.address as i64,
+        );
+        let pc_value = bcx.ins().iconst(types::I32, pc as i64);
+        let status = bcx.ins().call_indirect(
+            helpers.consume_instruction_budget.signature,
+            helper,
+            &[ctx, pc_value],
+        );
+        let status = bcx.inst_results(status)[0];
+        let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+        let failed = bcx.ins().band(status, break_mask);
+        let failed_block = bcx.create_block();
+        let continuation = bcx.create_block();
+        bcx.ins().brif(failed, failed_block, &[], continuation, &[]);
+        bcx.switch_to_block(failed_block);
+        self.emit_available_materialization(bcx, ctx, helpers);
+        bcx.ins().return_(&[status]);
+        bcx.switch_to_block(continuation);
+    }
+
+    fn emit_instruction(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        decoded: &LoopDecodedInstruction,
+        blocks: &[Block],
+        loop_exit: Block,
+    ) -> Option<()> {
+        let register = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
+        match &decoded.instruction {
+            Instruction::StoreZero { dst } => {
+                let value = self.constant(bcx, 0.0, 0);
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreOne { dst } => {
+                let value = self.constant(bcx, 1.0, 1);
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreInt8 { dst, value } => {
+                let value = self.constant(bcx, f64::from(*value), i64::from(*value));
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreInt16 { dst, value } => {
+                let value = self.constant(bcx, f64::from(*value), i64::from(*value));
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreInt32 { dst, value } => {
+                let value = self.constant(bcx, f64::from(*value), i64::from(*value));
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreFloat { dst, value } if self.mode == NativeMode::F64 => {
+                let value = bcx.ins().f64const(f64::from(*value));
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::StoreDouble { dst, value } if self.mode == NativeMode::F64 => {
+                let value = bcx.ins().f64const(*value);
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::Move { dst, src } => {
+                let value = self.use_register(bcx, register(*src))?;
+                self.define_register(bcx, register(*dst), value)?;
+            }
+            Instruction::Add { dst, lhs, rhs } => {
+                let lhs = self.use_register(bcx, register(*lhs))?;
+                let rhs = self.use_register(bcx, register(*rhs))?;
+                let result = match self.mode {
+                    NativeMode::F64 => bcx.ins().fadd(lhs, rhs),
+                    NativeMode::I32 => {
+                        let result = bcx.ins().iadd(lhs, rhs);
+                        let lhs_sign = Self::sign_bit(bcx, lhs);
+                        let rhs_sign = Self::sign_bit(bcx, rhs);
+                        let result_sign = Self::sign_bit(bcx, result);
+                        let same = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+                        let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
+                        let overflow = bcx.ins().band(same, changed);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        result
+                    }
+                };
+                self.define_register(bcx, register(*dst), result)?;
+            }
+            Instruction::Sub { dst, lhs, rhs } => {
+                let lhs = self.use_register(bcx, register(*lhs))?;
+                let rhs = self.use_register(bcx, register(*rhs))?;
+                let result = match self.mode {
+                    NativeMode::F64 => bcx.ins().fsub(lhs, rhs),
+                    NativeMode::I32 => {
+                        let result = bcx.ins().isub(lhs, rhs);
+                        let lhs_sign = Self::sign_bit(bcx, lhs);
+                        let rhs_sign = Self::sign_bit(bcx, rhs);
+                        let result_sign = Self::sign_bit(bcx, result);
+                        let different = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
+                        let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
+                        let overflow = bcx.ins().band(different, changed);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        result
+                    }
+                };
+                self.define_register(bcx, register(*dst), result)?;
+            }
+            Instruction::Mul { dst, lhs, rhs } => {
+                let lhs = self.use_register(bcx, register(*lhs))?;
+                let rhs = self.use_register(bcx, register(*rhs))?;
+                let result = match self.mode {
+                    NativeMode::F64 => bcx.ins().fmul(lhs, rhs),
+                    NativeMode::I32 => {
+                        let lhs_wide = bcx.ins().sextend(types::I64, lhs);
+                        let rhs_wide = bcx.ins().sextend(types::I64, rhs);
+                        let wide = bcx.ins().imul(lhs_wide, rhs_wide);
+                        let result = bcx.ins().ireduce(types::I32, wide);
+                        let round_trip = bcx.ins().sextend(types::I64, result);
+                        let overflow = bcx.ins().icmp(IntCC::NotEqual, wide, round_trip);
+                        let zero = bcx.ins().iconst(types::I32, 0);
+                        let is_zero = bcx.ins().icmp(IntCC::Equal, result, zero);
+                        let lhs_negative = Self::sign_bit(bcx, lhs);
+                        let rhs_negative = Self::sign_bit(bcx, rhs);
+                        let signs_differ = bcx.ins().bxor(lhs_negative, rhs_negative);
+                        let negative_zero = bcx.ins().band(is_zero, signs_differ);
+                        let overflow = bcx.ins().bor(overflow, negative_zero);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        result
+                    }
+                };
+                self.define_register(bcx, register(*dst), result)?;
+            }
+            Instruction::Inc { dst, src } => {
+                let old = self.use_register(bcx, register(*src))?;
+                let result = match self.mode {
+                    NativeMode::F64 => {
+                        let one = bcx.ins().f64const(1.0);
+                        bcx.ins().fadd(old, one)
+                    }
+                    NativeMode::I32 => {
+                        let one = bcx.ins().iconst(types::I32, 1);
+                        let result = bcx.ins().iadd(old, one);
+                        let old_sign = Self::sign_bit(bcx, old);
+                        let result_sign = Self::sign_bit(bcx, result);
+                        let not_old_sign = bcx.ins().bnot(old_sign);
+                        let overflow = bcx.ins().band(not_old_sign, result_sign);
+                        self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, overflow);
+                        result
+                    }
+                };
+                self.define_register(bcx, register(*dst), result)?;
+            }
+            Instruction::Jump { address } => {
+                bcx.ins().jump(self.target_block(*address, blocks)?, &[]);
+            }
+            Instruction::JumpIfNotLessThan { address, lhs, rhs } => self.emit_compare(
+                bcx,
+                register(*lhs),
+                register(*rhs),
+                IntCC::SignedGreaterThanOrEqual,
+                FloatCC::UnorderedOrGreaterThanOrEqual,
+                *address,
+                decoded.next_pc,
+                blocks,
+                loop_exit,
+            )?,
+            Instruction::JumpIfNotLessThanOrEqual { address, lhs, rhs } => self.emit_compare(
+                bcx,
+                register(*lhs),
+                register(*rhs),
+                IntCC::SignedGreaterThan,
+                FloatCC::UnorderedOrGreaterThan,
+                *address,
+                decoded.next_pc,
+                blocks,
+                loop_exit,
+            )?,
+            Instruction::JumpIfNotGreaterThan { address, lhs, rhs } => self.emit_compare(
+                bcx,
+                register(*lhs),
+                register(*rhs),
+                IntCC::SignedLessThanOrEqual,
+                FloatCC::UnorderedOrLessThanOrEqual,
+                *address,
+                decoded.next_pc,
+                blocks,
+                loop_exit,
+            )?,
+            Instruction::JumpIfNotGreaterThanOrEqual { address, lhs, rhs } => self.emit_compare(
+                bcx,
+                register(*lhs),
+                register(*rhs),
+                IntCC::SignedLessThan,
+                FloatCC::UnorderedOrLessThan,
+                *address,
+                decoded.next_pc,
+                blocks,
+                loop_exit,
+            )?,
+            Instruction::JumpIfNotEqual { address, lhs, rhs } => self.emit_compare(
+                bcx,
+                register(*lhs),
+                register(*rhs),
+                IntCC::NotEqual,
+                FloatCC::NotEqual,
+                *address,
+                decoded.next_pc,
+                blocks,
+                loop_exit,
+            )?,
+            Instruction::IncrementLoopIteration => {
+                Self::emit_set_pc(bcx, ctx, helpers, decoded.next_pc as u32);
+                let helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.increment_loop.address as i64);
+                let status =
+                    bcx.ins()
+                        .call_indirect(helpers.increment_loop.signature, helper, &[ctx]);
+                let status = bcx.inst_results(status)[0];
+                let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+                let failed = bcx.ins().band(status, break_mask);
+                let failed_block = bcx.create_block();
+                let continuation = bcx.create_block();
+                bcx.ins().brif(failed, failed_block, &[], continuation, &[]);
+                bcx.switch_to_block(failed_block);
+                self.emit_available_materialization(bcx, ctx, helpers);
+                bcx.ins().return_(&[status]);
+                bcx.switch_to_block(continuation);
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_compare(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        lhs: usize,
+        rhs: usize,
+        int_condition: IntCC,
+        float_condition: FloatCC,
+        target: crate::vm::opcode::Address,
+        next_pc: usize,
+        blocks: &[Block],
+        loop_exit: Block,
+    ) -> Option<()> {
+        let lhs = self.use_register(bcx, lhs)?;
+        let rhs = self.use_register(bcx, rhs)?;
+        let condition = match self.mode {
+            NativeMode::I32 => bcx.ins().icmp(int_condition, lhs, rhs),
+            NativeMode::F64 => bcx.ins().fcmp(float_condition, lhs, rhs),
+        };
+        let target_pc = target.as_u32();
+        let target = if self.plan.exits.first()?.resume_pc == target_pc {
+            loop_exit
+        } else {
+            self.target_block(target, blocks)?
+        };
+        let next = self
+            .pc_to_index
+            .get(&next_pc)
+            .and_then(|index| blocks.get(*index))
+            .copied()?;
+        bcx.ins().brif(condition, target, &[], next, &[]);
+        Some(())
+    }
+
+    fn emit_overflow_guard(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        pc: usize,
+        overflow: cranelift_codegen::ir::Value,
+    ) {
+        let deopt = bcx.create_block();
+        let continuation = bcx.create_block();
+        bcx.ins().brif(overflow, deopt, &[], continuation, &[]);
+        bcx.switch_to_block(deopt);
+        if self.plan.key.budgeted {
+            let helper = bcx.ins().iconst(
+                helpers.ptr,
+                helpers.refund_instruction_budget.address as i64,
+            );
+            bcx.ins()
+                .call_indirect(helpers.refund_instruction_budget.signature, helper, &[ctx]);
+        }
+        self.emit_available_materialization(bcx, ctx, helpers);
+        Self::emit_set_pc(bcx, ctx, helpers, pc as u32);
+        let status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(
+                JitExitKind::Deopt,
+                JitExitReason::IntegerOverflow,
+                pc as u32,
+            ) as i64,
+        );
+        bcx.ins().return_(&[status]);
+        bcx.switch_to_block(continuation);
+    }
+
+    fn emit_available_materialization(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+    ) {
+        for (register, variable) in self.variables.iter().enumerate() {
+            let Ok(value) = bcx.try_use_var(*variable) else {
+                continue;
+            };
+            self.emit_store(bcx, ctx, helpers, register, value);
+        }
+    }
+
+    fn emit_exact_materialization(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        values: &[LoopExitValue],
+    ) -> Option<()> {
+        for value in values {
+            match value.source {
+                LoopExitSource::PreservedVmValue => {}
+                LoopExitSource::NativeValue => {
+                    let native = self.use_register(bcx, value.register as usize)?;
+                    self.emit_store(bcx, ctx, helpers, value.register as usize, native);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn emit_store(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        register: usize,
+        value: cranelift_codegen::ir::Value,
+    ) {
+        let helper = match self.mode {
+            NativeMode::I32 => helpers.store_i32,
+            NativeMode::F64 => helpers.store_f64,
+        };
+        let address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+        let register = bcx.ins().iconst(types::I32, register as i64);
+        bcx.ins()
+            .call_indirect(helper.signature, address, &[ctx, register, value]);
+    }
+
+    fn emit_set_pc(
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &LoopHelpers,
+        pc: u32,
+    ) {
+        let helper = bcx.ins().iconst(helpers.ptr, helpers.set_pc.address as i64);
+        let pc = bcx.ins().iconst(types::I32, i64::from(pc));
+        bcx.ins()
+            .call_indirect(helpers.set_pc.signature, helper, &[ctx, pc]);
+    }
+
+    fn target_block(&self, address: crate::vm::opcode::Address, blocks: &[Block]) -> Option<Block> {
+        self.pc_to_index
+            .get(&(address.as_u32() as usize))
+            .and_then(|index| blocks.get(*index))
+            .copied()
+    }
+
+    fn use_register(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        register: usize,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        self.variables
+            .get(register)
+            .and_then(|variable| bcx.try_use_var(*variable).ok())
+    }
+
+    fn define_register(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        register: usize,
+        value: cranelift_codegen::ir::Value,
+    ) -> Option<()> {
+        bcx.def_var(*self.variables.get(register)?, value);
+        Some(())
+    }
+
+    fn constant(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        f64_value: f64,
+        i32_value: i64,
+    ) -> cranelift_codegen::ir::Value {
+        match self.mode {
+            NativeMode::I32 => bcx.ins().iconst(types::I32, i32_value),
+            NativeMode::F64 => bcx.ins().f64const(f64_value),
+        }
+    }
+
+    fn sign_bit(
+        bcx: &mut FunctionBuilder<'_>,
+        value: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let zero = bcx.ins().iconst(types::I32, 0);
+        bcx.ins().icmp(IntCC::SignedLessThan, value, zero)
+    }
+}
+
 // The helper implementations are kept with the compiler so their ABI is
 // reviewed together with the generated calls. Helpers return zero on success
 // and a tagged/break status on failure.
@@ -2536,6 +3339,59 @@ extern "C" fn jit_guard(context: *mut Context, charge_instruction_budget: u32) -
         return 0;
     }
     1
+}
+
+/// Validate the immutable frame identity owned by one typed loop artifact.
+/// Register values are checked separately so a representation miss can carry
+/// a distinct entry-rejection reason. Every access here is bounds checked;
+/// generated code never reaches the unchecked VM register helpers until this
+/// guard and all per-register guards have succeeded.
+extern "C" fn jit_loop_entry_guard(
+    context: *mut Context,
+    backend_id: u64,
+    code_id: u64,
+    header_pc: u32,
+    charge_instruction_budget: u32,
+    register_count: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let frame = context.vm.frame();
+    let budget_mode_matches =
+        context.instruction_budget_remaining.is_some() == (charge_instruction_budget != 0);
+    let register_range_exists = register_count == frame.code_block.register_count
+        && (register_count == 0
+            || context
+                .vm
+                .stack
+                .get_register(frame, register_count as usize - 1)
+                .is_some());
+    u64::from(
+        context.active_jit_backend_id == backend_id
+            && frame.code_block.debug_id == code_id
+            && frame.pc == header_pc
+            && !frame.construct()
+            && budget_mode_matches
+            && register_range_exists,
+    )
+}
+
+extern "C" fn jit_loop_register_guard(
+    context: *mut Context,
+    register: u32,
+    representation: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let frame = context.vm.frame();
+    let Some(value) = context.vm.stack.get_register(frame, register as usize) else {
+        return 0;
+    };
+    u64::from(match representation {
+        0 => value.as_i32().is_some(),
+        1 => value.as_number().is_some(),
+        _ => false,
+    })
 }
 
 /// Charge one bytecode instruction before native lowering executes it.

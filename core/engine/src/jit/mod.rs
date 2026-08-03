@@ -1159,6 +1159,7 @@ const MAX_LOOP_COMPILE_NS: u128 = 10_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopRegionStateKind {
     Observed,
+    Ready,
     Rejected { reason: JitOsrRejectionReason },
     Suppressed { reason: JitOsrSuppressionReason },
 }
@@ -1175,6 +1176,17 @@ enum LoopRegionAction {
     Compile,
     Closed,
     Suppressed(JitOsrSuppressionReason),
+}
+
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "invoked and validated by the scheduler in Slice 4A1.4"
+)]
+struct LoopCachedEntry {
+    compiled: native::CompiledLoopRegion,
+    header_pc: u32,
+    resume_pc: u32,
 }
 
 /// If `instr` is a **same-frame** branch (no frame push), return its target
@@ -1223,8 +1235,12 @@ pub struct JitBackend {
     /// unbudgeted entries are distinct so the latter keep their fast path.
     cache: FxHashMap<JitCacheKey, CachedEntry>,
     /// Bounded per-key loop hotness and terminal admission state. No generated
-    /// loop entry can be stored or invoked until the following compiler slice.
+    /// loop entry can be invoked until the following scheduler slice.
     loop_regions: FxHashMap<JitCacheKey, LoopRegionState>,
+    /// Successfully compiled loop regions. The production scheduler has no
+    /// lookup or invocation edge until Slice 4A1.4; direct compiler tests use
+    /// a cfg(test)-only accessor below.
+    loop_cache: FxHashMap<JitCacheKey, LoopCachedEntry>,
     loop_code_bytes: usize,
     loop_code_bytes_exhausted: bool,
     loop_compile_time_exhausted: bool,
@@ -1275,6 +1291,7 @@ impl JitBackend {
             next_fn_id: 0,
             cache: FxHashMap::default(),
             loop_regions: FxHashMap::default(),
+            loop_cache: FxHashMap::default(),
             loop_code_bytes: 0,
             loop_code_bytes_exhausted: false,
             loop_compile_time_exhausted: false,
@@ -1400,9 +1417,9 @@ impl JitBackend {
                         std::cmp::Ordering::Greater => LoopRegionAction::Closed,
                     }
                 }
-                LoopRegionStateKind::Rejected { .. } | LoopRegionStateKind::Suppressed { .. } => {
-                    LoopRegionAction::Closed
-                }
+                LoopRegionStateKind::Ready
+                | LoopRegionStateKind::Rejected { .. }
+                | LoopRegionStateKind::Suppressed { .. } => LoopRegionAction::Closed,
             };
             if crossed_hotness {
                 self.update_osr_counters(|counters| {
@@ -1459,6 +1476,67 @@ impl JitBackend {
         state.kind = LoopRegionStateKind::Rejected { reason };
         self.update_osr_counters(|counters| counters.rejections.record(reason));
         true
+    }
+
+    /// Compile a proven loop plan into the bounded loop cache without adding
+    /// any production scheduler path that can invoke it.
+    #[allow(
+        dead_code,
+        reason = "called by the post-backedge scheduler in Slice 4A1.4"
+    )]
+    fn compile_loop_region(&mut self, code: &CodeBlock, plan: &native::LoopRegionPlan) -> bool {
+        let key = plan.key;
+        let JitEntryPoint::Loop { header_pc, .. } = key.entry_point else {
+            return false;
+        };
+        let hotness_threshold = self.thresholds.loop_backedges.max(1);
+        if !matches!(
+            self.loop_regions.get(&key),
+            Some(LoopRegionState {
+                kind: LoopRegionStateKind::Observed,
+                backedges,
+            }) if *backedges == hotness_threshold
+        ) || self.loop_cache.contains_key(&key)
+        {
+            return false;
+        }
+
+        self.record_loop_compile_attempt();
+        let started = Instant::now();
+        let result = native::compile_loop_region(self, code, plan);
+        let compile_ns = started.elapsed().as_nanos();
+        match result {
+            native::LoopNativeCompileResult::Compiled(compiled) => {
+                let Some(exit) = plan.exits.first() else {
+                    self.record_loop_compile_result(false, 0, compile_ns);
+                    return self.reject_loop_region(key, JitOsrRejectionReason::Lowering);
+                };
+                self.record_loop_compile_result(true, compiled.code_bytes, compile_ns);
+                self.loop_cache.insert(
+                    key,
+                    LoopCachedEntry {
+                        compiled,
+                        header_pc,
+                        resume_pc: exit.resume_pc,
+                    },
+                );
+                let Some(state) = self.loop_regions.get_mut(&key) else {
+                    return false;
+                };
+                state.kind = LoopRegionStateKind::Ready;
+                true
+            }
+            native::LoopNativeCompileResult::Rejected(reason) => {
+                self.record_loop_compile_result(false, 0, compile_ns);
+                self.reject_loop_region(key, reason);
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn compiled_loop_entry_for_test(&self, key: JitCacheKey) -> Option<LoopCachedEntry> {
+        self.loop_cache.get(&key).copied()
     }
 
     #[allow(dead_code, reason = "called by the loop compiler in Slice 4A1.3")]
@@ -2425,6 +2503,21 @@ mod tests {
         )
     }
 
+    fn push_loop_test_frame(context: &mut Context, code: boa_gc::Gc<CodeBlock>) {
+        let (active_runnable, environments, realm) = {
+            let frame = context.vm.frame();
+            (
+                frame.active_runnable.clone(),
+                frame.environments.clone(),
+                frame.realm.clone(),
+            )
+        };
+        let frame = crate::vm::CallFrame::new(code, active_runnable, environments, realm);
+        context
+            .vm
+            .push_frame_with_stack(frame, JsValue::undefined(), JsValue::undefined());
+    }
+
     fn enable_jit_without_admission_floor(context: &mut Context) {
         context.enable_jit();
         context
@@ -3369,6 +3462,405 @@ mod tests {
     }
 
     #[test]
+    fn jit_loop_compiler_materializes_fractional_continuation_without_scheduler_wiring() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::F64,
+            false,
+            false,
+        )
+        .expect("selected loop plan");
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Compile
+        );
+        assert!(backend.compile_loop_region(&code, &plan));
+        let cached = backend
+            .compiled_loop_entry_for_test(plan.key)
+            .expect("compiled loop cache entry");
+        assert_eq!(cached.header_pc, header_pc);
+        assert_eq!(cached.resume_pc, plan.exits[0].resume_pc);
+        assert!(cached.compiled.code_bytes > 0);
+
+        let mut context = Context::default();
+        push_loop_test_frame(&mut context, code.clone());
+        context.vm.frame_mut().pc = header_pc;
+        context.vm.set_register(1, JsValue::new(0.5));
+        context.vm.set_register(2, JsValue::new(10));
+        context.vm.set_register(4, JsValue::new(0));
+        context.active_jit_backend_id = backend.id();
+        let status = (cached.compiled.entry)(&raw mut context);
+        context.active_jit_backend_id = 0;
+
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::Continuation,
+                reason: JitExitReason::LoopExit,
+                pc: plan.exits[0].resume_pc,
+            })
+        );
+        assert_eq!(context.vm.frame().pc, plan.exits[0].resume_pc);
+        assert_eq!(context.vm.get_register(1).as_number(), Some(45.5));
+        assert_eq!(context.vm.frame().loop_iteration_count, 10);
+
+        context.vm.pop_frame();
+        assert_eq!(backend.stats().osr.compilations, 1);
+        assert_eq!(backend.stats().osr.code_bytes, cached.compiled.code_bytes);
+    }
+
+    #[test]
+    fn jit_loop_compiler_entry_guards_are_pre_effect_and_strict() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::F64,
+            false,
+            false,
+        )
+        .expect("selected loop plan");
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Compile
+        );
+        assert!(backend.compile_loop_region(&code, &plan));
+        let entry = backend
+            .compiled_loop_entry_for_test(plan.key)
+            .expect("compiled loop")
+            .compiled
+            .entry;
+
+        let mut context = Context::default();
+        push_loop_test_frame(&mut context, code.clone());
+        context.vm.frame_mut().pc = header_pc;
+        context
+            .vm
+            .set_register(1, JsValue::new(js_string!("not a number")));
+        context.vm.set_register(2, JsValue::new(10));
+        context.vm.set_register(4, JsValue::new(0));
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::EntryRejected,
+                reason: JitExitReason::ArgumentType,
+                pc: header_pc,
+            })
+        );
+        assert_eq!(context.vm.frame().pc, header_pc);
+        assert_eq!(context.vm.frame().loop_iteration_count, 0);
+        assert!(context.vm.get_register(1).is_string());
+
+        context.vm.set_register(1, JsValue::new(0.5));
+        context.set_instruction_budget(100);
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::EntryRejected,
+                reason: JitExitReason::EntryGuard,
+                pc: header_pc,
+            })
+        );
+        assert_eq!(context.instruction_budget_remaining(), Some(100));
+        assert_eq!(context.vm.frame().loop_iteration_count, 0);
+        context.vm.pop_frame();
+    }
+
+    #[test]
+    fn jit_loop_compiler_budget_and_overflow_replay_preserve_native_state() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            true,
+            false,
+        )
+        .expect("integer loop plan");
+        let add_pc = InstructionIterator::new(&code.bytecode)
+            .find_map(|(pc, _, instruction)| {
+                matches!(instruction, Instruction::Add { .. }).then_some(pc as u32)
+            })
+            .expect("add instruction");
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Compile
+        );
+        assert!(backend.compile_loop_region(&code, &plan));
+        let entry = backend
+            .compiled_loop_entry_for_test(plan.key)
+            .expect("compiled loop")
+            .compiled
+            .entry;
+
+        let mut context = Context::default();
+        push_loop_test_frame(&mut context, code.clone());
+        context.vm.frame_mut().pc = header_pc;
+        context.vm.set_register(1, JsValue::new(i32::MAX));
+        context.vm.set_register(2, JsValue::new(2));
+        context.vm.set_register(4, JsValue::new(0));
+        context.set_instruction_budget(100);
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::Deopt,
+                reason: JitExitReason::IntegerOverflow,
+                pc: add_pc,
+            })
+        );
+        assert_eq!(context.vm.frame().pc, add_pc);
+        assert_eq!(context.vm.get_register(1).as_i32(), Some(i32::MAX));
+        assert_eq!(context.vm.get_register(4).as_i32(), Some(1));
+        assert_eq!(context.instruction_budget_remaining(), Some(97));
+        context.vm.pop_frame();
+
+        let mut successful = Context::default();
+        push_loop_test_frame(&mut successful, code.clone());
+        successful.vm.frame_mut().pc = header_pc;
+        successful.vm.set_register(1, JsValue::new(0));
+        successful.vm.set_register(2, JsValue::new(10));
+        successful.vm.set_register(4, JsValue::new(0));
+        successful.set_instruction_budget(100);
+        successful.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut successful);
+        successful.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::Continuation,
+                reason: JitExitReason::LoopExit,
+                pc: plan.exits[0].resume_pc,
+            })
+        );
+        assert_eq!(successful.vm.get_register(1).as_i32(), Some(45));
+        assert_eq!(successful.instruction_budget_remaining(), Some(43));
+        successful.vm.pop_frame();
+
+        let mut exhausted = Context::default();
+        push_loop_test_frame(&mut exhausted, code);
+        exhausted.vm.frame_mut().pc = header_pc;
+        exhausted.vm.set_register(1, JsValue::new(0));
+        exhausted.vm.set_register(2, JsValue::new(10));
+        exhausted.vm.set_register(4, JsValue::new(0));
+        exhausted.set_instruction_budget(3);
+        exhausted.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut exhausted);
+        exhausted.active_jit_backend_id = 0;
+        assert_eq!(status, JIT_BREAK_BIT);
+        assert_eq!(
+            exhausted.vm.jit_exit_pending,
+            Some(JitExit {
+                kind: JitExitKind::Budget,
+                reason: JitExitReason::RuntimeLimit,
+                pc: add_pc,
+            })
+        );
+        assert_eq!(exhausted.vm.frame().pc, add_pc);
+        assert_eq!(exhausted.vm.get_register(1).as_i32(), Some(0));
+        assert_eq!(exhausted.vm.get_register(4).as_i32(), Some(1));
+        assert_eq!(exhausted.instruction_budget_remaining(), Some(0));
+        assert!(exhausted.vm.jit_pending.is_some());
+        exhausted.vm.pop_frame();
+    }
+
+    #[test]
+    fn jit_loop_compiler_deopts_i32_multiplication_that_would_produce_negative_zero() {
+        let code = first_function_code(
+            "function once(limit, factor) { let total = 0; for (let i = 0; i < limit; i++) { total = total * factor; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            false,
+            false,
+        )
+        .expect("integer multiplication loop plan");
+        let mut loop_register = None;
+        let mut limit_register = None;
+        let mut total_register = None;
+        let mut factor_register = None;
+        let mut multiply_pc = None;
+        for (pc, _, instruction) in InstructionIterator::new(&code.bytecode) {
+            if pc < header_pc as usize || pc > backedge_pc as usize {
+                continue;
+            }
+            match instruction {
+                Instruction::Inc { src, .. } => loop_register = Some(usize::from(src)),
+                Instruction::JumpIfNotLessThan { rhs, .. } => {
+                    limit_register = Some(usize::from(rhs));
+                }
+                Instruction::Mul { lhs, rhs, .. } => {
+                    total_register = Some(usize::from(lhs));
+                    factor_register = Some(usize::from(rhs));
+                    multiply_pc = Some(pc as u32);
+                }
+                _ => {}
+            }
+        }
+        let loop_register = loop_register.expect("loop register");
+        let limit_register = limit_register.expect("limit register");
+        let total_register = total_register.expect("total register");
+        let factor_register = factor_register.expect("factor register");
+        let multiply_pc = multiply_pc.expect("multiply pc");
+
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Compile
+        );
+        assert!(backend.compile_loop_region(&code, &plan));
+        let entry = backend
+            .compiled_loop_entry_for_test(plan.key)
+            .expect("compiled loop")
+            .compiled
+            .entry;
+
+        let mut context = Context::default();
+        push_loop_test_frame(&mut context, code);
+        context.vm.frame_mut().pc = header_pc;
+        for value in &plan.entry {
+            context
+                .vm
+                .set_register(value.register as usize, JsValue::new(0));
+        }
+        context.vm.set_register(limit_register, JsValue::new(2));
+        context.vm.set_register(factor_register, JsValue::new(-1));
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::Deopt,
+                reason: JitExitReason::IntegerOverflow,
+                pc: multiply_pc,
+            })
+        );
+        assert_eq!(context.vm.get_register(total_register).as_i32(), Some(0));
+        assert_eq!(context.vm.get_register(loop_register).as_i32(), Some(1));
+        context.vm.pop_frame();
+    }
+
+    #[test]
+    fn jit_loop_compiler_revalidation_failure_is_terminal_and_uncached() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let mut plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::F64,
+            false,
+            false,
+        )
+        .expect("selected loop plan");
+        let key = plan.key;
+        plan.instruction_pcs[0] = plan.instruction_pcs[0].saturating_add(1);
+
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        assert_eq!(backend.observe_loop_region(key), LoopRegionAction::Compile);
+        assert!(!backend.compile_loop_region(&code, &plan));
+        assert!(backend.compiled_loop_entry_for_test(key).is_none());
+        assert_eq!(backend.observe_loop_region(key), LoopRegionAction::Closed);
+        assert!(matches!(
+            backend.loop_regions.get(&key),
+            Some(LoopRegionState {
+                kind: LoopRegionStateKind::Rejected {
+                    reason: JitOsrRejectionReason::Lowering,
+                },
+                ..
+            })
+        ));
+        assert_eq!(backend.stats().osr.compile_attempts, 1);
+        assert_eq!(backend.stats().osr.compilations, 0);
+        assert_eq!(backend.stats().osr.code_bytes, 0);
+        assert_eq!(backend.stats().osr.rejections.lowering, 1);
+    }
+
+    #[test]
+    fn jit_loop_compiler_requires_the_exact_hot_observed_key() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitOsrRepresentation::I32,
+            false,
+            false,
+        )
+        .expect("integer loop plan");
+        let mut backend = JitBackend::new();
+        backend.set_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 2,
+        });
+
+        assert_eq!(
+            backend.observe_loop_region(plan.key),
+            LoopRegionAction::Cold
+        );
+        assert!(!backend.compile_loop_region(&code, &plan));
+        assert!(backend.compiled_loop_entry_for_test(plan.key).is_none());
+        assert_eq!(backend.stats().osr.compile_attempts, 0);
+        assert_eq!(backend.stats().osr.compilations, 0);
+        assert_eq!(backend.stats().osr.code_bytes, 0);
+    }
+
+    #[test]
     fn jit_loop_region_state_is_bounded_without_forgetting_exact_keys() {
         let mut backend = JitBackend::new();
         backend.enable_diagnostics(JitDiagnosticLimits::default());
@@ -3810,7 +4302,7 @@ mod tests {
         enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } let value = 0; for (let i = 0; i < 80; i++) { value = add(i, 1); } for (let i = 0; i < 80; i++) { value = subtract(i, 1); } let overflow = add(2147483647, 1); let text = add(\"x\", \"y\"); let negativeZero = subtract(-0, 0); (overflow === 2147483648 && text === \"xy\" && Object.is(negativeZero, -0)) ? 1 : 0",
+                "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } function multiply(left, right) { return left * right; } let value = 0; for (let i = 0; i < 80; i++) { value = add(i, 1); } for (let i = 0; i < 80; i++) { value = subtract(i, 1); } for (let i = 0; i < 80; i++) { value = multiply(i, 1); } let overflow = add(2147483647, 1); let text = add(\"x\", \"y\"); let negativeZero = subtract(-0, 0); let negativeZeroProduct = multiply(0, -1); (overflow === 2147483648 && text === \"xy\" && Object.is(negativeZero, -0) && Object.is(negativeZeroProduct, -0)) ? 1 : 0",
             ),
             None,
             &mut context,
@@ -3822,7 +4314,7 @@ mod tests {
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
-        assert!(stats.deopts >= 3, "stats: {stats:?}");
+        assert!(stats.deopts >= 4, "stats: {stats:?}");
     }
 
     #[test]
