@@ -982,6 +982,10 @@ struct RegisterDefinition {
 struct RegisterAnalysis {
     before: Vec<Vec<RegisterKind>>,
     after: Vec<Vec<RegisterKind>>,
+    /// The single register each instruction rewrites, if any. Recorded here so
+    /// the definedness bookkeeping in the compiler cannot drift from
+    /// `output_definition`.
+    targets: Vec<Option<usize>>,
 }
 
 fn analyze_registers(
@@ -1001,6 +1005,7 @@ fn analyze_registers(
     let mut current: Vec<usize> = (0..register_count).collect();
     let mut before_ids = Vec::with_capacity(instructions.instructions.len());
     let mut after_ids = Vec::with_capacity(instructions.instructions.len());
+    let mut targets = Vec::with_capacity(instructions.instructions.len());
     let call_pushes = call_push_operands(instructions);
 
     for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
@@ -1017,6 +1022,7 @@ fn analyze_registers(
             mark_definition(definition, &mut definitions);
         }
 
+        let mut target = None;
         if let Some((register, source, kind)) =
             output_definition(instruction, &current, &definitions)
         {
@@ -1028,7 +1034,9 @@ fn analyze_registers(
             if let Some(current_definition) = current.get_mut(register) {
                 *current_definition = definition;
             }
+            target = Some(register);
         }
+        targets.push(target);
 
         after_ids.push(current.clone());
     }
@@ -1046,6 +1054,7 @@ fn analyze_registers(
     Some(RegisterAnalysis {
         before: before_ids.iter().map(|ids| kinds(ids)).collect(),
         after: after_ids.iter().map(|ids| kinds(ids)).collect(),
+        targets,
     })
 }
 
@@ -1260,8 +1269,8 @@ struct Helpers {
     named_f64: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
-    store_i32: Helper,
-    store_f64: Helper,
+    store_i32_if_defined: Helper,
+    store_f64_if_defined: Helper,
     push_i32: Helper,
     push_f64: Helper,
     pop_i32: Helper,
@@ -1282,6 +1291,11 @@ struct NativeCompiler<'a> {
     analysis: RegisterAnalysis,
     current_instruction: usize,
     variables: Vec<Variable>,
+    /// One companion per register, carrying whether `variables` holds the
+    /// register's current value on the path being executed.
+    defined_flags: Vec<Variable>,
+    flag_defined: Option<cranelift_codegen::ir::Value>,
+    flag_undefined: Option<cranelift_codegen::ir::Value>,
     dirty: BTreeSet<usize>,
     charge_instruction_budget: bool,
     instrument_storage: bool,
@@ -1305,6 +1319,9 @@ impl<'a> NativeCompiler<'a> {
             analysis,
             current_instruction: 0,
             variables: Vec::new(),
+            defined_flags: Vec::new(),
+            flag_defined: None,
+            flag_undefined: None,
             dirty: BTreeSet::new(),
             charge_instruction_budget,
             instrument_storage,
@@ -1325,6 +1342,9 @@ impl<'a> NativeCompiler<'a> {
         self.variables = (0..self.code.register_count)
             .map(|_| bcx.declare_var(self.mode.value_type()))
             .collect();
+        self.defined_flags = (0..self.code.register_count)
+            .map(|_| bcx.declare_var(types::I32))
+            .collect();
 
         let code_blocks: Vec<Block> = self
             .instructions
@@ -1344,6 +1364,18 @@ impl<'a> NativeCompiler<'a> {
         };
 
         let helpers = self.build_helpers(&mut bcx, ptr);
+
+        // A single pair of constants defined in the entry block keeps the flags
+        // free wherever definedness agrees across a join: Cranelift drops the
+        // block parameter when every predecessor yields the same value, so a
+        // flag only becomes a real phi where the paths genuinely disagree.
+        let flag_defined = bcx.ins().iconst(types::I32, 1);
+        let flag_undefined = bcx.ins().iconst(types::I32, 0);
+        self.flag_defined = Some(flag_defined);
+        self.flag_undefined = Some(flag_undefined);
+        for register in 0..self.variables.len() {
+            self.clear_defined_flag(&mut bcx, register);
+        }
 
         let guard_ok = self.emit_entry_guard(&mut bcx, ctx_val, entry_deopt, &helpers);
         if !guard_ok {
@@ -1388,6 +1420,15 @@ impl<'a> NativeCompiler<'a> {
                 &code_blocks,
                 break_block,
             ) {
+                return Ok(None);
+            }
+
+            // A definition the lowering could not keep in a Cranelift variable
+            // went straight to the VM frame, so the frame is now the owner.
+            if let Some(Some(target)) = self.analysis.targets.get(index).copied()
+                && self.defined_register_kind(target) == RegisterKind::Boxed
+                && !self.clear_defined_flag(&mut bcx, target)
+            {
                 return Ok(None);
             }
 
@@ -1608,14 +1649,14 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32],
                 types::I64,
             ),
-            store_i32: make(
-                jit_store_i32 as *const () as usize,
-                &[ptr, types::I32, types::I32],
+            store_i32_if_defined: make(
+                jit_store_i32_if_defined as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
-            store_f64: make(
-                jit_store_f64 as *const () as usize,
-                &[ptr, types::I32, types::F64],
+            store_f64_if_defined: make(
+                jit_store_f64_if_defined as *const () as usize,
+                &[ptr, types::I32, types::F64, types::I32],
                 types::I64,
             ),
             push_i32: make(
@@ -2520,8 +2561,38 @@ impl<'a> NativeCompiler<'a> {
             return false;
         };
         bcx.def_var(*variable, value);
+        let Some(flag_defined) = self.flag_defined else {
+            return false;
+        };
+        let Some(flag) = self.defined_flags.get(register) else {
+            return false;
+        };
+        bcx.def_var(*flag, flag_defined);
         self.dirty.insert(register);
         true
+    }
+
+    /// Record that the VM frame, not the Cranelift variable, now owns the
+    /// register. Boxed definitions write the frame directly, so a stale native
+    /// value must never be flushed over them at a later guard exit.
+    fn clear_defined_flag(&self, bcx: &mut FunctionBuilder<'_>, register: usize) -> bool {
+        let (Some(flag_undefined), Some(flag)) =
+            (self.flag_undefined, self.defined_flags.get(register))
+        else {
+            return false;
+        };
+        bcx.def_var(*flag, flag_undefined);
+        true
+    }
+
+    fn use_defined_flag(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        register: usize,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        self.defined_flags
+            .get(register)
+            .and_then(|flag| bcx.try_use_var(*flag).ok())
     }
 
     fn constant_f64_or_i32(
@@ -2616,23 +2687,34 @@ impl<'a> NativeCompiler<'a> {
         }
 
         // Dirty values are materialized before returning to the interpreter.
-        // `try_use_var` also validates that every value has a definition on
-        // this path; an invalid map rejects native compilation.
-        for register in &self.dirty {
-            let Some(value) = self.use_register(bcx, *register) else {
+        //
+        // A dirty register is not necessarily *live natively* on the path that
+        // reached this exit: a definition the path branched around still puts
+        // the register in `self.dirty`, and `try_use_var` cannot tell us so —
+        // it only rejects *undeclared* variables, and silently materializes a
+        // declared-but-undefined variable as zero. Writing that zero back would
+        // replace whatever the VM frame still holds. Each register therefore
+        // carries a companion flag that the same control flow keeps in sync, and
+        // the store helper honours it.
+        let registers: Vec<usize> = self.dirty.iter().copied().collect();
+        for register in registers {
+            let Some(value) = self.use_register(bcx, register) else {
+                return false;
+            };
+            let Some(defined) = self.use_defined_flag(bcx, register) else {
                 return false;
             };
             let helper = if self.mode == NativeMode::F64 {
-                helpers.store_f64
+                helpers.store_f64_if_defined
             } else {
-                helpers.store_i32
+                helpers.store_i32_if_defined
             };
-            let register_value = bcx.ins().iconst(types::I32, *register as i64);
+            let register_value = bcx.ins().iconst(types::I32, register as i64);
             let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
             bcx.ins().call_indirect(
                 helper.signature,
                 helper_address,
-                &[ctx, register_value, value],
+                &[ctx, register_value, value, defined],
             );
         }
         self.emit_set_pc(bcx, ctx, helpers, pc);
@@ -4049,6 +4131,46 @@ extern "C" fn jit_store_i32(context: *mut Context, register: u32, value: i32) ->
 }
 
 extern "C" fn jit_store_f64(context: *mut Context, register: u32, value: f64) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .set_register(register as usize, JsValue::new(value));
+    0
+}
+
+/// Write back a register only when the taken path actually defined it.
+///
+/// The function tier accumulates one dirty set for the whole body, so a guard
+/// exit can be reached on a path that branched around a register's native
+/// definition. `defined` is the companion flag the generated code keeps in step
+/// with that control flow; a zero leaves the VM frame's own value in place.
+extern "C" fn jit_store_i32_if_defined(
+    context: *mut Context,
+    register: u32,
+    value: i32,
+    defined: u32,
+) -> u64 {
+    if defined == 0 {
+        return 0;
+    }
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .set_register(register as usize, JsValue::new(value));
+    0
+}
+
+extern "C" fn jit_store_f64_if_defined(
+    context: *mut Context,
+    register: u32,
+    value: f64,
+    defined: u32,
+) -> u64 {
+    if defined == 0 {
+        return 0;
+    }
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     context

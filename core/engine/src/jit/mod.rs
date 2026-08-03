@@ -7515,6 +7515,46 @@ mod tests {
         }));
     }
 
+    /// A guard exit reached on a path that branched around a register's native
+    /// definition must leave that register alone: the Cranelift variable holds
+    /// no value on this path, and writing one back replaces the object the VM
+    /// frame still owns with a numeric zero.
+    #[test]
+    fn context_owned_jit_preserves_branch_skipped_registers_across_guard_deopt() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function pick(subject, iterations, value) { let width = subject.b; for (let i = 0; i < iterations; i++) { subject = 1; } let doubled = value + value; return subject; } \
+                 let shape = { b: 7 }; let warm = 0; \
+                 for (let i = 0; i < 200; i++) { warm = pick(shape, 0, 1); } \
+                 pick(shape, 0, 2147483647) === shape",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate"),
+            JsValue::new(true),
+            "the overflow deopt must not overwrite a register whose only native definition was skipped"
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_compilations >= 1,
+            "the guarded shape must still reach the native tier: {stats:?}"
+        );
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::IntegerOverflow
+        }));
+    }
+
     #[test]
     fn context_owned_jit_reads_current_global_declarative_binding() {
         let mut context = Context::default();
