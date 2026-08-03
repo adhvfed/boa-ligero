@@ -1,12 +1,13 @@
 # Binding-read and call-boundary review — 2026-08-03
 
-Status: design approved for one global-declarative `GetName` form; production
-admission must first reject entries that cannot continue across calls.
+Status: implemented and gated 2026-08-03. Boa `345767c5` lands the call-boundary
+denial and global-declarative read; Ligero `2c39eafe` projects schema 4; Boa
+`54a109f6` lands the required behavior-neutral refactor.
 
 This review refines Slice 2C after inspecting Boa's binding locator,
 environment, realm, VM-register, deoptimization, and admission paths. It also
-records the release measurements from the local implementation prototype. The
-prototype is evidence for the design and gate; it is not a landed checkpoint.
+records the release measurements that selected the design. Final post-refactor
+results are in the [Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
 
 ## Binding contract selected
 
@@ -112,3 +113,7 @@ or VM-register materialization plumbing exposed by the slice. The refactor must
 re-run the same float positive control, call-heavy negative controls, focused
 JIT suite, feature-disabled checks, formatting, and affected warning-denying
 Clippy. Do not use the refactor to widen binding scopes or opcode coverage.
+
+Boa `54a109f6` completes this checkpoint by borrowing the generated helper
+table throughout emission and removing its unused compiler copy. It changes no
+helper signature, opcode allowlist, diagnostic reason, or generated exit path.

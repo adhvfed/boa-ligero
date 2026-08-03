@@ -109,6 +109,10 @@ to retain at least a 2× warm win with matching sink and zero steady-state
 deopts. Call-containing entries must compile no artifact and keep the method,
 flat-call, and property negative controls within 5% of interpreter medians.
 W0 must retain its native loop, checksum, paint structure, and cold guardrail.
+**Passed 2026-08-03:** the post-refactor float control is 4.80× faster, all
+four negative controls are within 5%, and W0 is 30.0% lower at the median with
+one native artifact, 999 entries, zero deopts, 387 display items, and 258 paint
+segments. See the [Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
 
 ### Gate O — OSR
 

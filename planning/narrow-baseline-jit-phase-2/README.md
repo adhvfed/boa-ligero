@@ -12,16 +12,15 @@ browser kernel remains native. The scheduled behavior-neutral scheduler
 refactor and bounded per-code admission diagnostics are complete. The guarded
 receiver review then rejected standalone `This` lowering: the measured method
 immediately reaches an unsupported named store and remains below the production
-admission threshold. The binding review now approves one narrow
-`GlobalDeclarative` `GetName` form that re-reads the current VM-owned value on
-every native entry and retains no environment pointer or binding snapshot. A
-local release prototype makes the floating-point control 4.81× faster, but it
-also exposed an admission hole: call-containing loop callers can compile a
-losing shim even though native code cannot continue across the first call.
-Slice 2C therefore first rejects those entries with a distinct diagnostic
-reason, then gates the binding lowering, then pays a separately revertible
-behavior-neutral refactor. Each new execution ABI still requires its own design
-review before implementation.
+admission threshold. Slice 2C is now complete. Boa `345767c5` rejects
+non-continuable callers before artifact creation and lowers only
+`GlobalDeclarative` `GetName` through a current-frame/current-realm read;
+Ligero `2c39eafe` projects diagnostic schema 4. Boa `54a109f6` then pays the
+scheduled separately revertible helper-table refactor. Post-refactor release
+gates retain a 4.80× floating-point win, keep all negative controls inside 5%,
+and preserve W0's checksum and paint structure at a 30.0% lower median cold
+load. Each new execution ABI still requires its own design review before
+implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -82,13 +81,16 @@ Every Phase 2 entry and exit ABI inherits that rule.
    frontier is `SetPropertyByName` and the 16-instruction helper remains denied.
 5. Close the call-boundary admission hole: while generated callers have no
    native continuation after a call, call-containing function entries must
-   install no artifact and report a distinct denial reason.
+   install no artifact and report a distinct denial reason. **Complete:** Boa
+   `345767c5` reports `denied_call_boundary` and installs no artifact.
 6. Lower only `GlobalDeclarative` `GetName` through a current-frame/current-
    realm read after a locator-stability guard. Keep global-object, stack,
    eval-affected, write, and deletion forms unsupported; gate the float win
    against call-heavy controls, W0, TDZ, mutation, GC, realm, and budgets.
+   **Complete:** Boa `345767c5`, with Ligero schema projection `2c39eafe`.
 7. Pay the scheduled behavior-neutral helper/materialization refactor after
-   the two Slice 2C behavior changes.
+   the two Slice 2C behavior changes. **Complete:** Boa `54a109f6` borrows the
+   generated helper table and removes its unused compiler copy.
 8. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
    helper-backed storage by measured lost time and transition count.
 9. Implement the highest-ranked boundary behind its own ABI review; re-profile
@@ -134,6 +136,9 @@ showing that another boundary dominates.
 - [Binding-read and call-boundary review, 2026-08-03](12-binding-read-and-call-boundary-review-2026-08-03.md)
   — the approved global-declarative read contract, the call-containing entry
   admission correction, measured gate, exclusions, and refactor checkpoint.
+- [Slice 2C closure, 2026-08-03](13-slice-2c-closure-2026-08-03.md) — landed
+  commits, correctness matrix, post-refactor release controls, W0, and the
+  remaining Decision checkpoint A.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

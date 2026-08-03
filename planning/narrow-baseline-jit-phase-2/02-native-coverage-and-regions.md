@@ -67,11 +67,13 @@ and realm on every entry, and stores it in a rooted VM register. Do not cache a
 raw environment pointer or binding value in generated code.
 
 The [2026-08-03 binding review](12-binding-read-and-call-boundary-review-2026-08-03.md)
-approves this narrow form. `GetName` blocks every measured microbenchmark
+approved this narrow form, and Boa `345767c5` lands it without widening the
+other environment forms. `GetName` blocks every measured microbenchmark
 caller, while the floating-point control's `N` binding completes an otherwise-
 supported native loop. The call-heavy callers are negative controls and now
 also expose a prerequisite admission correction: until a compiled caller can
-resume after a call, bodies containing calls must install no artifact.
+resume after a call, bodies containing calls install no artifact. The completed
+gate is recorded in the [Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
 
 ### Integer representation operations
 

@@ -104,7 +104,7 @@ Review commit:
 docs(jit): reject standalone receiver lowering
 ```
 
-## Slice 2C0 — reject non-continuable call entries
+## Slice 2C0 — reject non-continuable call entries (complete)
 
 The binding prototype exposed a production-admission hole: a backward branch
 currently admits a caller even when its static profile contains calls, although
@@ -123,7 +123,11 @@ Suggested commit:
 perf(jit): reject non-continuable call entries
 ```
 
-## Slice 2C1 — lower one global-declarative binding read
+Landed as part of Boa `345767c5`: production admission reports
+`denied_call_boundary`, creates no artifact, and retains an explicit test-only
+override for call-lowering semantics.
+
+## Slice 2C1 — lower one global-declarative binding read (complete)
 
 The [dated review](12-binding-read-and-call-boundary-review-2026-08-03.md)
 approves exactly `GetName` with a compile-time `GlobalDeclarative` locator. On
@@ -150,7 +154,11 @@ Suggested commit:
 perf(jit): lower stable global binding reads
 ```
 
-## Slice 2C2 — behavior-neutral helper refactor
+Landed in Boa `345767c5`; Ligero `2c39eafe` projects schema-4 admission and
+binding-exit reasons. The semantic and release gates are recorded in the
+[Slice 2C closure](13-slice-2c-closure-2026-08-03.md).
+
+## Slice 2C2 — behavior-neutral helper refactor (complete)
 
 The admission correction and binding lowering are two behavior slices. Pay the
 scheduled refactor before selecting another execution ABI: consolidate the
@@ -166,6 +174,10 @@ Suggested commit:
 ```text
 refactor(jit): unify binding helper materialization
 ```
+
+Landed as Boa `54a109f6`. Compiler emission now borrows one generated helper
+table and no longer stores or copies an unused 536-byte table. Native coverage,
+diagnostics, and the allowlist are unchanged.
 
 ## Slice 3 — region stitching, only if selected
 

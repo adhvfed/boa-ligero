@@ -65,14 +65,12 @@ are within the 5% JIT-disabled parity guardrail and profitable straight-line
 entries plus W0 retain their wins. `612c7dc6` subsequently consolidates the
 dormant interpreter path without changing that result.
 
-The binding prototype exposed a narrower admission hole. A body with a
-backward branch is currently admitted even when its static profile contains
-calls, but generated callers cannot resume natively after a call. Production
-admission must therefore deny call-containing function entries, emit no shim
-or native artifact, and report `denied_call_boundary`. Keep a test-only
-override for call-lowering semantics. This temporary rule is relaxed only by
-the reviewed compiled-call ABI and Gate K, not by adding lowering for
-instructions before the call.
+The binding prototype exposed a narrower admission hole. Boa `345767c5` closes
+it: a body containing calls is denied before compilation, emits no shim or
+native artifact, and reports `denied_call_boundary`; the explicit test-only
+override retains call-lowering semantic coverage. This temporary rule is
+relaxed only by the reviewed compiled-call ABI and Gate K, not by adding
+lowering for instructions before the call.
 
 ## Thresholds and hysteresis
 
