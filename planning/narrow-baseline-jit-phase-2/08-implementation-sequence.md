@@ -347,13 +347,64 @@ schedule a separately revertible behavior-neutral refactor of region-key,
 materialization-map, or exit-mapping plumbing before a second execution ABI is
 considered.
 
-**Stop/go:** a one-shot hot loop must show OSR execution and pass the full OSR
-test set; otherwise leave OSR disabled and diagnose the materialization gap.
+Land the shape through these independently reversible boundaries:
 
-Suggested commit:
+1. **4A1.1 — planner and maps (complete, Boa `c435d60e`).** Add typed loop
+   identity and a pure canonical-latch CFG/liveness proof. Bound analysis to
+   128 region instructions and a 16-instruction return continuation. Emit no
+   machine code and mutate no VM state.
+2. **4A1.2 — bounded state and diagnostics (complete, Boa `7837f0a8`, Ligero
+   `c05557ed`).** Retain at most 64 exact typed loop keys. When full, let an
+   already-retained key progress but suppress every unseen key without an
+   allocation. Account only successful emitted-loop bytes; account time for
+   every completed compile attempt; trip the 1 MiB and greater-than-10 ms
+   breakers only after the unavoidable result. Schema 8 exposes one fixed
+   source-free aggregate and the exit taxonomy, not page-sized records. No
+   loop artifact is stored or invoked.
+3. **4A1.3 — separate uniform-mode compiler (next).** Compile only a proven
+   `LoopRegionPlan`; strictly guard and load every live-in; lower the planned
+   numeric instructions; materialize each path-specific exit; and encode only
+   metadata-validated `EntryRejected`, `Continuation(LoopExit)`, deopt, budget,
+   or completion results. Compilation tests call the compiler directly. The
+   runtime scheduler must still have no path to invoke the artifact.
+4. **4A1.4 — exact post-backedge scheduler wiring.** Observe the already
+   charged canonical latch, compile synchronously at the reviewed safe
+   boundary, invoke only a complete cached artifact, and use a separate
+   per-frame OSR attempted/closed flag. Rejection must preserve dormant
+   dispatch and ordinary PC-zero entry behavior.
+5. **4A1.5 — differential and workload gate.** Close representation, replay,
+   continuation, budget, loop-limit, GC, recursion, cache-capacity, negative
+   parity, W0, and fixed-matrix evidence before calling Slice 4A1 complete.
+6. **4A1.R — behavior-neutral refactor.** After the behavior gate, consolidate
+   exactly one repeated seam among typed entry keys, materialization emission,
+   and exit mapping in a separately revertible commit. Re-run the focused JIT
+   suite and strict lint without changing thresholds, opcode eligibility,
+   diagnostics, or scheduling. Decision checkpoint B and every second ABI wait
+   for this refactor.
+
+The compiler and scheduler commits are deliberately separate. A compiler test
+may execute its generated function through a test-only harness, but production
+code must not gain an invocation edge until 4A1.4. If 4A1.3 cannot implement
+the planner's existing maps without widening the opcode set, adding mixed-mode
+SSA, boxing the whole frame, or accepting an unvalidated resume PC, stop and
+revise the ABI rather than folding the exception into scheduler wiring.
+
+**4A1.3 stop/go:** the direct compiler harness must preserve the selected
+fractional-accumulator result and exact path-specific continuation state in
+both budget modes, while malformed plans and lowering failures leave no
+invokable cache entry. Only then may 4A1.4 add the production invocation edge.
+
+**Slice 4A1 stop/go:** a one-shot hot loop must show OSR execution and pass the
+full OSR test set; otherwise leave OSR disabled and diagnose the
+materialization gap.
+
+Remaining suggested commits:
 
 ```text
+feat(jit): compile guarded loop OSR regions
 perf(jit): enter hot loop regions with guarded OSR
+test(jit): close loop OSR differential gates
+refactor(jit): consolidate loop region exit plumbing
 ```
 
 ## Slice 4B — compiled ordinary calls

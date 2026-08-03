@@ -42,7 +42,14 @@ that the region still needs an explicit external continuation and live-in
 representation plan; the earlier screen was not a nonzero-PC compilation
 proof. Broader engine and application rows contain no first-shape OSR
 candidates, so this is a narrow ABI selection rather than a breadth claim.
-Slice 4A0's ownership/materialization/budget design review is complete.
+Slice 4A0's ownership/materialization/budget design review is complete. Slice
+4A1.1 now proves the canonical region and its live-state maps, and Slice
+4A1.2 retains bounded per-region hotness/terminal state, source-free schema-8
+diagnostics, capacity/circuit-breaker policy, and the entry/continuation exit
+taxonomy. Neither slice can emit or invoke a loop artifact. Slice 4A1.3 is the
+next bounded step: a separate uniform-mode region compiler that remains
+unreachable from the scheduler until its generated entry, materialization,
+and continuation paths pass focused tests.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -130,8 +137,15 @@ Every Phase 2 entry and exit ABI inherits that rule.
    and Ligero `78d55bda` enable zero-drop 4,096-record profiling; the fixed
    matrix selects only conservative loop-header OSR.
 10. Check in Slice 4A0's exact OSR ownership, cache-key, materialization, GC,
-   exception, and finite-budget ABI review; then implement that one shape and
-   re-profile before selecting the next boundary.
+    exception, and finite-budget ABI review; then implement that one shape and
+    re-profile before selecting the next boundary. **ABI review complete:**
+    Boa `3deaf18e`. **Planner complete:** Boa `c435d60e` proves the canonical
+    region and path-specific maps without executable behavior. **Bounded state
+    and diagnostics complete:** Boa `7837f0a8` adds the 64-key table,
+    allocation-free new-site suppression at capacity, 1 MiB/10 ms post-attempt
+    circuit breakers, schema-8 aggregate counters, and inert exit taxonomy;
+    Ligero `c05557ed` projects schema 8. **Next:** Slice 4A1.3's separate region
+    compiler, still without scheduler invocation.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -201,6 +215,9 @@ showing that another boundary dominates.
   — the exact typed region identity, safe post-backedge ownership boundary,
   live-in and exit materialization rules, continuation/replay taxonomy, bounds,
   exclusions, and Slice 4A1 gates.
+- [Slice 4A1 planner and metadata checkpoint, 2026-08-03](21-slice-4a1-planner-metadata-checkpoint-2026-08-03.md)
+  — the landed pure planner, bounded per-region state and schema-8 diagnostics,
+  verified non-invocation boundary, and the narrowed Slice 4A1.3 compiler gate.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
