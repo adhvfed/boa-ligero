@@ -3332,6 +3332,219 @@ mod tests {
     }
 
     #[test]
+    fn jit_function_and_loop_capacity_reservations_coexist_in_both_fill_orders() {
+        fn fill_function_states(backend: &mut JitBackend) {
+            let ready = CachedEntry {
+                entry: malformed_loop_untagged,
+                native: true,
+            };
+            for index in 0..MAX_FUNCTION_ENTRY_STATES {
+                backend.cache.insert(
+                    JitCacheKey::function(index as u64, index & 1 != 0, index & 2 != 0),
+                    FunctionEntryState::Ready(ready),
+                );
+            }
+        }
+
+        fn fill_loop_states(backend: &mut JitBackend) {
+            for index in 0..MAX_LOOP_REGION_STATES {
+                assert_eq!(
+                    backend.observe_loop_region(loop_key(index as u64, 10)),
+                    LoopRegionAction::Cold
+                );
+            }
+        }
+
+        for functions_first in [true, false] {
+            let mut backend = JitBackend::new();
+            if functions_first {
+                fill_function_states(&mut backend);
+                fill_loop_states(&mut backend);
+            } else {
+                fill_loop_states(&mut backend);
+                fill_function_states(&mut backend);
+            }
+
+            assert_eq!(backend.cache.len(), MAX_FUNCTION_ENTRY_STATES);
+            assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+            assert!(
+                backend
+                    .loop_plans
+                    .keys()
+                    .all(|key| backend.loop_regions.contains_key(key))
+            );
+            assert!(
+                backend
+                    .loop_cache
+                    .keys()
+                    .all(|key| backend.loop_regions.contains_key(key))
+            );
+            assert_eq!(
+                backend.observe_loop_region(loop_key(u64::MAX, 10)),
+                LoopRegionAction::Suppressed(JitOsrSuppressionReason::RegionCapacity)
+            );
+            assert_eq!(backend.loop_regions.len(), MAX_LOOP_REGION_STATES);
+        }
+    }
+
+    #[test]
+    fn jit_cache_keys_keep_entry_mode_variants_distinct() {
+        let mut keys = std::collections::HashSet::new();
+        for budgeted in [false, true] {
+            for diagnostic in [false, true] {
+                assert!(keys.insert(JitCacheKey::function(7, budgeted, diagnostic)));
+                for representation in [JitOsrRepresentation::I32, JitOsrRepresentation::F64] {
+                    assert!(keys.insert(JitCacheKey::loop_region(
+                        7,
+                        10,
+                        20,
+                        representation,
+                        budgeted,
+                        diagnostic,
+                    )));
+                }
+            }
+        }
+        assert_eq!(keys.len(), 12);
+    }
+
+    #[test]
+    fn jit_diagnostic_vectors_and_indices_saturate_at_the_hard_cap() {
+        let mut diagnostics = JitDiagnosticState::new(JitDiagnosticLimits {
+            compile_records: usize::MAX,
+            admission_records: usize::MAX,
+            exit_records: usize::MAX,
+            call_records: usize::MAX,
+            loop_records: usize::MAX,
+            storage_records: usize::MAX,
+        });
+
+        for index in 0..=MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND {
+            let code_id = index as u64;
+            diagnostics.record_compile(JitCompileRecord {
+                code_id,
+                entry_pc: 0,
+                budgeted: false,
+                outcome: JitCompileOutcome::Native,
+                blocker: None,
+                first_blocking_opcode: None,
+                first_blocking_pc: None,
+                supported_prefix_instructions: 1,
+                native_instructions: 1,
+                native_backward_branches: 0,
+                native_call_instructions: 0,
+                native_property_instructions: 0,
+                bytecode_instructions: 1,
+                compile_ns: 1,
+                code_bytes: 1,
+            });
+            diagnostics.record_admission(JitAdmissionRecord {
+                code_id,
+                allowed: true,
+                reason: JitAdmissionReason::AllowedStraightLineWork,
+                leaf_fast_path: false,
+                blocker: None,
+                first_blocking_opcode: None,
+                first_blocking_pc: None,
+                supported_prefix_instructions: 1,
+                bytecode_instructions: 1,
+                native_backward_branches: 0,
+                native_call_instructions: 0,
+                native_property_instructions: 0,
+            });
+            diagnostics.record_exit(
+                code_id,
+                0,
+                JitExit {
+                    kind: JitExitKind::Return,
+                    reason: JitExitReason::Return,
+                    pc: 1,
+                },
+                1,
+            );
+            diagnostics.record_call_site(code_id, 1, JitCallTargetObservation::NonOrdinary);
+            diagnostics.record_loop_site(
+                JitLoopSiteRecord {
+                    code_id,
+                    header_pc: 1,
+                    backedge_pc: 2,
+                    ..JitLoopSiteRecord::default()
+                },
+                false,
+                false,
+            );
+            diagnostics.record_storage_site(code_id, 1, JitStorageSiteKind::Computed, None);
+        }
+
+        assert_eq!(
+            diagnostics.compile_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.admission_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.exit_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.call_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.loop_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.storage_records.len(),
+            MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND
+        );
+        assert_eq!(
+            diagnostics.call_record_indices.len(),
+            diagnostics.call_records.len()
+        );
+        assert_eq!(
+            diagnostics.loop_record_indices.len(),
+            diagnostics.loop_records.len()
+        );
+        assert_eq!(
+            diagnostics.storage_record_indices.len(),
+            diagnostics.storage_records.len()
+        );
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.dropped_compile_records, 1);
+        assert_eq!(snapshot.dropped_admission_records, 1);
+        assert_eq!(snapshot.dropped_exit_records, 1);
+        assert_eq!(snapshot.dropped_call_observations, 1);
+        assert_eq!(snapshot.dropped_loop_observations, 1);
+        assert_eq!(snapshot.dropped_storage_observations, 1);
+        let serialized = serde_json::to_string(&snapshot).expect("serialize saturated diagnostics");
+        assert!(!serialized.contains("record_indices"));
+        assert!(!serialized.contains("distinctive_private_page_data"));
+    }
+
+    #[test]
+    fn jit_production_emitters_remain_structurally_bounded() {
+        let declare_needle = [".declare_", "function("].concat();
+        let define_needle = [".define_", "function("].concat();
+        let finalize_needle = [".finalize_", "definitions("].concat();
+        let module_source = include_str!("mod.rs");
+        let native_source = include_str!("native.rs");
+
+        // `mod.rs` contains one production shim emitter and one `#[cfg(test)]`
+        // context-thunk seam. `native.rs` contains the governed PC-zero and
+        // loop emitters. Any additional producer requires an ownership review.
+        assert_eq!(module_source.matches(&declare_needle).count(), 2);
+        assert_eq!(module_source.matches(&define_needle).count(), 2);
+        assert_eq!(module_source.matches(&finalize_needle).count(), 2);
+        assert_eq!(native_source.matches(&declare_needle).count(), 2);
+        assert_eq!(native_source.matches(&define_needle).count(), 2);
+        assert_eq!(native_source.matches(&finalize_needle).count(), 2);
+    }
+
+    #[test]
     fn jit_backend_resource_thresholds_suppress_unseen_work_and_reuse_ready_entries() {
         let ready_code = first_function_code("function ready(value) { return value + 1; }");
         let unseen_code = first_function_code("function unseen(value) { return value + 2; }");
