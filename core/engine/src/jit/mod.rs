@@ -175,7 +175,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 6;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 7;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -199,6 +199,9 @@ pub struct JitDiagnosticLimits {
     /// Maximum number of distinct interpreted loop-backedge records retained
     /// by a context.
     pub loop_records: usize,
+    /// Maximum number of distinct interpreted storage-read records retained
+    /// by a context.
+    pub storage_records: usize,
 }
 
 impl JitDiagnosticLimits {
@@ -213,6 +216,9 @@ impl JitDiagnosticLimits {
             exit_records: self.exit_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             call_records: self.call_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             loop_records: self.loop_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+            storage_records: self
+                .storage_records
+                .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
         }
     }
 }
@@ -225,6 +231,7 @@ impl Default for JitDiagnosticLimits {
             exit_records: 256,
             call_records: 256,
             loop_records: 256,
+            storage_records: 256,
         }
     }
 }
@@ -518,6 +525,46 @@ pub struct JitLoopSiteRecord {
     pub region_instructions: u32,
 }
 
+/// Interpreted storage-read shape observed at one bytecode site.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitStorageSiteKind {
+    /// Static-name property read backed by Boa's named inline cache.
+    Named,
+    /// Numeric indexed read eligible for Boa's dense-element inline cache.
+    Dense,
+    /// Computed property read outside the narrow dense numeric shape.
+    Computed,
+    /// Specialized `length` read, which has no named/dense cache record.
+    Length,
+}
+
+/// One bounded, source-free interpreted storage-read record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitStorageSiteRecord {
+    /// Runtime-local code-block identity.
+    pub code_id: u64,
+    /// Bytecode PC of the interpreted read.
+    pub pc: u32,
+    /// Coarse operation/receiver shape; never a property name or key value.
+    pub kind: JitStorageSiteKind,
+    /// Total reads observed at this site.
+    pub executions: u64,
+    /// Reads for which the existing named/dense inline cache matched before
+    /// the opcode executed.
+    pub inline_cache_hits: u64,
+    /// Reads for which the applicable inline cache did not match.
+    pub inline_cache_misses: u64,
+    /// Reads whose coarse shape has no applicable named/dense cache.
+    pub inline_cache_not_applicable: u64,
+}
+
+impl Default for JitStorageSiteKind {
+    fn default() -> Self {
+        Self::Computed
+    }
+}
+
 /// Stable snapshot of opt-in detailed JIT diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticSnapshot {
@@ -536,6 +583,9 @@ pub struct JitDiagnosticSnapshot {
     /// Aggregated interpreted loop backedges in deterministic code/header/
     /// backedge order.
     pub loop_records: Vec<JitLoopSiteRecord>,
+    /// Aggregated interpreted storage reads in deterministic code/PC/kind
+    /// order.
+    pub storage_records: Vec<JitStorageSiteRecord>,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
@@ -548,6 +598,9 @@ pub struct JitDiagnosticSnapshot {
     /// Loop observations omitted because their site was not retained after
     /// reaching the configured bound.
     pub dropped_loop_observations: u64,
+    /// Storage observations omitted because their site was not retained after
+    /// reaching the configured bound.
+    pub dropped_storage_observations: u64,
 }
 
 #[derive(Debug)]
@@ -575,11 +628,14 @@ struct JitDiagnosticState {
     call_record_indices: FxHashMap<(u64, u32), usize>,
     loop_records: Vec<JitLoopSiteRecord>,
     loop_record_indices: FxHashMap<(u64, u32, u32), usize>,
+    storage_records: Vec<JitStorageSiteRecord>,
+    storage_record_indices: FxHashMap<(u64, u32, JitStorageSiteKind), usize>,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
     dropped_call_observations: u64,
     dropped_loop_observations: u64,
+    dropped_storage_observations: u64,
 }
 
 impl JitDiagnosticState {
@@ -594,11 +650,14 @@ impl JitDiagnosticState {
             call_record_indices: FxHashMap::default(),
             loop_records: Vec::with_capacity(limits.loop_records.min(64)),
             loop_record_indices: FxHashMap::default(),
+            storage_records: Vec::with_capacity(limits.storage_records.min(64)),
+            storage_record_indices: FxHashMap::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
             dropped_call_observations: 0,
             dropped_loop_observations: 0,
+            dropped_storage_observations: 0,
         }
     }
 
@@ -748,6 +807,44 @@ impl JitDiagnosticState {
         }
     }
 
+    fn record_storage_site(
+        &mut self,
+        code_id: u64,
+        pc: u32,
+        kind: JitStorageSiteKind,
+        inline_cache_hit: Option<bool>,
+    ) {
+        let key = (code_id, pc, kind);
+        let record = if let Some(index) = self.storage_record_indices.get(&key).copied() {
+            &mut self.storage_records[index]
+        } else if self.storage_records.len() < self.limits.storage_records {
+            let index = self.storage_records.len();
+            self.storage_records.push(JitStorageSiteRecord {
+                code_id,
+                pc,
+                kind,
+                ..JitStorageSiteRecord::default()
+            });
+            self.storage_record_indices.insert(key, index);
+            &mut self.storage_records[index]
+        } else {
+            self.dropped_storage_observations = self.dropped_storage_observations.saturating_add(1);
+            return;
+        };
+
+        record.executions = record.executions.saturating_add(1);
+        match inline_cache_hit {
+            Some(true) => record.inline_cache_hits = record.inline_cache_hits.saturating_add(1),
+            Some(false) => {
+                record.inline_cache_misses = record.inline_cache_misses.saturating_add(1);
+            }
+            None => {
+                record.inline_cache_not_applicable =
+                    record.inline_cache_not_applicable.saturating_add(1);
+            }
+        }
+    }
+
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
         compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
@@ -771,6 +868,8 @@ impl JitDiagnosticState {
         call_records.sort_by_key(|record| (record.caller_code_id, record.pc));
         let mut loop_records = self.loop_records.clone();
         loop_records.sort_by_key(|record| (record.code_id, record.header_pc, record.backedge_pc));
+        let mut storage_records = self.storage_records.clone();
+        storage_records.sort_by_key(|record| (record.code_id, record.pc, record.kind));
         JitDiagnosticSnapshot {
             schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
             limits: self.limits,
@@ -779,11 +878,13 @@ impl JitDiagnosticState {
             exit_records,
             call_records,
             loop_records,
+            storage_records,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
             dropped_call_observations: self.dropped_call_observations,
             dropped_loop_observations: self.dropped_loop_observations,
+            dropped_storage_observations: self.dropped_storage_observations,
         }
     }
 }
@@ -1224,6 +1325,32 @@ impl JitBackend {
     /// opt-in and bounded.
     pub(crate) const fn observes_call_sites(&self) -> bool {
         self.diagnostics.is_some() || self.admission_allow_call_boundaries
+    }
+
+    /// Whether the interpreter must report storage-read sites to this backend.
+    ///
+    /// Storage attribution is diagnostics-only. Normal JIT execution retains
+    /// no per-opcode observer or storage-site state.
+    pub(crate) const fn observes_storage_sites(&self) -> bool {
+        self.diagnostics.is_some()
+    }
+
+    /// Whether the interpreter must decode any pre-operation diagnostic site.
+    pub(crate) const fn observes_interpreted_sites(&self) -> bool {
+        self.observes_call_sites() || self.observes_storage_sites()
+    }
+
+    /// Record one interpreted storage read without retaining page data.
+    pub(crate) fn observe_storage_site(
+        &mut self,
+        code: &CodeBlock,
+        pc: u32,
+        kind: JitStorageSiteKind,
+        inline_cache_hit: Option<bool>,
+    ) {
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.record_storage_site(code.debug_id, pc, kind, inline_cache_hit);
+        }
     }
 
     /// Observe one interpreted `Call` without changing production admission.
@@ -1878,6 +2005,7 @@ mod tests {
             exit_records: 0,
             call_records: 0,
             loop_records: 0,
+            storage_records: 0,
         });
         let _ = bounded.cached_entry(&native_code, false);
         let _ = bounded.cached_entry(&unsupported_code, false);
@@ -1892,6 +2020,7 @@ mod tests {
             exit_records: usize::MAX,
             call_records: usize::MAX,
             loop_records: usize::MAX,
+            storage_records: usize::MAX,
         });
         let hard_bounded = hard_bounded
             .diagnostic_snapshot()
@@ -1904,6 +2033,7 @@ mod tests {
                 exit_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 call_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 loop_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+                storage_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
             }
         );
     }
@@ -1977,6 +2107,7 @@ mod tests {
             exit_records: 0,
             call_records: 0,
             loop_records: 0,
+            storage_records: 0,
         });
         assert!(!bounded.admit_function_entry(&tiny_code));
         assert!(bounded.admit_function_entry(&loop_code));
@@ -2615,6 +2746,98 @@ mod tests {
     }
 
     #[test]
+    fn jit_interpreted_storage_diagnostics_are_exact_bounded_and_source_free() {
+        let source = "function readStorage(object, array, key) { let total = 0; for (let index = 0; index < 4; index++) { total += object.distinctive_private_storage_name; total += array[index]; total += object[key]; total += array.length; } return total; } readStorage({ distinctive_private_storage_name: 3 }, [1, 2, 3, 4], 'distinctive_private_storage_name')";
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+            .expect("parse");
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(50)
+        );
+
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        let record = |kind| {
+            snapshot
+                .storage_records
+                .iter()
+                .find(|record| record.kind == kind)
+                .unwrap_or_else(|| panic!("missing {kind:?} record: {snapshot:?}"))
+        };
+
+        let named = record(JitStorageSiteKind::Named);
+        assert_eq!(named.executions, 4, "record: {named:?}");
+        assert_eq!(named.inline_cache_hits, 3, "record: {named:?}");
+        assert_eq!(named.inline_cache_misses, 1, "record: {named:?}");
+        assert_eq!(named.inline_cache_not_applicable, 0, "record: {named:?}");
+
+        let dense = record(JitStorageSiteKind::Dense);
+        assert_eq!(dense.executions, 4, "record: {dense:?}");
+        assert_eq!(dense.inline_cache_hits, 3, "record: {dense:?}");
+        assert_eq!(dense.inline_cache_misses, 1, "record: {dense:?}");
+        assert_eq!(dense.inline_cache_not_applicable, 0, "record: {dense:?}");
+
+        let computed = record(JitStorageSiteKind::Computed);
+        assert_eq!(computed.executions, 4, "record: {computed:?}");
+        assert_eq!(computed.inline_cache_hits, 0, "record: {computed:?}");
+        assert_eq!(computed.inline_cache_misses, 0, "record: {computed:?}");
+        assert_eq!(
+            computed.inline_cache_not_applicable, 4,
+            "record: {computed:?}"
+        );
+
+        let length = record(JitStorageSiteKind::Length);
+        assert_eq!(length.executions, 4, "record: {length:?}");
+        assert_eq!(length.inline_cache_hits, 0, "record: {length:?}");
+        assert_eq!(length.inline_cache_misses, 0, "record: {length:?}");
+        assert_eq!(length.inline_cache_not_applicable, 4, "record: {length:?}");
+
+        assert_eq!(snapshot.storage_records.len(), 4, "snapshot: {snapshot:?}");
+        assert_eq!(snapshot.dropped_storage_observations, 0);
+        let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
+        assert!(!serialized.contains("distinctive_private_storage_name"));
+    }
+
+    #[test]
+    fn jit_storage_diagnostics_observe_denied_dormant_frames_and_respect_zero_cap() {
+        let source = "function blocked(object) { return object.distinctive_private_dormant_storage | 0; } const object = { distinctive_private_dormant_storage: 7 }; let answer = 0; for (let call = 0; call < 40; call++) answer = blocked(object); answer";
+        let run = |storage_records| {
+            let mut context = Context::default();
+            context.enable_jit_diagnostics(JitDiagnosticLimits {
+                storage_records,
+                ..JitDiagnosticLimits::default()
+            });
+            let script =
+                crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                    .expect("parse");
+            assert_eq!(
+                script.evaluate(&mut context).expect("evaluate").as_i32(),
+                Some(7)
+            );
+            context
+                .jit_diagnostic_snapshot()
+                .expect("diagnostics enabled")
+        };
+
+        let retained = run(8);
+        assert_eq!(retained.storage_records.len(), 1, "snapshot: {retained:?}");
+        let named = &retained.storage_records[0];
+        assert_eq!(named.kind, JitStorageSiteKind::Named);
+        assert_eq!(named.executions, 40, "record: {named:?}");
+        assert_eq!(named.inline_cache_hits, 39, "record: {named:?}");
+        assert_eq!(named.inline_cache_misses, 1, "record: {named:?}");
+
+        let zero = run(0);
+        assert!(zero.storage_records.is_empty(), "snapshot: {zero:?}");
+        assert_eq!(zero.dropped_storage_observations, 40);
+        let serialized = serde_json::to_string(&retained).expect("serialize diagnostics");
+        assert!(!serialized.contains("distinctive_private_dormant_storage"));
+    }
+
+    #[test]
     fn context_owned_jit_runs_native_integer_loop() {
         let mut context = Context::default();
         context.enable_jit();
@@ -2764,6 +2987,7 @@ mod tests {
                 exit_records: 1,
                 call_records: 0,
                 loop_records: 0,
+                storage_records: 0,
             },
         );
         let overflow = crate::Script::parse(

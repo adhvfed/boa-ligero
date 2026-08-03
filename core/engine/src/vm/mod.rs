@@ -1245,11 +1245,11 @@ impl Context {
         frame_depth: usize,
         backend: &mut crate::jit::JitBackend,
     ) -> ControlFlow<CompletionRecord> {
-        if backend.observes_call_sites() {
+        if backend.observes_interpreted_sites() {
             self.run_interpreter_until_frame_change_with(frame_depth, |context, observation| {
                 match observation {
                     InterpreterJitObservation::Before { opcode, pc } => {
-                        context.observe_jit_call_site(backend, opcode, pc);
+                        context.observe_jit_interpreted_site(backend, opcode, pc);
                     }
                     InterpreterJitObservation::After { pc, next_pc }
                         if backend.observes_loop_backedges()
@@ -1271,27 +1271,105 @@ impl Context {
     }
 
     #[cfg(feature = "jit")]
-    fn observe_jit_call_site(&self, backend: &mut crate::jit::JitBackend, opcode: Opcode, pc: u32) {
-        if opcode != Opcode::Call {
+    fn observe_jit_interpreted_site(
+        &self,
+        backend: &mut crate::jit::JitBackend,
+        opcode: Opcode,
+        pc: u32,
+    ) {
+        let observe_call = backend.observes_call_sites() && opcode == Opcode::Call;
+        let observe_storage = backend.observes_storage_sites()
+            && matches!(
+                opcode,
+                Opcode::GetLengthProperty
+                    | Opcode::GetPropertyByName
+                    | Opcode::GetPropertyByNameWithThis
+                    | Opcode::GetPropertyByValue
+                    | Opcode::GetPropertyByValuePush
+            );
+        if !observe_call && !observe_storage {
             return;
         }
-        let (Instruction::Call { argument_count }, _) = self
+
+        let (instruction, _) = self
             .vm
             .frame()
             .code_block
             .bytecode
-            .next_instruction(pc as usize)
-        else {
-            return;
-        };
+            .next_instruction(pc as usize);
         let code = self.vm.frame().code_block.clone();
-        backend.observe_call_site(
-            &code,
-            pc,
-            self,
-            usize::from(argument_count),
-            !self.vm.frame().jit_entry_attempted(),
-        );
+
+        match instruction {
+            Instruction::Call { argument_count } if observe_call => {
+                backend.observe_call_site(
+                    &code,
+                    pc,
+                    self,
+                    usize::from(argument_count),
+                    !self.vm.frame().jit_entry_attempted(),
+                );
+            }
+            Instruction::GetLengthProperty { .. } if observe_storage => {
+                backend.observe_storage_site(
+                    &code,
+                    pc,
+                    crate::jit::JitStorageSiteKind::Length,
+                    None,
+                );
+            }
+            Instruction::GetPropertyByName {
+                value, ic_index, ..
+            }
+            | Instruction::GetPropertyByNameWithThis {
+                value, ic_index, ..
+            } if observe_storage => {
+                let inline_cache_hit = self
+                    .vm
+                    .get_register(usize::from(value))
+                    .as_object_borrowed()
+                    .map(|object| {
+                        let object = object.borrow();
+                        code.ic[usize::from(ic_index)].get(object.shape()).is_some()
+                    });
+                backend.observe_storage_site(
+                    &code,
+                    pc,
+                    crate::jit::JitStorageSiteKind::Named,
+                    inline_cache_hit,
+                );
+            }
+            Instruction::GetPropertyByValue {
+                key,
+                object,
+                ic_index,
+                ..
+            }
+            | Instruction::GetPropertyByValuePush {
+                key,
+                object,
+                ic_index,
+                ..
+            } if observe_storage => {
+                let key = self.vm.get_register(usize::from(key));
+                let object = self.vm.get_register(usize::from(object));
+                let observation = match (key.variant(), object.as_object_borrowed()) {
+                    (crate::value::JsVariant::Integer32(index), Some(object)) if index >= 0 => {
+                        let object = object.borrow();
+                        let hit = code.element_ic[usize::from(ic_index)]
+                            .matches(object.shape())
+                            .is_some()
+                            && object
+                                .properties()
+                                .get_indexed_data_property(index as u32)
+                                .is_some();
+                        (crate::jit::JitStorageSiteKind::Dense, Some(hit))
+                    }
+                    _ => (crate::jit::JitStorageSiteKind::Computed, None),
+                };
+                backend.observe_storage_site(&code, pc, observation.0, observation.1);
+            }
+            _ => {}
+        }
     }
 
     #[cfg(feature = "jit")]
@@ -1407,8 +1485,8 @@ impl Context {
                 };
                 let opcode = Opcode::decode(*byte);
 
-                if backend.observes_call_sites() {
-                    self.observe_jit_call_site(backend, opcode, old_pc);
+                if backend.observes_interpreted_sites() {
+                    self.observe_jit_interpreted_site(backend, opcode, old_pc);
                 }
 
                 match self.execute_one(
