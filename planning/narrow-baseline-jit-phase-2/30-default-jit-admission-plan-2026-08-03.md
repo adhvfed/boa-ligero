@@ -84,6 +84,14 @@ code bytes, cumulative compile-time budget/window, diagnostic overhead, and
 every cache/metadata/plan map. Then one behavior slice must add and test that
 backend-wide policy across whole-function and loop artifacts together:
 
+The design record is now
+[checked in](31-default-jit-resource-bounds-design-2026-08-03.md). It selects
+192 reserved function variants plus 64 loop keys, an 8 MiB aggregate code
+breaker, 10 ms per-attempt and 100 ms cumulative compile breakers, a 1,024-
+instruction PC-zero ceiling, a 1,024-site legacy feedback cap, and the existing
+4,096-per-class diagnostic cap. D1 implementation and its cold/RSS evidence
+remain open.
+
 - a hard retained-entry and accounted-code bound;
 - a cumulative compile-time breaker for unseen keys;
 - deterministic duplicate/failure suppression;

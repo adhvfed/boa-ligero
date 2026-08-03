@@ -111,6 +111,16 @@ the suppressed 65th key leaves no partial state, and a retained ready key still
 enters its cached artifact at capacity. See the
 [containment checkpoint](25-slice-4a1-containment-checkpoint-2026-08-03.md).
 
+The default-on D1 review now defines the complete backend policy rather than
+leaving the PC-zero cache outside those bounds. The selected limits reserve
+192 function variants and 64 loop keys, account all runtime artifacts against
+8 MiB, stop unseen compilation after one 10 ms attempt or 100 ms cumulative
+codegen, and reject PC-zero bodies above 1,024 decoded instructions before IR
+construction. Ready artifacts remain reusable and finalized code is never
+pretended to be evicted. Exact map cardinalities, post-publication retirement,
+diagnostic overhead, and acceptance tests are in the
+[D1 design record](31-default-jit-resource-bounds-design-2026-08-03.md).
+
 ## Cold-start policy
 
 Report and optimize these separately:

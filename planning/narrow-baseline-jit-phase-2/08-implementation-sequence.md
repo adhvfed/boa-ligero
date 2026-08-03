@@ -554,6 +554,12 @@ run the named Tier-A W2 A/B corpus; pass the two supported native platforms and
 security review; then land only the default/opt-out flip. No second ABI or
 remote-script policy change may ride with that sequence.
 
+D1's numerical policy and implementation order are fixed in the
+[resource-bounds design](31-default-jit-resource-bounds-design-2026-08-03.md).
+Land capacity/static-admission suppression first, then unified byte/time
+accounting and safe backend retirement. Do not fold either slice into the
+eventual default flip.
+
 Suggested commits:
 
 ```text
