@@ -3497,6 +3497,101 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_osr_survives_forced_gc_around_cache_entry() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition")
+        .evaluate(&mut context)
+        .expect("define function");
+
+        let evaluate_once = |context: &mut Context| {
+            crate::Script::parse(crate::Source::from_bytes("once(3)"), None, context)
+                .expect("parse call")
+                .evaluate(context)
+                .expect("evaluate call")
+        };
+
+        boa_gc::force_collect();
+        assert_eq!(evaluate_once(&mut context).as_number(), Some(3.5));
+        let cold = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(cold.osr.compilations, 1, "stats: {cold:?}");
+        assert_eq!(cold.osr.entries, 1, "stats: {cold:?}");
+
+        boa_gc::force_collect();
+        assert_eq!(evaluate_once(&mut context).as_number(), Some(3.5));
+        let cached = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(cached.osr.compilations, 1, "stats: {cached:?}");
+        assert_eq!(cached.osr.entries, 2, "stats: {cached:?}");
+
+        boa_gc::force_collect();
+        assert_eq!(evaluate_once(&mut context).as_number(), Some(3.5));
+        let after_return = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(after_return.osr.compilations, 1, "stats: {after_return:?}");
+        assert_eq!(after_return.osr.entries, 3, "stats: {after_return:?}");
+        assert_eq!(after_return.osr.deopts, 0, "stats: {after_return:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_osr_preserves_nested_frames_and_recursion_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0; for (let i = 0; i < limit; i++) { total = total + i; } return total; } function descend(depth) { return depth ? descend(depth - 1) : once(3); }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definitions")
+        .evaluate(&mut context)
+        .expect("define functions");
+
+        let nested =
+            crate::Script::parse(crate::Source::from_bytes("descend(3)"), None, &mut context)
+                .expect("parse nested call");
+        assert_eq!(
+            nested
+                .evaluate(&mut context)
+                .expect("evaluate nested call")
+                .as_i32(),
+            Some(3)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 1, "stats: {stats:?}");
+
+        context.runtime_limits_mut().set_recursion_limit(2);
+        let recursive =
+            crate::Script::parse(crate::Source::from_bytes("descend(10)"), None, &mut context)
+                .expect("parse recursive call");
+        let error = recursive
+            .evaluate(&mut context)
+            .expect_err("recursion limit must remain enforced");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::Recursion))
+        );
+        assert!(context.jit_enabled());
+        assert_eq!(context.vm.frames.len(), 1);
+    }
+
+    #[test]
     fn context_owned_jit_keeps_below_threshold_loop_interpreted() {
         let mut context = Context::default();
         context.enable_jit();
@@ -4494,6 +4589,52 @@ mod tests {
             .set_register(1, JsValue::new(js_string!("not a number")));
         context.vm.set_register(2, JsValue::new(10));
         context.vm.set_register(4, JsValue::new(0));
+
+        context.active_jit_backend_id = backend.id().wrapping_add(1);
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::EntryRejected,
+                reason: JitExitReason::EntryGuard,
+                pc: header_pc,
+            })
+        );
+
+        context.vm.frame_mut().pc = header_pc + 1;
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        context.vm.frame_mut().pc = header_pc;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::EntryRejected,
+                reason: JitExitReason::EntryGuard,
+                pc: header_pc,
+            })
+        );
+
+        let original_code = context.vm.frame().code_block.clone();
+        context.vm.frame_mut().code_block = first_function_code(
+            "function different(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total - i; } return total; }",
+        );
+        context.active_jit_backend_id = backend.id();
+        let status = entry(&raw mut context);
+        context.active_jit_backend_id = 0;
+        context.vm.frame_mut().code_block = original_code;
+        assert_eq!(
+            JitExit::decode(status),
+            Some(JitExit {
+                kind: JitExitKind::EntryRejected,
+                reason: JitExitReason::EntryGuard,
+                pc: header_pc,
+            })
+        );
+        assert_eq!(context.vm.frame().loop_iteration_count, 0);
+        assert!(context.vm.get_register(1).is_string());
+
         context.active_jit_backend_id = backend.id();
         let status = entry(&raw mut context);
         context.active_jit_backend_id = 0;
