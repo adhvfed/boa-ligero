@@ -15,8 +15,8 @@ use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
 use crate::{Context, JsValue};
 
 use super::{
-    JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCompileBlockerKind, JitExit, JitExitKind,
-    JitExitReason,
+    JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind, JitExit,
+    JitExitKind, JitExitReason, JitNumericRepresentation,
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -169,6 +169,437 @@ pub(super) fn loop_admission_profile(
         instructions: region,
     }
     .static_profile())
+}
+
+const MAX_LOOP_REGION_INSTRUCTIONS: usize = 128;
+const MAX_LOOP_CONTINUATION_INSTRUCTIONS: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoopPlanRejection {
+    IneligibleCodeBlock(JitCompileBlockerKind),
+    InvalidBoundary,
+    RegionTooLarge,
+    UnsupportedRegionOpcode,
+    InvalidControlFlow,
+    UnsupportedContinuation,
+    RepresentationMismatch,
+    UnprovenValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoopEntrySource {
+    VmRegister,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoopExitSource {
+    NativeValue,
+    PreservedVmValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LoopEntryValue {
+    pub(super) register: u32,
+    pub(super) representation: JitNumericRepresentation,
+    pub(super) source: LoopEntrySource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LoopExitValue {
+    pub(super) register: u32,
+    pub(super) source: LoopExitSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LoopExitMap {
+    pub(super) from_pc: u32,
+    pub(super) resume_pc: u32,
+    pub(super) materialize: Vec<LoopExitValue>,
+}
+
+/// A source-free, side-effect-free proof for one canonical numeric loop.
+///
+/// This is deliberately not executable yet. The scheduler and compiler slices
+/// consume this immutable plan only after the planner has proved every entry
+/// value and the single path-specific continuation map.
+#[allow(dead_code, reason = "consumed by the next loop-OSR compiler slice")]
+pub(super) struct LoopRegionPlan {
+    pub(super) key: JitCacheKey,
+    pub(super) instruction_pcs: Vec<u32>,
+    pub(super) entry: Vec<LoopEntryValue>,
+    pub(super) exits: Vec<LoopExitMap>,
+    pub(super) requires_f64: bool,
+}
+
+struct LoopDecodedInstruction {
+    pc: usize,
+    next_pc: usize,
+    instruction: Instruction,
+}
+
+/// Prove the first loop-OSR shape without compiling or touching VM state.
+///
+/// The first shape has one unconditional canonical latch and one conditional
+/// forward continuation. Its continuation is intentionally restricted to the
+/// bytecompiler's register-to-return epilogue so liveness cannot silently
+/// guess at an unmodelled opcode.
+#[allow(dead_code, reason = "called by tests before scheduler wiring")]
+pub(super) fn plan_loop_region(
+    code: &CodeBlock,
+    header_pc: u32,
+    backedge_pc: u32,
+    representation: JitNumericRepresentation,
+    budgeted: bool,
+    diagnostic: bool,
+) -> Result<LoopRegionPlan, LoopPlanRejection> {
+    if let Some(kind) = eligibility_blocker(code) {
+        return Err(LoopPlanRejection::IneligibleCodeBlock(kind));
+    }
+    if header_pc >= backedge_pc {
+        return Err(LoopPlanRejection::InvalidBoundary);
+    }
+
+    let region = decode_loop_region(code, header_pc, backedge_pc)?;
+    let by_pc: HashMap<usize, usize> = region
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.pc, index))
+        .collect();
+    if !matches!(
+        &region.last().ok_or(LoopPlanRejection::InvalidBoundary)?.instruction,
+        Instruction::Jump { address } if address.as_u32() == header_pc
+    ) {
+        return Err(LoopPlanRejection::InvalidControlFlow);
+    }
+
+    let mut external_exit = None;
+    let mut requires_f64 = false;
+    let mut uses = Vec::with_capacity(region.len());
+    let mut defs = Vec::with_capacity(region.len());
+    let mut successors = Vec::with_capacity(region.len());
+
+    for (region_index, decoded_instruction) in region.iter().enumerate() {
+        let (instruction_uses, instruction_def) = loop_use_def(
+            &decoded_instruction.instruction,
+            code.register_count as usize,
+        )?;
+        requires_f64 |= matches!(
+            decoded_instruction.instruction,
+            Instruction::StoreFloat { .. } | Instruction::StoreDouble { .. }
+        );
+        uses.push(instruction_uses);
+        defs.push(instruction_def);
+
+        let mut instruction_successors = Vec::with_capacity(2);
+        match &decoded_instruction.instruction {
+            Instruction::Jump { address } => {
+                if decoded_instruction.pc != backedge_pc as usize || address.as_u32() != header_pc {
+                    return Err(LoopPlanRejection::InvalidControlFlow);
+                }
+                instruction_successors.push(0);
+            }
+            instruction if is_loop_conditional_branch(instruction) => {
+                let target_pc =
+                    branch_target(instruction).ok_or(LoopPlanRejection::InvalidControlFlow)?;
+                let fallthrough = by_pc
+                    .get(&decoded_instruction.next_pc)
+                    .copied()
+                    .ok_or(LoopPlanRejection::InvalidControlFlow)?;
+                if let Some(&target) = by_pc.get(&target_pc) {
+                    if target <= region_index {
+                        return Err(LoopPlanRejection::InvalidControlFlow);
+                    }
+                    instruction_successors.push(target);
+                } else {
+                    if target_pc <= backedge_pc as usize || external_exit.is_some() {
+                        return Err(LoopPlanRejection::InvalidControlFlow);
+                    }
+                    external_exit = Some((decoded_instruction.pc, target_pc));
+                }
+                instruction_successors.push(fallthrough);
+            }
+            _ => {
+                let next = by_pc
+                    .get(&decoded_instruction.next_pc)
+                    .copied()
+                    .ok_or(LoopPlanRejection::InvalidControlFlow)?;
+                instruction_successors.push(next);
+            }
+        }
+        successors.push(instruction_successors);
+    }
+
+    let (exit_from_pc, resume_pc) = external_exit.ok_or(LoopPlanRejection::InvalidControlFlow)?;
+    if requires_f64 && representation != JitNumericRepresentation::F64 {
+        return Err(LoopPlanRejection::RepresentationMismatch);
+    }
+    let exit_live = continuation_live_in(code, resume_pc, code.register_count as usize)?;
+
+    let exit_instruction_index = *by_pc
+        .get(&exit_from_pc)
+        .ok_or(LoopPlanRejection::InvalidControlFlow)?;
+    let mut live_in = vec![BTreeSet::new(); region.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in (0..region.len()).rev() {
+            let mut live_out = BTreeSet::new();
+            for successor in &successors[index] {
+                live_out.extend(live_in[*successor].iter().copied());
+            }
+            if index == exit_instruction_index {
+                live_out.extend(exit_live.iter().copied());
+            }
+            if let Some(definition) = defs[index] {
+                live_out.remove(&definition);
+            }
+            live_out.extend(uses[index].iter().copied());
+            if live_out != live_in[index] {
+                live_in[index] = live_out;
+                changed = true;
+            }
+        }
+    }
+
+    let used_or_defined: BTreeSet<usize> = uses
+        .iter()
+        .flat_map(|registers| registers.iter().copied())
+        .chain(defs.iter().flatten().copied())
+        .collect();
+    let defined: BTreeSet<usize> = defs.iter().flatten().copied().collect();
+    let entry_registers: BTreeSet<usize> =
+        live_in[0].intersection(&used_or_defined).copied().collect();
+
+    let entry = entry_registers
+        .iter()
+        .map(|register| LoopEntryValue {
+            register: *register as u32,
+            representation,
+            source: LoopEntrySource::VmRegister,
+        })
+        .collect();
+    let mut materialize = Vec::with_capacity(exit_live.len());
+    for register in exit_live {
+        let source = if defined.contains(&register) {
+            if !live_in[exit_instruction_index].contains(&register)
+                || (!entry_registers.contains(&register)
+                    && !definitely_defined_before(
+                        &successors,
+                        &defs,
+                        exit_instruction_index,
+                        register,
+                    ))
+            {
+                return Err(LoopPlanRejection::UnprovenValue);
+            }
+            LoopExitSource::NativeValue
+        } else {
+            LoopExitSource::PreservedVmValue
+        };
+        materialize.push(LoopExitValue {
+            register: register as u32,
+            source,
+        });
+    }
+
+    Ok(LoopRegionPlan {
+        key: JitCacheKey::loop_region(
+            code.debug_id,
+            header_pc,
+            backedge_pc,
+            representation,
+            budgeted,
+            diagnostic,
+        ),
+        instruction_pcs: region
+            .iter()
+            .map(|instruction| instruction.pc as u32)
+            .collect(),
+        entry,
+        exits: vec![LoopExitMap {
+            from_pc: exit_from_pc as u32,
+            resume_pc: resume_pc as u32,
+            materialize,
+        }],
+        requires_f64,
+    })
+}
+
+fn decode_loop_region(
+    code: &CodeBlock,
+    header_pc: u32,
+    backedge_pc: u32,
+) -> Result<Vec<LoopDecodedInstruction>, LoopPlanRejection> {
+    let mut region = Vec::new();
+    let mut iterator = InstructionIterator::new(&code.bytecode);
+    while let Some((pc, _, instruction)) = iterator.next() {
+        if pc > backedge_pc as usize {
+            break;
+        }
+        if pc >= header_pc as usize {
+            if region.len() == MAX_LOOP_REGION_INSTRUCTIONS {
+                return Err(LoopPlanRejection::RegionTooLarge);
+            }
+            region.push(LoopDecodedInstruction {
+                pc,
+                next_pc: iterator.pc(),
+                instruction,
+            });
+        }
+    }
+    if region.first().map(|instruction| instruction.pc) != Some(header_pc as usize)
+        || region.last().map(|instruction| instruction.pc) != Some(backedge_pc as usize)
+    {
+        return Err(LoopPlanRejection::InvalidBoundary);
+    }
+    Ok(region)
+}
+
+fn loop_use_def(
+    instruction: &Instruction,
+    register_count: usize,
+) -> Result<(Vec<usize>, Option<usize>), LoopPlanRejection> {
+    let register = |value: usize| {
+        (value < register_count)
+            .then_some(value)
+            .ok_or(LoopPlanRejection::UnprovenValue)
+    };
+    let unary = |src: usize, dst: usize| Ok((vec![register(src)?], Some(register(dst)?)));
+    let binary = |lhs: usize, rhs: usize, dst: usize| {
+        Ok((vec![register(lhs)?, register(rhs)?], Some(register(dst)?)))
+    };
+    let comparison = |lhs: usize, rhs: usize| Ok((vec![register(lhs)?, register(rhs)?], None));
+
+    match instruction {
+        Instruction::StoreZero { dst }
+        | Instruction::StoreOne { dst }
+        | Instruction::StoreInt8 { dst, .. }
+        | Instruction::StoreInt16 { dst, .. }
+        | Instruction::StoreInt32 { dst, .. }
+        | Instruction::StoreFloat { dst, .. }
+        | Instruction::StoreDouble { dst, .. } => {
+            Ok((Vec::new(), Some(register(usize::from(*dst))?)))
+        }
+        Instruction::Move { src, dst } | Instruction::Inc { src, dst } => {
+            unary(usize::from(*src), usize::from(*dst))
+        }
+        Instruction::Add { lhs, rhs, dst }
+        | Instruction::Sub { lhs, rhs, dst }
+        | Instruction::Mul { lhs, rhs, dst } => {
+            binary(usize::from(*lhs), usize::from(*rhs), usize::from(*dst))
+        }
+        Instruction::JumpIfNotLessThan { lhs, rhs, .. }
+        | Instruction::JumpIfNotLessThanOrEqual { lhs, rhs, .. }
+        | Instruction::JumpIfNotGreaterThan { lhs, rhs, .. }
+        | Instruction::JumpIfNotGreaterThanOrEqual { lhs, rhs, .. }
+        | Instruction::JumpIfNotEqual { lhs, rhs, .. } => {
+            comparison(usize::from(*lhs), usize::from(*rhs))
+        }
+        Instruction::IncrementLoopIteration | Instruction::Jump { .. } => Ok((Vec::new(), None)),
+        _ => Err(LoopPlanRejection::UnsupportedRegionOpcode),
+    }
+}
+
+fn is_loop_conditional_branch(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::JumpIfNotLessThan { .. }
+            | Instruction::JumpIfNotLessThanOrEqual { .. }
+            | Instruction::JumpIfNotGreaterThan { .. }
+            | Instruction::JumpIfNotGreaterThanOrEqual { .. }
+            | Instruction::JumpIfNotEqual { .. }
+    )
+}
+
+fn continuation_live_in(
+    code: &CodeBlock,
+    resume_pc: usize,
+    register_count: usize,
+) -> Result<BTreeSet<usize>, LoopPlanRejection> {
+    let mut epilogue = Vec::new();
+    let mut found_resume = false;
+    let mut found_return = false;
+    for (pc, _, instruction) in InstructionIterator::new(&code.bytecode) {
+        if !found_resume {
+            if pc < resume_pc {
+                continue;
+            }
+            if pc != resume_pc {
+                return Err(LoopPlanRejection::UnsupportedContinuation);
+            }
+            found_resume = true;
+        }
+        if epilogue.len() == MAX_LOOP_CONTINUATION_INSTRUCTIONS {
+            return Err(LoopPlanRejection::UnsupportedContinuation);
+        }
+        let (uses, definition, returns) = match &instruction {
+            Instruction::PushFromRegister { src } | Instruction::SetAccumulator { src } => {
+                (vec![usize::from(*src)], None, false)
+            }
+            Instruction::PopIntoRegister { dst } => (Vec::new(), Some(usize::from(*dst)), false),
+            Instruction::CheckReturn => (Vec::new(), None, false),
+            Instruction::Return => (Vec::new(), None, true),
+            _ => return Err(LoopPlanRejection::UnsupportedContinuation),
+        };
+        if uses.iter().any(|register| *register >= register_count)
+            || definition.is_some_and(|register| register >= register_count)
+        {
+            return Err(LoopPlanRejection::UnprovenValue);
+        }
+        epilogue.push((uses, definition));
+        if returns {
+            found_return = true;
+            break;
+        }
+    }
+    if !found_resume || !found_return {
+        return Err(LoopPlanRejection::UnsupportedContinuation);
+    }
+
+    let mut live = BTreeSet::new();
+    for (uses, definition) in epilogue.into_iter().rev() {
+        if let Some(definition) = definition {
+            live.remove(&definition);
+        }
+        live.extend(uses);
+    }
+    Ok(live)
+}
+
+fn definitely_defined_before(
+    successors: &[Vec<usize>],
+    defs: &[Option<usize>],
+    exit_index: usize,
+    register: usize,
+) -> bool {
+    let mut definitely_defined = vec![false; successors.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in 0..successors.len() {
+            let incoming = if index == 0 {
+                false
+            } else {
+                let predecessors: Vec<usize> = successors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(predecessor, targets)| {
+                        targets.contains(&index).then_some(predecessor)
+                    })
+                    .collect();
+                !predecessors.is_empty()
+                    && predecessors
+                        .iter()
+                        .all(|predecessor| definitely_defined[*predecessor])
+            };
+            let after = incoming || defs[index] == Some(register);
+            if after != definitely_defined[index] {
+                definitely_defined[index] = after;
+                changed = true;
+            }
+        }
+    }
+    definitely_defined.get(exit_index).copied().unwrap_or(false)
 }
 
 impl NativeRejection {

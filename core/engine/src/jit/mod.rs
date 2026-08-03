@@ -932,16 +932,62 @@ struct CachedEntry {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by the loop-OSR planner before scheduler wiring"
+)]
+enum JitNumericRepresentation {
+    I32,
+    F64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum JitEntryPoint {
+    Function,
+    #[allow(
+        dead_code,
+        reason = "constructed by the loop-OSR planner before scheduler wiring"
+    )]
+    Loop {
+        header_pc: u32,
+        backedge_pc: u32,
+        representation: JitNumericRepresentation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct JitCacheKey {
     code_id: u64,
+    entry_point: JitEntryPoint,
     budgeted: bool,
     diagnostic: bool,
 }
 
 impl JitCacheKey {
-    const fn new(code_id: u64, budgeted: bool, diagnostic: bool) -> Self {
+    const fn function(code_id: u64, budgeted: bool, diagnostic: bool) -> Self {
         Self {
             code_id,
+            entry_point: JitEntryPoint::Function,
+            budgeted,
+            diagnostic,
+        }
+    }
+
+    const fn loop_region(
+        code_id: u64,
+        header_pc: u32,
+        backedge_pc: u32,
+        representation: JitNumericRepresentation,
+        budgeted: bool,
+        diagnostic: bool,
+    ) -> Self {
+        Self {
+            code_id,
+            entry_point: JitEntryPoint::Loop {
+                header_pc,
+                backedge_pc,
+                representation,
+            },
             budgeted,
             diagnostic,
         }
@@ -1441,7 +1487,7 @@ impl JitBackend {
             let budgeted = context.instruction_budget_remaining().is_some();
             let cached_native = self
                 .cache
-                .get(&JitCacheKey::new(
+                .get(&JitCacheKey::function(
                     target_code_id,
                     budgeted,
                     self.diagnostics.is_some(),
@@ -1477,7 +1523,7 @@ impl JitBackend {
     fn cached_entry(&mut self, code: &CodeBlock, charge_instruction_budget: bool) -> CachedEntry {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
-        let cache_key = JitCacheKey::new(code.debug_id, charge_instruction_budget, diagnostic);
+        let cache_key = JitCacheKey::function(code.debug_id, charge_instruction_budget, diagnostic);
 
         if let Some(cached) = self.cache.get(&cache_key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
@@ -1978,6 +2024,17 @@ mod tests {
         let code = script.codeblock(&mut context).expect("codeblock");
         let GlobalFunctionBinding { function_index, .. } = code.global_fns[0];
         code.constant_function(function_index as usize)
+    }
+
+    fn canonical_loop(code: &CodeBlock) -> (u32, u32) {
+        InstructionIterator::new(&code.bytecode)
+            .find_map(|(pc, _, instruction)| match instruction {
+                Instruction::Jump { address } if address.as_u32() < pc as u32 => {
+                    Some((address.as_u32(), pc as u32))
+                }
+                _ => None,
+            })
+            .expect("canonical backward jump")
     }
 
     fn enable_jit_without_admission_floor(context: &mut Context) {
@@ -2774,6 +2831,153 @@ mod tests {
 
         let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
         assert!(!serialized.contains("once"));
+    }
+
+    #[test]
+    fn jit_loop_planner_proves_fractional_live_in_and_path_specific_exit() {
+        let code = first_function_code(
+            "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitNumericRepresentation::F64,
+            true,
+            false,
+        )
+        .expect("selected loop must have a complete static plan");
+
+        assert_eq!(
+            plan.key,
+            JitCacheKey::loop_region(
+                code.debug_id,
+                header_pc,
+                backedge_pc,
+                JitNumericRepresentation::F64,
+                true,
+                false,
+            )
+        );
+        assert_eq!(
+            plan.entry,
+            vec![
+                native::LoopEntryValue {
+                    register: 1,
+                    representation: JitNumericRepresentation::F64,
+                    source: native::LoopEntrySource::VmRegister,
+                },
+                native::LoopEntryValue {
+                    register: 2,
+                    representation: JitNumericRepresentation::F64,
+                    source: native::LoopEntrySource::VmRegister,
+                },
+                native::LoopEntryValue {
+                    register: 4,
+                    representation: JitNumericRepresentation::F64,
+                    source: native::LoopEntrySource::VmRegister,
+                },
+            ]
+        );
+        assert_eq!(plan.exits.len(), 1);
+        assert_eq!(
+            plan.exits[0].materialize,
+            vec![native::LoopExitValue {
+                register: 1,
+                source: native::LoopExitSource::NativeValue,
+            }]
+        );
+        assert!(plan.exits[0].from_pc >= header_pc);
+        assert!(plan.exits[0].from_pc < backedge_pc);
+        assert!(plan.exits[0].resume_pc > backedge_pc);
+        assert_eq!(plan.instruction_pcs.first(), Some(&header_pc));
+        assert_eq!(plan.instruction_pcs.last(), Some(&backedge_pc));
+        assert!(
+            !plan.requires_f64,
+            "the artifact chooses F64 from live state, not a region-local constant"
+        );
+
+        let integer_key = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitNumericRepresentation::I32,
+            true,
+            false,
+        )
+        .expect("representation is selected by the later guarded-state slice")
+        .key;
+        assert_ne!(integer_key, plan.key);
+    }
+
+    #[test]
+    fn jit_loop_planner_rejects_unmodelled_region_operations() {
+        let code = first_function_code(
+            "function divided(limit) { let total = 1; for (let i = 1; i < limit; i++) { total = total / i; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        assert_eq!(
+            native::plan_loop_region(
+                &code,
+                header_pc,
+                backedge_pc,
+                JitNumericRepresentation::F64,
+                false,
+                false,
+            )
+            .err(),
+            Some(native::LoopPlanRejection::UnsupportedRegionOpcode)
+        );
+    }
+
+    #[test]
+    fn jit_loop_planner_preserves_untouched_exit_values_in_vm_registers() {
+        let code = first_function_code(
+            "function preserve(limit, result) { for (let i = 0; i < limit; i++) {} return result; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        let plan = native::plan_loop_region(
+            &code,
+            header_pc,
+            backedge_pc,
+            JitNumericRepresentation::I32,
+            false,
+            false,
+        )
+        .expect("empty numeric loop has a provable exit map");
+
+        let preserved = plan.exits[0]
+            .materialize
+            .iter()
+            .find(|value| value.source == native::LoopExitSource::PreservedVmValue)
+            .expect("the returned argument is untouched by the native region");
+        assert!(
+            plan.entry
+                .iter()
+                .all(|entry| entry.register != preserved.register),
+            "an untouched exit-only register must not be loaded into native state"
+        );
+    }
+
+    #[test]
+    fn jit_loop_planner_rejects_i32_for_region_float_constants() {
+        let code = first_function_code(
+            "function fractional(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = 0.5; } return total; }",
+        );
+        let (header_pc, backedge_pc) = canonical_loop(&code);
+        assert_eq!(
+            native::plan_loop_region(
+                &code,
+                header_pc,
+                backedge_pc,
+                JitNumericRepresentation::I32,
+                false,
+                false,
+            )
+            .err(),
+            Some(native::LoopPlanRejection::RepresentationMismatch)
+        );
     }
 
     #[test]
