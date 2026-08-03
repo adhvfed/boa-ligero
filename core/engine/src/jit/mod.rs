@@ -559,6 +559,38 @@ pub struct JitStorageSiteRecord {
     pub inline_cache_not_applicable: u64,
 }
 
+/// Fixed aggregate counters produced only by diagnostic native artifacts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitNativeStorageRecord {
+    /// Successful named-property guards.
+    pub named_guard_hits: u64,
+    /// Failed named-property guards that returned to the interpreter.
+    pub named_guard_misses: u64,
+    /// Named-property helper loads following successful guards.
+    pub named_loads: u64,
+    /// Successful dense-element guards.
+    pub dense_guard_hits: u64,
+    /// Failed dense-element guards that returned to the interpreter.
+    pub dense_guard_misses: u64,
+    /// Dense-element helper loads following successful guards.
+    pub dense_loads: u64,
+}
+
+impl JitNativeStorageRecord {
+    fn merge(&mut self, other: Self) {
+        self.named_guard_hits = self.named_guard_hits.saturating_add(other.named_guard_hits);
+        self.named_guard_misses = self
+            .named_guard_misses
+            .saturating_add(other.named_guard_misses);
+        self.named_loads = self.named_loads.saturating_add(other.named_loads);
+        self.dense_guard_hits = self.dense_guard_hits.saturating_add(other.dense_guard_hits);
+        self.dense_guard_misses = self
+            .dense_guard_misses
+            .saturating_add(other.dense_guard_misses);
+        self.dense_loads = self.dense_loads.saturating_add(other.dense_loads);
+    }
+}
+
 impl Default for JitStorageSiteKind {
     fn default() -> Self {
         Self::Computed
@@ -586,6 +618,8 @@ pub struct JitDiagnosticSnapshot {
     /// Aggregated interpreted storage reads in deterministic code/PC/kind
     /// order.
     pub storage_records: Vec<JitStorageSiteRecord>,
+    /// Fixed native guard/load aggregates from diagnostic artifacts.
+    pub native_storage: JitNativeStorageRecord,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
@@ -630,6 +664,7 @@ struct JitDiagnosticState {
     loop_record_indices: FxHashMap<(u64, u32, u32), usize>,
     storage_records: Vec<JitStorageSiteRecord>,
     storage_record_indices: FxHashMap<(u64, u32, JitStorageSiteKind), usize>,
+    native_storage: JitNativeStorageRecord,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
@@ -652,6 +687,7 @@ impl JitDiagnosticState {
             loop_record_indices: FxHashMap::default(),
             storage_records: Vec::with_capacity(limits.storage_records.min(64)),
             storage_record_indices: FxHashMap::default(),
+            native_storage: JitNativeStorageRecord::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
@@ -845,6 +881,10 @@ impl JitDiagnosticState {
         }
     }
 
+    fn record_native_storage(&mut self, record: JitNativeStorageRecord) {
+        self.native_storage.merge(record);
+    }
+
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
         compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
@@ -879,6 +919,7 @@ impl JitDiagnosticState {
             call_records,
             loop_records,
             storage_records,
+            native_storage: self.native_storage,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
@@ -899,11 +940,16 @@ struct CachedEntry {
 struct JitCacheKey {
     code_id: u64,
     budgeted: bool,
+    diagnostic: bool,
 }
 
 impl JitCacheKey {
-    const fn new(code_id: u64, budgeted: bool) -> Self {
-        Self { code_id, budgeted }
+    const fn new(code_id: u64, budgeted: bool, diagnostic: bool) -> Self {
+        Self {
+            code_id,
+            budgeted,
+            diagnostic,
+        }
     }
 }
 
@@ -1400,7 +1446,11 @@ impl JitBackend {
             let budgeted = context.instruction_budget_remaining().is_some();
             let cached_native = self
                 .cache
-                .get(&JitCacheKey::new(target_code_id, budgeted))
+                .get(&JitCacheKey::new(
+                    target_code_id,
+                    budgeted,
+                    self.diagnostics.is_some(),
+                ))
                 .map(|entry| entry.native);
             JitCallTargetObservation::Ordinary {
                 code_id: target_code_id,
@@ -1431,7 +1481,8 @@ impl JitBackend {
     /// Return a cached entry if one exists, compiling and caching it otherwise.
     fn cached_entry(&mut self, code: &CodeBlock, charge_instruction_budget: bool) -> CachedEntry {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
-        let cache_key = JitCacheKey::new(code.debug_id, charge_instruction_budget);
+        let diagnostic = self.diagnostics.is_some();
+        let cache_key = JitCacheKey::new(code.debug_id, charge_instruction_budget, diagnostic);
 
         if let Some(cached) = self.cache.get(&cache_key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
@@ -1441,7 +1492,7 @@ impl JitBackend {
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         let started = Instant::now();
         let (entry, native, code_bytes, native_profile, rejection) =
-            self.compile_codeblock_with_kind(code, charge_instruction_budget);
+            self.compile_codeblock_with_kind(code, charge_instruction_budget, diagnostic);
         let compile_ns = started.elapsed().as_nanos();
         self.stats.compile_time_ns = self.stats.compile_time_ns.saturating_add(compile_ns);
         self.stats.compilations = self.stats.compilations.saturating_add(1);
@@ -1530,6 +1581,7 @@ impl JitBackend {
         }
         let started = if cached.native && self.diagnostics.is_some() {
             context.vm.jit_exit_pending = None;
+            context.vm.jit_native_storage = JitNativeStorageRecord::default();
             Some(Instant::now())
         } else {
             None
@@ -1537,6 +1589,12 @@ impl JitBackend {
         // SAFETY: `context` is exclusively borrowed for the duration of the
         // native call, and the backend owns the generated code pointer.
         let status = (cached.entry)(std::ptr::from_mut(context));
+        if cached.native && self.diagnostics.is_some() {
+            let native_storage = std::mem::take(&mut context.vm.jit_native_storage);
+            if let Some(diagnostics) = &mut self.diagnostics {
+                diagnostics.record_native_storage(native_storage);
+            }
+        }
         let decoded_exit = JitExit::decode(status);
         if matches!(
             decoded_exit,
@@ -1674,13 +1732,14 @@ impl JitBackend {
     /// Panics if Cranelift codegen fails.
     #[must_use]
     pub fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
-        self.compile_codeblock_with_kind(code, false).0
+        self.compile_codeblock_with_kind(code, false, false).0
     }
 
     fn compile_codeblock_with_kind(
         &mut self,
         code: &CodeBlock,
         charge_instruction_budget: bool,
+        instrument_storage: bool,
     ) -> (
         extern "C" fn(*mut Context) -> u64,
         bool,
@@ -1694,6 +1753,7 @@ impl JitBackend {
             code,
             charge_instruction_budget,
             collect_diagnostic_metadata,
+            instrument_storage,
         ) {
             native::NativeCompileResult::Compiled {
                 entry,
@@ -2953,6 +3013,120 @@ mod tests {
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn diagnostic_native_storage_artifacts_count_guard_hits_misses_and_loads() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function named(object, n) { let total = 0; for (let i = 0; i < n; i++) total += object.distinctive_private_native_name; return total; } function dense(values, n) { let total = 0; for (let i = 0; i < n; i++) total += values[i]; return total; } let object = { distinctive_private_native_name: 3 }; let values = [1, 2, 3]; let namedAnswer = 0; let denseAnswer = 0; for (let j = 0; j < 80; j++) { namedAnswer = named(object, 10); denseAnswer = dense(values, 3); } object.extra = 1; namedAnswer = named(object, 10); values[1] = 2.5; denseAnswer = dense(values, 3); namedAnswer === 30 && denseAnswer === 6.5",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script
+                .evaluate(&mut context)
+                .expect("evaluate")
+                .as_boolean(),
+            Some(true)
+        );
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        let native = snapshot.native_storage;
+        assert!(native.named_guard_hits > 0, "snapshot: {snapshot:?}");
+        assert!(native.named_guard_misses > 0, "snapshot: {snapshot:?}");
+        assert_eq!(native.named_loads, native.named_guard_hits);
+        assert!(native.dense_guard_hits > 0, "snapshot: {snapshot:?}");
+        assert!(native.dense_guard_misses > 0, "snapshot: {snapshot:?}");
+        assert_eq!(native.dense_loads, native.dense_guard_hits);
+        assert_eq!(
+            context.vm.jit_native_storage,
+            JitNativeStorageRecord::default(),
+            "per-entry scratch counters must be merged and cleared"
+        );
+        let serialized = serde_json::to_string(&snapshot).expect("serialize diagnostics");
+        assert!(!serialized.contains("distinctive_private_native_name"));
+    }
+
+    #[test]
+    fn diagnostic_native_storage_uses_a_separate_cache_variant() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let warm = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sumObject(object, n) { let total = 0; for (let i = 0; i < n; i++) total += object.value; return total; } let cachedObject = { value: 3 }; let answer = 0; for (let j = 0; j < 80; j++) answer = sumObject(cachedObject, 10); answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+        assert_eq!(
+            warm.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(30)
+        );
+        let production_compilations = context.jit_stats().expect("JIT enabled").compilations;
+        assert_eq!(
+            context.vm.jit_native_storage,
+            JitNativeStorageRecord::default(),
+            "production helpers must not update diagnostic scratch counters"
+        );
+
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let diagnostic = crate::Script::parse(
+            crate::Source::from_bytes("sumObject(cachedObject, 10)"),
+            None,
+            &mut context,
+        )
+        .expect("parse diagnostic call");
+        assert_eq!(
+            diagnostic
+                .evaluate(&mut context)
+                .expect("evaluate diagnostic call")
+                .as_i32(),
+            Some(30)
+        );
+        let diagnostic_stats = context.jit_stats().expect("JIT enabled");
+        assert_eq!(
+            diagnostic_stats.compilations,
+            production_compilations + 1,
+            "diagnostics must compile a distinct artifact"
+        );
+        let snapshot = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics enabled");
+        assert_eq!(snapshot.native_storage.named_guard_hits, 10);
+        assert_eq!(snapshot.native_storage.named_guard_misses, 0);
+        assert_eq!(snapshot.native_storage.named_loads, 10);
+
+        context.disable_jit_diagnostics();
+        let production_again = crate::Script::parse(
+            crate::Source::from_bytes("sumObject(cachedObject, 10)"),
+            None,
+            &mut context,
+        )
+        .expect("parse production call");
+        assert_eq!(
+            production_again
+                .evaluate(&mut context)
+                .expect("evaluate production call")
+                .as_i32(),
+            Some(30)
+        );
+        assert_eq!(
+            context.jit_stats().expect("JIT enabled").compilations,
+            diagnostic_stats.compilations,
+            "disabling diagnostics must reuse the production artifact"
+        );
+        assert_eq!(
+            context.vm.jit_native_storage,
+            JitNativeStorageRecord::default()
+        );
     }
 
     #[test]

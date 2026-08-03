@@ -134,6 +134,11 @@ pub struct Vm {
     #[cfg(feature = "jit")]
     pub(crate) jit_exit_pending: Option<crate::jit::JitExit>,
 
+    /// Per-entry scratch counters updated only by diagnostic native helper
+    /// variants and merged into the owning backend immediately after return.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_native_storage: crate::jit::JitNativeStorageRecord,
+
     #[cfg(feature = "trace")]
     pub(crate) trace: bool,
     #[cfg(feature = "trace")]
@@ -492,6 +497,8 @@ impl Vm {
             jit_pending: None,
             #[cfg(feature = "jit")]
             jit_exit_pending: None,
+            #[cfg(feature = "jit")]
+            jit_native_storage: crate::jit::JitNativeStorageRecord::default(),
             #[cfg(feature = "trace")]
             trace: false,
             #[cfg(feature = "trace")]

@@ -194,6 +194,7 @@ pub(super) fn compile(
     code: &CodeBlock,
     charge_instruction_budget: bool,
     collect_diagnostic_metadata: bool,
+    instrument_storage: bool,
 ) -> NativeCompileResult {
     let eligibility_blocker = eligibility_blocker(code);
     if let Some(kind) = eligibility_blocker {
@@ -221,9 +222,14 @@ pub(super) fn compile(
     let bytecode_instructions = instructions.instructions.len();
     let profile = instructions.static_profile();
     let mode = select_mode(&instructions);
-    let Some(mut compiler) =
-        NativeCompiler::new(backend, code, instructions, mode, charge_instruction_budget)
-    else {
+    let Some(mut compiler) = NativeCompiler::new(
+        backend,
+        code,
+        instructions,
+        mode,
+        charge_instruction_budget,
+        instrument_storage,
+    ) else {
         return NativeCompileResult::Rejected(NativeRejection::new(
             JitCompileBlockerKind::RegisterAnalysis,
             None,
@@ -712,6 +718,7 @@ struct NativeCompiler<'a> {
     variables: Vec<Variable>,
     dirty: BTreeSet<usize>,
     charge_instruction_budget: bool,
+    instrument_storage: bool,
 }
 
 impl<'a> NativeCompiler<'a> {
@@ -721,6 +728,7 @@ impl<'a> NativeCompiler<'a> {
         instructions: DecodedInstructions,
         mode: NativeMode,
         charge_instruction_budget: bool,
+        instrument_storage: bool,
     ) -> Option<Self> {
         let analysis = analyze_registers(&instructions, code.register_count as usize)?;
         Some(Self {
@@ -733,6 +741,7 @@ impl<'a> NativeCompiler<'a> {
             variables: Vec::new(),
             dirty: BTreeSet::new(),
             charge_instruction_budget,
+            instrument_storage,
         })
     }
 
@@ -941,37 +950,65 @@ impl<'a> NativeCompiler<'a> {
                 types::F64,
             ),
             dense_guard: make(
-                jit_dense_array_guard as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_dense_array_guard as *const () as usize
+                } else {
+                    jit_dense_array_guard as *const () as usize
+                },
                 &[ptr, types::I32, types::I32, types::I32, types::I32],
                 types::I64,
             ),
             dense_guard_f64: make(
-                jit_dense_array_guard_f64 as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_dense_array_guard_f64 as *const () as usize
+                } else {
+                    jit_dense_array_guard_f64 as *const () as usize
+                },
                 &[ptr, types::I32, types::F64, types::I32],
                 types::I64,
             ),
             dense_i32: make(
-                jit_dense_array_i32 as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_dense_array_i32 as *const () as usize
+                } else {
+                    jit_dense_array_i32 as *const () as usize
+                },
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I32,
             ),
             dense_f64: make(
-                jit_dense_array_f64 as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_dense_array_f64 as *const () as usize
+                } else {
+                    jit_dense_array_f64 as *const () as usize
+                },
                 &[ptr, types::I32, types::F64, types::I32],
                 types::F64,
             ),
             named_guard: make(
-                jit_named_property_guard as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_named_property_guard as *const () as usize
+                } else {
+                    jit_named_property_guard as *const () as usize
+                },
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
             named_i32: make(
-                jit_named_property_i32 as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_named_property_i32 as *const () as usize
+                } else {
+                    jit_named_property_i32 as *const () as usize
+                },
                 &[ptr, types::I32, types::I32],
                 types::I32,
             ),
             named_f64: make(
-                jit_named_property_f64 as *const () as usize,
+                if self.instrument_storage {
+                    jit_diagnostic_named_property_f64 as *const () as usize
+                } else {
+                    jit_named_property_f64 as *const () as usize
+                },
                 &[ptr, types::I32, types::I32],
                 types::F64,
             ),
@@ -2313,6 +2350,71 @@ extern "C" fn jit_dense_array_f64(
         .unwrap_or(0.0)
 }
 
+extern "C" fn jit_diagnostic_dense_array_guard(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+    mode: u32,
+) -> u64 {
+    let result = jit_dense_array_guard(context, register, index, ic_index, mode);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+    } else {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_dense_array_guard_f64(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+) -> u64 {
+    let result = jit_dense_array_guard_f64(context, register, index, ic_index);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+    } else {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_dense_array_i32(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+) -> i32 {
+    let result = jit_dense_array_i32(context, register, index, ic_index);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    counters.dense_loads = counters.dense_loads.saturating_add(1);
+    result
+}
+
+extern "C" fn jit_diagnostic_dense_array_f64(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+) -> f64 {
+    let result = jit_dense_array_f64(context, register, index, ic_index);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    counters.dense_loads = counters.dense_loads.saturating_add(1);
+    result
+}
+
 fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Option<JsValue> {
     let value = context.vm.get_register(register as usize);
     let object = value.as_object_borrowed()?;
@@ -2371,6 +2473,50 @@ extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_in
     named_property_value(context, register, ic_index)
         .and_then(|value| value.as_number())
         .unwrap_or(0.0)
+}
+
+extern "C" fn jit_diagnostic_named_property_guard(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+    mode: u32,
+) -> u64 {
+    let result = jit_named_property_guard(context, register, ic_index, mode);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.named_guard_misses = counters.named_guard_misses.saturating_add(1);
+    } else {
+        counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_named_property_i32(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+) -> i32 {
+    let result = jit_named_property_i32(context, register, ic_index);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    counters.named_loads = counters.named_loads.saturating_add(1);
+    result
+}
+
+extern "C" fn jit_diagnostic_named_property_f64(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+) -> f64 {
+    let result = jit_named_property_f64(context, register, ic_index);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    counters.named_loads = counters.named_loads.saturating_add(1);
+    result
 }
 
 extern "C" fn jit_call_ordinary(
