@@ -5,9 +5,11 @@
 //!
 //! This mirrors the timing protocol in `tools/bench-compare/runner.mjs` so
 //! Boa and node/bun numbers are directly comparable. When built with the
-//! `jit` feature, a fourth `jit` mode reports a warm JIT measurement and a
-//! separate first-call measurement that includes native compilation. JIT mode
-//! can also write a bounded diagnostic snapshot after timing via
+//! `jit` feature, `jit` mode reports a warm JIT measurement and a separate
+//! first-call measurement that includes native compilation. The `osr-cold`
+//! mode performs exactly one production-threshold call in a fresh process
+//! context, with no earlier threshold override or native compilation. Both JIT
+//! modes can write a bounded diagnostic snapshot after timing via
 //! `--jit-diagnostics-out <path>`. The optional
 //! `--jit-diagnostic-record-limit <count>` applies the same requested bound to
 //! every detailed record kind; Boa still enforces its engine-owned hard cap.
@@ -21,6 +23,33 @@ use boa_engine::jit::JIT_DIAGNOSTIC_SCHEMA_VERSION;
 use boa_engine::{
     Context, JsValue, Source, js_string, optimizer::OptimizerOptions, script::Script,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerMode {
+    Interpreter,
+    Jit,
+    OsrCold,
+}
+
+impl RunnerMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "interp" => Ok(Self::Interpreter),
+            "jit" => Ok(Self::Jit),
+            "osr-cold" => Ok(Self::OsrCold),
+            other => Err(format!(
+                "unknown runner mode `{other}`; expected `interp`, `jit`, or `osr-cold`"
+            )),
+        }
+    }
+}
+
+fn validate_mode_invocation(mode: RunnerMode, runs: usize, warmup: usize) -> Result<(), String> {
+    if mode == RunnerMode::OsrCold && (runs != 1 || warmup != 0) {
+        return Err("osr-cold mode requires exactly `runs=1` and `warmup=0`".to_owned());
+    }
+    Ok(())
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -36,8 +65,20 @@ fn main() {
         .get(4)
         .filter(|mode| !mode.is_empty())
         .map(String::as_str)
-        .unwrap_or("interp");
+        .map(RunnerMode::parse)
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            print_usage();
+            process::exit(2);
+        })
+        .unwrap_or(RunnerMode::Interpreter);
     let diagnostic_options = parse_jit_diagnostic_options(&args[5..]).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        print_usage();
+        process::exit(2);
+    });
+    validate_mode_invocation(mode, runs, warmup).unwrap_or_else(|error| {
         eprintln!("{error}");
         print_usage();
         process::exit(2);
@@ -46,14 +87,14 @@ fn main() {
     let code = fs::read_to_string(Path::new(script_path)).expect("read script");
 
     match mode {
-        "interp" if diagnostic_options == JitDiagnosticOptions::default() => {
+        RunnerMode::Interpreter if diagnostic_options == JitDiagnosticOptions::default() => {
             run_interpreter(script_path, &code, runs, warmup);
         }
-        "interp" => {
-            eprintln!("--jit-diagnostics-out is only valid in jit mode");
+        RunnerMode::Interpreter => {
+            eprintln!("--jit-diagnostics-out is only valid in a JIT mode");
             process::exit(2);
         }
-        "jit" => {
+        RunnerMode::Jit => {
             #[cfg(feature = "jit")]
             run_jit(
                 script_path,
@@ -69,16 +110,28 @@ fn main() {
                 process::exit(2);
             }
         }
-        other => {
-            eprintln!("unknown runner mode `{other}`; expected `interp` or `jit`");
-            process::exit(2);
+        RunnerMode::OsrCold => {
+            #[cfg(feature = "jit")]
+            run_osr_cold(
+                script_path,
+                &code,
+                diagnostic_options.output.map(Path::new),
+                diagnostic_options.record_limit,
+            );
+            #[cfg(not(feature = "jit"))]
+            {
+                eprintln!(
+                    "osr-cold mode requires building bench-compare-runner with `--features jit`"
+                );
+                process::exit(2);
+            }
         }
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: runner-boa <script.js> [runs] [warmup] [interp|jit] \
+        "usage: runner-boa <script.js> [runs] [warmup] [interp|jit|osr-cold] \
          [--jit-diagnostics-out <path>] \
          [--jit-diagnostic-record-limit <count>]"
     );
@@ -182,6 +235,121 @@ fn main_function(context: &mut Context, script_path: &str) -> boa_engine::object
         .unwrap_or_else(|_| panic!("no main in {script_path}"))
         .as_callable()
         .unwrap_or_else(|| panic!("main is not callable in {script_path}"))
+}
+
+#[cfg(feature = "jit")]
+struct OsrColdSample {
+    elapsed_ns: u128,
+    acc: i32,
+    stats: boa_engine::jit::JitStats,
+    diagnostics: Option<boa_engine::jit::JitDiagnosticSnapshot>,
+}
+
+/// Execute one production-threshold call without any earlier native work in
+/// this context. The process-level protocol launches this mode directly, so
+/// Cranelift and the loop cache are cold when the timer begins.
+#[cfg(feature = "jit")]
+fn collect_osr_cold_sample(
+    script_path: &str,
+    code: &str,
+    diagnostic_limits: Option<boa_engine::jit::JitDiagnosticLimits>,
+) -> OsrColdSample {
+    let context = &mut Context::default();
+    context.set_optimizer_options(OptimizerOptions::empty());
+    register_runtime(context);
+
+    let script = parse_script(code, context);
+    script.codeblock(context).unwrap();
+    script.evaluate(context).unwrap();
+    let function = main_function(context, script_path);
+    if let Some(limits) = diagnostic_limits {
+        context.enable_jit_diagnostics(limits);
+    } else {
+        context.enable_jit();
+    }
+
+    let start = Instant::now();
+    let value = function.call(&JsValue::undefined(), &[], context).unwrap();
+    let elapsed_ns = start.elapsed().as_nanos();
+    let acc = value.to_i32(context).unwrap_or(0);
+    let stats = context.jit_stats().expect("JIT stats");
+    let diagnostics =
+        diagnostic_limits.map(|_| context.jit_diagnostic_snapshot().expect("JIT diagnostics"));
+
+    OsrColdSample {
+        elapsed_ns,
+        acc,
+        stats,
+        diagnostics,
+    }
+}
+
+#[cfg(feature = "jit")]
+fn run_osr_cold(
+    script_path: &str,
+    code: &str,
+    diagnostics_out: Option<&Path>,
+    diagnostic_record_limit: Option<usize>,
+) {
+    let diagnostic_limits = diagnostics_out.map(|_| jit_diagnostic_limits(diagnostic_record_limit));
+    let sample = collect_osr_cold_sample(script_path, code, diagnostic_limits);
+    let stats = sample.stats;
+    let osr = stats.osr;
+    let total_compile_time_ns = stats.compile_time_ns.saturating_add(osr.compile_time_ns);
+    let function_native_entries = stats.native_entries.saturating_sub(osr.entries);
+
+    println!(
+        concat!(
+            "elapsed_ns={} runs=1 ns_per_run={} acc={} mode=osr-cold ",
+            "total_compile_time_ns={} function_compile_time_ns={} ",
+            "compilations={} native_compilations={} shim_compilations={} ",
+            "function_entries={} native_entries={} function_native_entries={} deopts={} ",
+            "loop_backedges={} hotness_threshold_crossings={} ",
+            "osr_cache_requests={} osr_cache_hits={} osr_cache_misses={} ",
+            "osr_hotness_crossings={} osr_compile_attempts={} ",
+            "osr_compilations={} osr_entries={} osr_entry_rejections={} ",
+            "osr_continuations={} osr_deopts={} osr_compile_time_ns={} ",
+            "osr_code_bytes={}"
+        ),
+        sample.elapsed_ns,
+        sample.elapsed_ns,
+        sample.acc,
+        total_compile_time_ns,
+        stats.compile_time_ns,
+        stats.compilations,
+        stats.native_compilations,
+        stats.shim_compilations,
+        stats.function_entries,
+        stats.native_entries,
+        function_native_entries,
+        stats.deopts,
+        stats.loop_backedges,
+        stats.hotness_threshold_crossings,
+        osr.cache_requests,
+        osr.cache_hits,
+        osr.cache_misses,
+        osr.hotness_crossings,
+        osr.compile_attempts,
+        osr.compilations,
+        osr.entries,
+        osr.entry_rejections,
+        osr.continuations,
+        osr.deopts,
+        osr.compile_time_ns,
+        osr.code_bytes,
+    );
+
+    if let (Some(output), Some(snapshot)) = (diagnostics_out, sample.diagnostics) {
+        let report = JitOsrColdDiagnosticReport {
+            schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
+            mode: "osr-cold",
+            runs: 1,
+            warmup: 0,
+            sample: snapshot,
+        };
+        let json = serde_json::to_vec_pretty(&report).expect("serialize JIT diagnostics");
+        fs::write(output, json).expect("write JIT diagnostics");
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -340,9 +508,97 @@ struct JitDiagnosticReport {
     warm: boa_engine::jit::JitDiagnosticSnapshot,
 }
 
+#[cfg(feature = "jit")]
+#[derive(serde::Serialize)]
+struct JitOsrColdDiagnosticReport {
+    schema_version: u32,
+    mode: &'static str,
+    runs: usize,
+    warmup: usize,
+    sample: boa_engine::jit::JitDiagnosticSnapshot,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{JitDiagnosticOptions, parse_jit_diagnostic_options};
+    use super::{
+        JitDiagnosticOptions, RunnerMode, parse_jit_diagnostic_options, validate_mode_invocation,
+    };
+
+    #[test]
+    fn parses_and_validates_isolated_osr_mode() {
+        assert_eq!(RunnerMode::parse("interp"), Ok(RunnerMode::Interpreter));
+        assert_eq!(RunnerMode::parse("jit"), Ok(RunnerMode::Jit));
+        assert_eq!(RunnerMode::parse("osr-cold"), Ok(RunnerMode::OsrCold));
+        assert!(RunnerMode::parse("cold").is_err());
+
+        assert_eq!(validate_mode_invocation(RunnerMode::OsrCold, 1, 0), Ok(()));
+        assert!(validate_mode_invocation(RunnerMode::OsrCold, 2, 0).is_err());
+        assert!(validate_mode_invocation(RunnerMode::OsrCold, 1, 1).is_err());
+        assert_eq!(validate_mode_invocation(RunnerMode::Jit, 2, 1), Ok(()));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn isolated_osr_sample_uses_production_thresholds_without_function_jit() {
+        let source = r#"
+            function main() {
+                Math.abs(300);
+                let total = 0.5;
+                for (let i = 0; i < 300; i++) {
+                    total = total + i;
+                }
+                return total;
+            }
+        "#;
+        let sample = super::collect_osr_cold_sample("isolated-osr.js", source, None);
+
+        assert_eq!(sample.acc, 44_850);
+        assert_eq!(sample.stats.function_entries, 1);
+        assert_eq!(sample.stats.compilations, 0);
+        assert_eq!(sample.stats.native_entries, 1);
+        assert_eq!(sample.stats.osr.compile_attempts, 1);
+        assert_eq!(sample.stats.osr.compilations, 1);
+        assert_eq!(sample.stats.osr.entries, 1);
+        assert_eq!(
+            sample
+                .stats
+                .native_entries
+                .saturating_sub(sample.stats.osr.entries),
+            0
+        );
+        assert_eq!(sample.stats.osr.continuations, 1);
+        assert_eq!(sample.stats.osr.entry_rejections, 0);
+        assert_eq!(sample.stats.osr.deopts, 0);
+        assert!(sample.diagnostics.is_none());
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn isolated_osr_diagnostic_sample_is_bounded_and_zero_drop() {
+        let source = r#"
+            function main() {
+                Math.abs(300);
+                let total = 0.5;
+                for (let i = 0; i < 300; i++) {
+                    total = total + i;
+                }
+                return total;
+            }
+        "#;
+        let limits = boa_engine::jit::JitDiagnosticLimits::default();
+        let sample = super::collect_osr_cold_sample("isolated-osr.js", source, Some(limits));
+        let diagnostics = sample.diagnostics.expect("diagnostic snapshot");
+
+        assert_eq!(diagnostics.limits, limits);
+        assert_eq!(diagnostics.osr.compilations, 1);
+        assert_eq!(diagnostics.osr.entries, 1);
+        assert_eq!(diagnostics.dropped_compile_records, 0);
+        assert_eq!(diagnostics.dropped_admission_records, 0);
+        assert_eq!(diagnostics.dropped_exit_records, 0);
+        assert_eq!(diagnostics.dropped_call_observations, 0);
+        assert_eq!(diagnostics.dropped_loop_observations, 0);
+        assert_eq!(diagnostics.dropped_storage_observations, 0);
+    }
 
     #[test]
     fn parses_optional_jit_diagnostics() {
