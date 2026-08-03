@@ -361,12 +361,14 @@ Land the shape through these independently reversible boundaries:
    breakers only after the unavoidable result. Schema 8 exposes one fixed
    source-free aggregate and the exit taxonomy, not page-sized records. No
    loop artifact is stored or invoked.
-3. **4A1.3 — separate uniform-mode compiler (next).** Compile only a proven
-   `LoopRegionPlan`; strictly guard and load every live-in; lower the planned
-   numeric instructions; materialize each path-specific exit; and encode only
-   metadata-validated `EntryRejected`, `Continuation(LoopExit)`, deopt, budget,
-   or completion results. Compilation tests call the compiler directly. The
-   runtime scheduler must still have no path to invoke the artifact.
+3. **4A1.3 — separate uniform-mode compiler (complete, Boa `c2885afe`).** The
+   compiler revalidates the complete immutable `LoopRegionPlan`, strictly
+   guards and loads every live-in, lowers only the planned numeric/control-flow
+   instructions, and materializes the exact continuation or replay state. Six
+   direct-harness tests cover F64 continuation, strict pre-effect entry guards,
+   I32 overflow and finite-budget replay, negative-zero multiplication,
+   malformed-plan terminal rejection, and rejection of a cold exact key. The
+   bounded cache still has no production lookup or invocation edge.
 4. **4A1.4 — exact post-backedge scheduler wiring.** Observe the already
    charged canonical latch, compile synchronously at the reviewed safe
    boundary, invoke only a complete cached artifact, and use a separate
@@ -389,10 +391,12 @@ the planner's existing maps without widening the opcode set, adding mixed-mode
 SSA, boxing the whole frame, or accepting an unvalidated resume PC, stop and
 revise the ABI rather than folding the exception into scheduler wiring.
 
-**4A1.3 stop/go:** the direct compiler harness must preserve the selected
-fractional-accumulator result and exact path-specific continuation state in
-both budget modes, while malformed plans and lowering failures leave no
-invokable cache entry. Only then may 4A1.4 add the production invocation edge.
+**4A1.3 stop/go: passed.** The direct compiler harness preserves the selected
+fractional-accumulator result and exact path-specific continuation state,
+proves budget and loop-state materialization at native exits, and leaves
+malformed or cold plans uncached. The complete engine suite remains green and
+strict Clippy has no slice-local delta. 4A1.4 may now add only the reviewed
+production invocation edge.
 
 **Slice 4A1 stop/go:** a one-shot hot loop must show OSR execution and pass the
 full OSR test set; otherwise leave OSR disabled and diagnose the
@@ -401,7 +405,6 @@ materialization gap.
 Remaining suggested commits:
 
 ```text
-feat(jit): compile guarded loop OSR regions
 perf(jit): enter hot loop regions with guarded OSR
 test(jit): close loop OSR differential gates
 refactor(jit): consolidate loop region exit plumbing

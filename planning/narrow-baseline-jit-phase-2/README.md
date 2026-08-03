@@ -47,9 +47,11 @@ Slice 4A0's ownership/materialization/budget design review is complete. Slice
 4A1.2 retains bounded per-region hotness/terminal state, source-free schema-8
 diagnostics, capacity/circuit-breaker policy, and the entry/continuation exit
 taxonomy. Neither slice can emit or invoke a loop artifact. Slice 4A1.3 is the
-next bounded step: a separate uniform-mode region compiler that remains
-unreachable from the scheduler until its generated entry, materialization,
-and continuation paths pass focused tests.
+now complete in Boa `c2885afe`: a separate uniform-mode region compiler
+strictly guards planned live-ins, preserves exact budget/replay state, and
+materializes its validated continuation. Its bounded cache remains unreachable
+from the production scheduler. Slice 4A1.4 is next: connect that artifact only
+at the reviewed post-backedge ownership boundary.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -145,7 +147,11 @@ Every Phase 2 entry and exit ABI inherits that rule.
     allocation-free new-site suppression at capacity, 1 MiB/10 ms post-attempt
     circuit breakers, schema-8 aggregate counters, and inert exit taxonomy;
     Ligero `c05557ed` projects schema 8. **Next:** Slice 4A1.3's separate region
-    compiler, still without scheduler invocation.
+    compiler, still without scheduler invocation. **Compiler complete:** Boa
+    `c2885afe` revalidates the immutable plan, emits guarded uniform-mode loop
+    artifacts, and proves entry rejection, continuation materialization,
+    finite-budget/replay behavior, and terminal uncached rejection through a
+    direct harness. **Next:** Slice 4A1.4's exact post-backedge invocation edge.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
@@ -218,6 +224,10 @@ showing that another boundary dominates.
 - [Slice 4A1 planner and metadata checkpoint, 2026-08-03](21-slice-4a1-planner-metadata-checkpoint-2026-08-03.md)
   — the landed pure planner, bounded per-region state and schema-8 diagnostics,
   verified non-invocation boundary, and the narrowed Slice 4A1.3 compiler gate.
+- [Slice 4A1 region compiler checkpoint, 2026-08-03](22-slice-4a1-region-compiler-checkpoint-2026-08-03.md)
+  — the guarded uniform-mode compiler, direct entry/exit harness, exact replay
+  and continuation evidence, negative-zero correction, and the remaining
+  production non-invocation boundary before Slice 4A1.4.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
