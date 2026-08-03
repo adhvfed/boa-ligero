@@ -238,9 +238,11 @@ impl Call {
         if backend_id == 0 {
             return ControlFlow::Continue(());
         }
-        if context.vm.frame().code_block.jit_admission(backend_id)
-            != crate::vm::JitAdmissionState::DeniedLeaf
-        {
+        let admission = context.vm.frame().code_block.jit_admission(backend_id);
+        let may_run_directly = admission == crate::vm::JitAdmissionState::DeniedLeaf
+            || (admission == crate::vm::JitAdmissionState::DeniedNoLoop
+                && !context.active_jit_observes_interpreted_sites);
+        if !may_run_directly {
             return ControlFlow::Continue(());
         }
 

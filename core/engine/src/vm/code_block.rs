@@ -25,6 +25,9 @@ pub(crate) enum JitAdmissionState {
     Allowed,
     Denied,
     DeniedLeaf,
+    /// Native entry is denied and static bytecode contains no backward edge,
+    /// so this frame can never become eligible for loop OSR.
+    DeniedNoLoop,
 }
 
 #[cfg(feature = "jit")]
@@ -38,11 +41,11 @@ pub(crate) struct JitTieringCache {
 #[cfg(feature = "jit")]
 impl JitTieringCache {
     const fn scoped(self, backend_id: u64) -> Self {
-        if self.tagged >> 2 == backend_id {
+        if self.tagged >> 3 == backend_id {
             self
         } else {
             Self {
-                tagged: backend_id << 2,
+                tagged: backend_id << 3,
                 function_entries: 0,
                 loop_backedges: 0,
             }
@@ -50,20 +53,21 @@ impl JitTieringCache {
     }
 
     const fn state(self, backend_id: u64) -> JitAdmissionState {
-        if self.tagged >> 2 != backend_id {
+        if self.tagged >> 3 != backend_id {
             return JitAdmissionState::Unknown;
         }
-        match self.tagged & 0b11 {
+        match self.tagged & 0b111 {
             1 => JitAdmissionState::Allowed,
             2 => JitAdmissionState::Denied,
             3 => JitAdmissionState::DeniedLeaf,
+            4 => JitAdmissionState::DeniedNoLoop,
             _ => JitAdmissionState::Unknown,
         }
     }
 
     const fn with_state(self, backend_id: u64, state: JitAdmissionState) -> Self {
         let mut scoped = self.scoped(backend_id);
-        scoped.tagged = (backend_id << 2) | state as u64;
+        scoped.tagged = (backend_id << 3) | state as u64;
         scoped
     }
 

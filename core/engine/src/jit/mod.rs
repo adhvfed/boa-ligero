@@ -1892,12 +1892,14 @@ impl JitBackend {
 
         match code.jit_admission(self.id) {
             JitAdmissionState::Allowed => return true,
-            JitAdmissionState::Denied | JitAdmissionState::DeniedLeaf => return false,
+            JitAdmissionState::Denied
+            | JitAdmissionState::DeniedLeaf
+            | JitAdmissionState::DeniedNoLoop => return false,
             JitAdmissionState::Unknown => {}
         }
 
         let analysis = native::admission_profile(code, self.diagnostics.is_some());
-        let (allowed, state, reason, profile, rejection) = match analysis {
+        let (allowed, mut state, reason, profile, rejection) = match analysis {
             Ok(profile)
                 if profile.call_instructions > 0 && !self.admission_allow_call_boundaries =>
             {
@@ -1951,6 +1953,12 @@ impl JitBackend {
                 Some(rejection),
             ),
         };
+        if !allowed
+            && state == JitAdmissionState::Denied
+            && !Self::has_observable_loop_backedge(code)
+        {
+            state = JitAdmissionState::DeniedNoLoop;
+        }
         code.set_jit_admission(self.id, state);
         if !allowed {
             self.stats.admission_denials = self.stats.admission_denials.saturating_add(1);
@@ -2134,6 +2142,17 @@ impl JitBackend {
                     }
                     _ => same_frame_jump_target(&instruction) == Some(0),
                 }
+        })
+    }
+
+    /// Whether static bytecode contains an explicit same-frame backward edge
+    /// that the interpreter can report to the loop scheduler.
+    pub(crate) fn has_observable_loop_backedge(code: &CodeBlock) -> bool {
+        InstructionIterator::new(&code.bytecode).any(|(pc, _, instruction)| match &instruction {
+            Instruction::JumpTable { addresses, .. } => addresses
+                .iter()
+                .any(|address| (address.as_u32() as usize) < pc),
+            _ => same_frame_jump_target(&instruction).is_some_and(|target| (target as usize) < pc),
         })
     }
 
@@ -3379,7 +3398,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_property_reader_with_getter_is_not_classified_as_leaf() {
+    fn denied_property_reader_with_getter_closes_impossible_loop_osr() {
         let mut context = Context::default();
         context.enable_jit();
         context
@@ -3409,11 +3428,46 @@ mod tests {
         assert_eq!(result.as_i32(), Some(45));
         assert_eq!(
             read_code.jit_admission(backend_id),
-            crate::vm::JitAdmissionState::Denied
+            crate::vm::JitAdmissionState::DeniedNoLoop
         );
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn denied_native_entry_with_a_backward_edge_still_schedules_loop_osr() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: 1,
+            loop_backedges: 1,
+        });
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { this; let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } sum(10)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+        let top_level = script.codeblock(&mut context).expect("top-level codeblock");
+        let GlobalFunctionBinding { function_index, .. } = top_level.global_fns[0];
+        let sum_code = top_level.constant_function(function_index as usize);
+        let backend_id = context.jit_backend.as_ref().expect("JIT backend").id();
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(45));
+        assert_eq!(
+            sum_code.jit_admission(backend_id),
+            crate::vm::JitAdmissionState::Denied
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.native_compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.osr.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.entries, 1, "stats: {stats:?}");
+        assert_eq!(stats.osr.continuations, 1, "stats: {stats:?}");
     }
 
     #[test]

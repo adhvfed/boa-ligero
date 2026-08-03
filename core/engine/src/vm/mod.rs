@@ -1449,14 +1449,19 @@ impl Context {
     pub(crate) fn run(&mut self) -> CompletionRecord {
         let Some(mut backend) = self.jit_backend.take() else {
             let outer_backend_id = std::mem::replace(&mut self.active_jit_backend_id, 0);
+            let outer_observation =
+                std::mem::replace(&mut self.active_jit_observes_interpreted_sites, false);
             let record = self.run_interpreter();
             self.active_jit_backend_id = outer_backend_id;
+            self.active_jit_observes_interpreted_sites = outer_observation;
             return record;
         };
 
         self.active_jit_backend_id = backend.id();
+        self.active_jit_observes_interpreted_sites = backend.observes_interpreted_sites();
         let record = self.run_with_jit_backend(&mut backend);
         self.active_jit_backend_id = 0;
+        self.active_jit_observes_interpreted_sites = false;
         if !backend.is_compromised() {
             self.jit_backend = Some(backend);
         }
@@ -1474,7 +1479,9 @@ impl Context {
             let frame = self.vm.frame();
             let admission_denied = matches!(
                 frame.code_block.jit_admission(backend.id()),
-                JitAdmissionState::Denied | JitAdmissionState::DeniedLeaf
+                JitAdmissionState::Denied
+                    | JitAdmissionState::DeniedLeaf
+                    | JitAdmissionState::DeniedNoLoop
             );
             let entry_code = if frame.jit_entry_counted() {
                 None
@@ -1489,6 +1496,11 @@ impl Context {
             // after a deopt at a later PC; the interpreter is the continuation.
             if admission_denied {
                 self.vm.frame_mut().mark_jit_entry_attempted();
+                if self.vm.frame().code_block.jit_admission(backend.id())
+                    == JitAdmissionState::DeniedNoLoop
+                {
+                    self.vm.frame_mut().mark_jit_osr_closed();
+                }
             } else if self.vm.frame().pc == 0 && !self.vm.frame().jit_entry_attempted() {
                 let code = entry_code.unwrap_or_else(|| self.vm.frame().code_block.clone());
                 if backend.is_hot(&code) {

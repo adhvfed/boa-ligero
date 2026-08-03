@@ -118,6 +118,12 @@ pub struct Context {
     #[cfg(feature = "jit")]
     pub(crate) active_jit_backend_id: u64,
 
+    /// Whether the active scheduler must retain per-opcode interpreter
+    /// observations. Kept beside the backend token because the backend itself
+    /// is temporarily moved out of the context while opcode handlers run.
+    #[cfg(feature = "jit")]
+    pub(crate) active_jit_observes_interpreted_sites: bool,
+
     pub(crate) kept_alive: Vec<JsObject>,
 
     can_block: bool,
@@ -1366,6 +1372,8 @@ impl ContextBuilder {
             jit_backend: None,
             #[cfg(feature = "jit")]
             active_jit_backend_id: 0,
+            #[cfg(feature = "jit")]
+            active_jit_observes_interpreted_sites: false,
             strict: false,
             #[cfg(feature = "temporal")]
             timezone_provider: if let Some(provider) = self.timezone_provider {
