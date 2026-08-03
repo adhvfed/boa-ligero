@@ -112,6 +112,12 @@ pub struct Context {
     #[cfg(feature = "jit")]
     pub(crate) jit_backend: Option<crate::jit::JitBackend>,
 
+    /// Backend generation currently driving `Context::run`. The backend is
+    /// temporarily moved out of the context while the scheduler executes, so
+    /// opcode handlers use this token to reject stale admission decisions.
+    #[cfg(feature = "jit")]
+    pub(crate) active_jit_backend_id: u64,
+
     pub(crate) kept_alive: Vec<JsObject>,
 
     can_block: bool,
@@ -1358,6 +1364,8 @@ impl ContextBuilder {
             vm,
             #[cfg(feature = "jit")]
             jit_backend: None,
+            #[cfg(feature = "jit")]
+            active_jit_backend_id: 0,
             strict: false,
             #[cfg(feature = "temporal")]
             timezone_provider: if let Some(provider) = self.timezone_provider {

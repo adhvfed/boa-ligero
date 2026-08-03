@@ -17,6 +17,43 @@ use itertools::Itertools;
 use std::{cell::Cell, fmt::Display, fmt::Write as _};
 use thin_vec::ThinVec;
 
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum JitAdmissionState {
+    #[default]
+    Unknown,
+    Allowed,
+    Denied,
+    DeniedLeaf,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JitAdmissionCache {
+    tagged: u64,
+}
+
+#[cfg(feature = "jit")]
+impl JitAdmissionCache {
+    const fn new(backend_id: u64, state: JitAdmissionState) -> Self {
+        Self {
+            tagged: (backend_id << 2) | state as u64,
+        }
+    }
+
+    const fn state(self, backend_id: u64) -> JitAdmissionState {
+        if self.tagged >> 2 != backend_id {
+            return JitAdmissionState::Unknown;
+        }
+        match self.tagged & 0b11 {
+            1 => JitAdmissionState::Allowed,
+            2 => JitAdmissionState::Denied,
+            3 => JitAdmissionState::DeniedLeaf,
+            _ => JitAdmissionState::Unknown,
+        }
+    }
+}
+
 use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator},
@@ -176,6 +213,13 @@ pub struct CodeBlock {
     // Used for identifying anonymous functions in compiled output and call frames.
     pub(crate) debug_id: u64,
 
+    /// Cached context-tier admission result, scoped to the backend generation
+    /// that selected it. Later frames can bypass tiering maps without carrying
+    /// a decision across disable/re-enable or another context.
+    #[cfg(feature = "jit")]
+    #[unsafe_ignore_trace]
+    pub(crate) jit_admission: Cell<JitAdmissionCache>,
+
     #[cfg(feature = "trace")]
     #[unsafe_ignore_trace]
     pub(crate) traced: Cell<bool>,
@@ -210,6 +254,8 @@ impl CodeBlock {
             global_fns: Box::default(),
             global_vars: Box::default(),
             debug_id: CodeBlock::get_next_codeblock_id(),
+            #[cfg(feature = "jit")]
+            jit_admission: Cell::new(JitAdmissionCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         }
@@ -294,6 +340,19 @@ impl CodeBlock {
     /// Returns true if this function an async function.
     pub(crate) fn is_ordinary(&self) -> bool {
         !self.is_async() && !self.is_generator()
+    }
+
+    /// Return this code block's admission decision for `backend_id`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_admission(&self, backend_id: u64) -> JitAdmissionState {
+        self.jit_admission.get().state(backend_id)
+    }
+
+    /// Cache an admission decision for one backend generation.
+    #[cfg(feature = "jit")]
+    pub(crate) fn set_jit_admission(&self, backend_id: u64, state: JitAdmissionState) {
+        self.jit_admission
+            .set(JitAdmissionCache::new(backend_id, state));
     }
 
     /// Returns true if this function has the `"prototype"` property when function object is created.

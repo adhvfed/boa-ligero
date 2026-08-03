@@ -44,6 +44,8 @@ pub use {
 pub(crate) use call_frame::BindingReference;
 
 pub(crate) use code_block::GlobalFunctionBinding;
+#[cfg(feature = "jit")]
+pub(crate) use code_block::{JitAdmissionCache, JitAdmissionState};
 
 mod call_frame;
 mod code_block;
@@ -1167,13 +1169,86 @@ impl Context {
         CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
     }
 
+    /// Run a statically call-free, admission-denied frame through the ordinary
+    /// interpreter until it returns or unexpectedly enters another frame.
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_interpreter_until_frame_exit(
+        &mut self,
+        frame_depth: usize,
+    ) -> ControlFlow<CompletionRecord> {
+        while self.vm.frames.len() == frame_depth {
+            let frame = self.vm.frame();
+            let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
+                return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
+                    JsNativeError::error(),
+                )));
+            };
+            let opcode = Opcode::decode(*byte);
+
+            if let ControlFlow::Break(value) = self.execute_one(
+                |context, opcode| {
+                    let frame = context.vm.frame();
+                    let pc = frame.pc as usize;
+
+                    OPCODE_HANDLERS[opcode as usize](context, pc)
+                },
+                opcode,
+            ) {
+                return ControlFlow::Break(value);
+            }
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    /// Run a permanently admission-denied frame until an opcode leaves its
+    /// frame depth. Call-free denied callees complete inside the `Call`
+    /// handler; an unknown or admitted callee changes depth and returns control
+    /// to the tiering scheduler before its first bytecode executes.
+    #[cfg(feature = "jit")]
+    fn run_dormant_interpreter_until_frame_change(
+        &mut self,
+        frame_depth: usize,
+    ) -> ControlFlow<CompletionRecord> {
+        loop {
+            let frame = self.vm.frame();
+            let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
+                return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
+                    JsNativeError::error(),
+                )));
+            };
+            let opcode = Opcode::decode(*byte);
+
+            if let ControlFlow::Break(value) = self.execute_one(
+                |context, opcode| {
+                    let frame = context.vm.frame();
+                    let pc = frame.pc as usize;
+
+                    OPCODE_HANDLERS[opcode as usize](context, pc)
+                },
+                opcode,
+            ) {
+                return ControlFlow::Break(value);
+            }
+
+            if self.vm.frames.len() != frame_depth {
+                return ControlFlow::Continue(());
+            }
+        }
+    }
+
     #[cfg(feature = "jit")]
     pub(crate) fn run(&mut self) -> CompletionRecord {
         let Some(mut backend) = self.jit_backend.take() else {
-            return self.run_interpreter();
+            let outer_backend_id = std::mem::replace(&mut self.active_jit_backend_id, 0);
+            let record = self.run_interpreter();
+            self.active_jit_backend_id = outer_backend_id;
+            return record;
         };
 
+        self.active_jit_backend_id = backend.id();
         let record = self.run_with_jit_backend(&mut backend);
+        self.active_jit_backend_id = 0;
         self.jit_backend = Some(backend);
         record
     }
@@ -1187,22 +1262,30 @@ impl Context {
     fn run_with_jit_backend(&mut self, backend: &mut crate::jit::JitBackend) -> CompletionRecord {
         'scheduler: loop {
             let frame = self.vm.frame();
-            let entry_code = if !frame.jit_entry_counted() {
-                self.vm.frame_mut().mark_jit_entry_counted();
-                let code = self.vm.frame().code_block.clone();
-                backend.record_function_entry(&code);
-                Some(code)
-            } else {
+            let admission_denied = matches!(
+                frame.code_block.jit_admission(backend.id()),
+                JitAdmissionState::Denied | JitAdmissionState::DeniedLeaf
+            );
+            let entry_code = if frame.jit_entry_counted() {
                 None
+            } else {
+                self.vm.frame_mut().mark_jit_entry_counted();
+                backend.record_function_entry(self.vm.frame().code_block.as_ref());
+                (!admission_denied).then(|| self.vm.frame().code_block.clone())
             };
 
             // The initial compiled entry starts at PC zero and runs the whole
             // CodeBlock until it returns, breaks, or deopts. Never restart it
             // after a deopt at a later PC; the interpreter is the continuation.
-            if self.vm.frame().pc == 0 && !self.vm.frame().jit_entry_attempted() {
+            if admission_denied {
+                self.vm.frame_mut().mark_jit_entry_attempted();
+            } else if self.vm.frame().pc == 0 && !self.vm.frame().jit_entry_attempted() {
                 let code = entry_code.unwrap_or_else(|| self.vm.frame().code_block.clone());
                 if backend.is_hot(&code) {
                     self.vm.frame_mut().mark_jit_entry_attempted();
+                    if !backend.admit_function_entry(&code) {
+                        continue;
+                    }
                     let status = backend.invoke_cached_entry(&code, self);
 
                     if status & crate::jit::JIT_BREAK_BIT != 0 {
@@ -1242,6 +1325,28 @@ impl Context {
                 }
             }
 
+            match self.vm.frame().code_block.jit_admission(backend.id()) {
+                JitAdmissionState::DeniedLeaf => {
+                    let frame_depth = self.vm.frames.len();
+                    if let ControlFlow::Break(value) =
+                        self.run_interpreter_until_frame_exit(frame_depth)
+                    {
+                        return value;
+                    }
+                    continue 'scheduler;
+                }
+                JitAdmissionState::Denied => {
+                    let frame_depth = self.vm.frames.len();
+                    if let ControlFlow::Break(value) =
+                        self.run_dormant_interpreter_until_frame_change(frame_depth)
+                    {
+                        return value;
+                    }
+                    continue 'scheduler;
+                }
+                JitAdmissionState::Unknown | JitAdmissionState::Allowed => {}
+            }
+
             // Once this frame has passed its one entry decision, keep it on the
             // ordinary interpreter dispatch path. Tiering only needs control
             // again when an opcode pushes or pops a frame, or when a backward
@@ -1260,6 +1365,7 @@ impl Context {
                 let opcode = Opcode::decode(*byte);
 
                 if opcode == Opcode::Call
+                    && !self.vm.frame().jit_entry_attempted()
                     && let (Instruction::Call { argument_count }, _) = self
                         .vm
                         .frame()
@@ -1285,6 +1391,22 @@ impl Context {
                 }
 
                 if self.vm.frames.len() != old_frame_depth {
+                    if self.vm.frames.len() == old_frame_depth + 1
+                        && self.vm.frame().code_block.jit_admission(backend.id())
+                            == JitAdmissionState::DeniedLeaf
+                    {
+                        self.vm.frame_mut().mark_jit_entry_counted();
+                        self.vm.frame_mut().mark_jit_entry_attempted();
+                        backend.record_function_entry(self.vm.frame().code_block.as_ref());
+                        if let ControlFlow::Break(value) =
+                            self.run_interpreter_until_frame_exit(old_frame_depth + 1)
+                        {
+                            return value;
+                        }
+                        if self.vm.frames.len() == old_frame_depth {
+                            continue;
+                        }
+                    }
                     continue 'scheduler;
                 }
 

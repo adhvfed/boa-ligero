@@ -1,4 +1,4 @@
-use std::{cell::RefCell, mem::MaybeUninit};
+use std::{cell::RefCell, mem::MaybeUninit, ops::ControlFlow};
 
 use boa_string::JsString;
 use dynify::Dynify;
@@ -183,7 +183,19 @@ pub(crate) struct Call;
 
 impl Call {
     #[inline(always)]
-    pub(super) fn operation(argument_count: IndexOperand, context: &mut Context) -> JsResult<()> {
+    pub(super) fn operation(
+        argument_count: IndexOperand,
+        context: &mut Context,
+    ) -> ControlFlow<crate::vm::CompletionRecord> {
+        match Self::try_call(argument_count, context) {
+            Ok(false) => Self::run_denied_leaf(context),
+            Ok(true) => ControlFlow::Continue(()),
+            Err(error) => context.handle_error(error),
+        }
+    }
+
+    #[inline(always)]
+    fn try_call(argument_count: IndexOperand, context: &mut Context) -> JsResult<bool> {
         let argument_count = usize::from(argument_count);
         let func = context
             .vm
@@ -214,13 +226,34 @@ impl Call {
                 argument_count,
                 &mut InternalMethodCallContext::new(context),
             )?
-            .resolve(context)
-            .map(drop);
+            .resolve(context);
         }
 
-        object.__call__(argument_count).resolve(context)?;
+        object.__call__(argument_count).resolve(context)
+    }
 
-        Ok(())
+    #[cfg(feature = "jit")]
+    fn run_denied_leaf(context: &mut Context) -> ControlFlow<crate::vm::CompletionRecord> {
+        let backend_id = context.active_jit_backend_id;
+        if backend_id == 0 {
+            return ControlFlow::Continue(());
+        }
+        if context.vm.frame().code_block.jit_admission(backend_id)
+            != crate::vm::JitAdmissionState::DeniedLeaf
+        {
+            return ControlFlow::Continue(());
+        }
+
+        let frame_depth = context.vm.frames.len();
+        context.vm.frame_mut().mark_jit_entry_counted();
+        context.vm.frame_mut().mark_jit_entry_attempted();
+        context.run_interpreter_until_frame_exit(frame_depth)
+    }
+
+    #[cfg(not(feature = "jit"))]
+    #[inline(always)]
+    fn run_denied_leaf(_: &mut Context) -> ControlFlow<crate::vm::CompletionRecord> {
+        ControlFlow::Continue(())
     }
 
     #[cold]

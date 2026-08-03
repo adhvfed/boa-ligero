@@ -24,9 +24,12 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 mod native;
+
+static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
 /// High bit of a shim's `u64` return value: set means the op broke (a
 /// [`CompletionRecord`] was stashed in `vm.jit_pending`); clear means continue,
@@ -154,6 +157,9 @@ pub struct JitStats {
     pub native_entries: u64,
     /// Number of native entries that returned to the interpreter.
     pub deopts: u64,
+    /// Number of static context-tier admission decisions that kept a code
+    /// block on the interpreter path.
+    pub admission_denials: u64,
     /// Nanoseconds spent compiling generated entries.
     pub compile_time_ns: u128,
 }
@@ -511,6 +517,7 @@ fn same_frame_jump_target(instr: &Instruction) -> Option<u32> {
 /// keep it alive for as long as any compiled function pointer is in use. The
 /// real tier will hold one of these per realm.
 pub struct JitBackend {
+    id: u64,
     pub(super) module: JITModule,
     /// Monotonic counter for unique symbol names. `JITModule::declare_function`
     /// deduplicates by name, so reusing a fixed name (e.g. "`jit_codeblock`")
@@ -529,6 +536,7 @@ pub struct JitBackend {
     /// function with the same calling convention.
     call_targets: FxHashMap<(u64, u32), u64>,
     thresholds: JitThresholds,
+    admission_min_straight_line_instructions: u32,
     stats: JitStats,
     diagnostics: Option<JitDiagnosticState>,
 }
@@ -540,6 +548,12 @@ impl std::fmt::Debug for JitBackend {
 }
 
 impl JitBackend {
+    /// Straight-line native bodies below this size did not amortize their
+    /// entry transition in the measured Phase 2 crossover. Backward-branch
+    /// bodies remain eligible because their work can stay native across loop
+    /// iterations.
+    const MIN_STRAIGHT_LINE_INSTRUCTIONS: u32 = 45;
+
     /// Build a JIT backend configured for the host ISA.
     ///
     /// # Panics
@@ -557,12 +571,14 @@ impl JitBackend {
             .expect("valid ISA flags");
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         Self {
+            id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
             module: JITModule::new(builder),
             next_fn_id: 0,
             cache: FxHashMap::default(),
             hotness: FxHashMap::default(),
             call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
+            admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
             stats: JitStats::default(),
             diagnostics: None,
         }
@@ -572,6 +588,11 @@ impl JitBackend {
     #[must_use]
     pub const fn stats(&self) -> JitStats {
         self.stats
+    }
+
+    /// Runtime-local generation used to scope cached admission decisions.
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
     }
 
     /// Enable bounded detailed diagnostics for cached runtime-tier compilation
@@ -605,11 +626,52 @@ impl JitBackend {
         self.thresholds
     }
 
+    #[cfg(test)]
+    fn allow_small_native_entries_for_tests(&mut self) {
+        self.admission_min_straight_line_instructions = 0;
+    }
+
     /// Record an ordinary function entry for tiering.
     pub(crate) fn record_function_entry(&mut self, code: &CodeBlock) {
         self.stats.function_entries = self.stats.function_entries.saturating_add(1);
+        if code.jit_admission(self.id) != crate::vm::JitAdmissionState::Unknown {
+            return;
+        }
         let hotness = self.hotness.entry(code.debug_id).or_default();
         hotness.function_entries = hotness.function_entries.saturating_add(1);
+    }
+
+    /// Apply and cache the context-tier's static native-entry admission rule.
+    /// Explicit low-level compilation does not call this method and therefore
+    /// retains the complete shim fallback used for differential testing.
+    pub(crate) fn admit_function_entry(&mut self, code: &CodeBlock) -> bool {
+        use crate::vm::JitAdmissionState;
+
+        match code.jit_admission(self.id) {
+            JitAdmissionState::Allowed => return true,
+            JitAdmissionState::Denied | JitAdmissionState::DeniedLeaf => return false,
+            JitAdmissionState::Unknown => {}
+        }
+
+        let profile = native::admission_profile(code);
+        let allowed = profile.is_some_and(|profile| {
+            profile.backward_branches > 0
+                || profile.bytecode_instructions >= self.admission_min_straight_line_instructions
+        });
+        let state = if allowed {
+            JitAdmissionState::Allowed
+        } else if profile.is_some_and(|profile| {
+            profile.call_instructions == 0 && profile.property_instructions == 0
+        }) {
+            JitAdmissionState::DeniedLeaf
+        } else {
+            JitAdmissionState::Denied
+        };
+        code.set_jit_admission(self.id, state);
+        if !allowed {
+            self.stats.admission_denials = self.stats.admission_denials.saturating_add(1);
+        }
+        allowed
     }
 
     /// Record a backward edge for tiering.
@@ -1130,9 +1192,9 @@ impl Default for JitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::JsValue;
     use crate::error::{EngineError, RuntimeLimitError};
     use crate::vm::GlobalFunctionBinding;
+    use crate::{JsValue, NativeFunction, js_string};
 
     /// A host helper that drives real VM state: it pushes a value onto the VM
     /// stack and returns a sentinel. Reaching `context.vm.stack` proves the
@@ -1152,6 +1214,27 @@ mod tests {
         let code = script.codeblock(&mut context).expect("codeblock");
         let GlobalFunctionBinding { function_index, .. } = code.global_fns[0];
         code.constant_function(function_index as usize)
+    }
+
+    fn enable_jit_without_admission_floor(context: &mut Context) {
+        context.enable_jit();
+        context
+            .jit_backend
+            .as_mut()
+            .expect("JIT was enabled")
+            .allow_small_native_entries_for_tests();
+    }
+
+    fn enable_jit_diagnostics_without_admission_floor(
+        context: &mut Context,
+        limits: JitDiagnosticLimits,
+    ) {
+        context.enable_jit_diagnostics(limits);
+        context
+            .jit_backend
+            .as_mut()
+            .expect("JIT was enabled")
+            .allow_small_native_entries_for_tests();
     }
 
     #[test]
@@ -1342,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn context_owned_jit_tiers_hot_function_entries() {
+    fn context_owned_jit_suppresses_tiny_hot_function_entries() {
         let mut context = Context::default();
         context.enable_jit();
         let script = crate::Script::parse(
@@ -1359,7 +1442,149 @@ mod tests {
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.function_entries >= 2, "stats: {stats:?}");
-        assert!(stats.compilations >= 1, "stats: {stats:?}");
+        assert_eq!(stats.admission_denials, 1, "stats: {stats:?}");
+        assert_eq!(stats.compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.native_entries, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn denied_wrapper_still_schedules_eligible_callee() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } function wrapper(n) { return sum(n); } let answer = 0; for (let i = 0; i < 80; i++) { answer = wrapper(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(45));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn denied_leaf_preserves_exception_unwind_to_caller() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(object) { return object.value; } const plain = { value: 1 }; for (let i = 0; i < 80; i++) { read(plain); } const throwing = { get value() { throw new Error('expected'); } }; let caught = false; try { read(throwing); } catch (error) { caught = error.message === 'expected'; } caught",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn denied_property_reader_with_getter_is_not_classified_as_leaf() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context
+            .register_global_callable(
+                js_string!("probeNestedInterpreter"),
+                0,
+                NativeFunction::from_copy_closure(|_, _, context| {
+                    assert_eq!(context.active_jit_backend_id, 0);
+                    Ok(JsValue::new(45))
+                }),
+            )
+            .expect("register probe");
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(input) { return input.value; } const object = { get value() { return probeNestedInterpreter(); } }; let answer = 0; for (let i = 0; i < 80; i++) { answer = read(object); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+        let top_level = script.codeblock(&mut context).expect("top-level codeblock");
+        let GlobalFunctionBinding { function_index, .. } = top_level.global_fns[0];
+        let read_code = top_level.constant_function(function_index as usize);
+        let backend_id = context.jit_backend.as_ref().expect("JIT backend").id();
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(45));
+        assert_eq!(
+            read_code.jit_admission(backend_id),
+            crate::vm::JitAdmissionState::Denied
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn admission_cache_is_scoped_to_backend_generation() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } let first = 0; for (let i = 0; i < 80; i++) { first = sum(10); } first",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        assert_eq!(
+            setup
+                .evaluate(&mut context)
+                .expect("evaluate setup")
+                .as_i32(),
+            Some(45)
+        );
+        assert!(
+            context
+                .jit_stats()
+                .expect("first JIT backend")
+                .native_compilations
+                >= 1
+        );
+
+        context.disable_jit();
+        assert_eq!(context.active_jit_backend_id, 0);
+        let interpreted =
+            crate::Script::parse(crate::Source::from_bytes("sum(10)"), None, &mut context)
+                .expect("parse interpreted call");
+        assert_eq!(
+            interpreted
+                .evaluate(&mut context)
+                .expect("evaluate with JIT disabled")
+                .as_i32(),
+            Some(45)
+        );
+
+        context.enable_jit();
+        let warm_again = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let second = 0; for (let i = 0; i < 80; i++) { second = sum(10); } second",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse second warmup");
+        assert_eq!(
+            warm_again
+                .evaluate(&mut context)
+                .expect("evaluate second warmup")
+                .as_i32(),
+            Some(45)
+        );
+        let stats = context.jit_stats().expect("second JIT backend");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
     }
 
@@ -1472,7 +1697,7 @@ mod tests {
     #[test]
     fn context_owned_jit_deopts_numeric_type_and_overflow_guards() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } let value = 0; for (let i = 0; i < 80; i++) { value = add(i, 1); } for (let i = 0; i < 80; i++) { value = subtract(i, 1); } let overflow = add(2147483647, 1); let text = add(\"x\", \"y\"); let negativeZero = subtract(-0, 0); (overflow === 2147483648 && text === \"xy\" && Object.is(negativeZero, -0)) ? 1 : 0",
@@ -1493,7 +1718,7 @@ mod tests {
     #[test]
     fn jit_exit_diagnostics_are_exact_bounded_and_opt_in() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let warmup = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } let warm = 0; for (let i = 0; i < 80; i++) { warm = add(i, 1); } warm",
@@ -1505,10 +1730,13 @@ mod tests {
         warmup.evaluate(&mut context).expect("warm up");
         assert_eq!(context.jit_diagnostic_snapshot(), None);
 
-        context.enable_jit_diagnostics(JitDiagnosticLimits {
-            compile_records: 0,
-            exit_records: 1,
-        });
+        enable_jit_diagnostics_without_admission_floor(
+            &mut context,
+            JitDiagnosticLimits {
+                compile_records: 0,
+                exit_records: 1,
+            },
+        );
         let overflow = crate::Script::parse(
             crate::Source::from_bytes("add(2147483647, 1)"),
             None,
@@ -1554,7 +1782,7 @@ mod tests {
     #[test]
     fn jit_return_diagnostic_reports_caller_resume_pc() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let warmup = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } let warm = 0; for (let i = 0; i < 80; i++) { warm = add(i, 1); } warm",
@@ -1565,7 +1793,10 @@ mod tests {
         .expect("parse warmup");
         warmup.evaluate(&mut context).expect("warm up");
 
-        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        enable_jit_diagnostics_without_admission_floor(
+            &mut context,
+            JitDiagnosticLimits::default(),
+        );
         let call = crate::Script::parse(
             crate::Source::from_bytes("let answer = add(20, 22); answer"),
             None,
@@ -1740,7 +1971,7 @@ mod tests {
         let prepare = |jit: bool| {
             let mut context = Context::default();
             if jit {
-                context.enable_jit();
+                enable_jit_without_admission_floor(&mut context);
             }
             let script = crate::Script::parse(
                 crate::Source::from_bytes(
@@ -1777,7 +2008,7 @@ mod tests {
     #[test]
     fn context_owned_jit_preserves_exception_propagation_through_call() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function fail() { throw new Error(\"boom\"); } function apply(function_value) { return function_value(); } let caught = 0; for (let i = 0; i < 80; i++) { try { apply(fail); } catch (error) { if (error.message === \"boom\") { caught++; } } } caught",
@@ -1870,7 +2101,7 @@ mod tests {
     #[test]
     fn context_owned_jit_survives_forced_gc_around_property_guard() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
 
         let setup = crate::Script::parse(
             crate::Source::from_bytes(
@@ -1900,7 +2131,7 @@ mod tests {
     #[test]
     fn context_owned_jit_dispatches_native_ordinary_function_call() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = apply(add, 20, 22); } answer",
@@ -1921,7 +2152,7 @@ mod tests {
     #[test]
     fn context_owned_jit_deopts_non_ordinary_call_to_interpreter() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = answer + apply(add, 20, 22); } answer = answer + apply(Math.max, 5, 4); answer",
@@ -1942,7 +2173,7 @@ mod tests {
     #[test]
     fn context_owned_jit_deopts_different_ordinary_call_target() {
         let mut context = Context::default();
-        context.enable_jit();
+        enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } function subtract(left, right) { return left - right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = answer + apply(add, 20, 22); } answer = answer + apply(subtract, 20, 22); answer",

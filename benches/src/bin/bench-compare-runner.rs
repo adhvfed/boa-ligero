@@ -226,7 +226,8 @@ fn run_jit(
             "cold_elapsed_ns={} cold_ns_per_run={} cold_acc={} ",
             "cold_compile_time_ns={} cold_native_entries={} cold_deopts={} ",
             "compile_time_ns={} compilations={} native_compilations={} ",
-            "shim_compilations={} native_entries={} deopts={}"
+            "shim_compilations={} native_entries={} deopts={} ",
+            "cold_admission_denials={} admission_denials={}"
         ),
         elapsed_ns,
         runs,
@@ -244,6 +245,8 @@ fn run_jit(
         stats.shim_compilations,
         stats.native_entries,
         stats.deopts,
+        cold_stats.admission_denials,
+        stats.admission_denials,
     );
 
     if let Some(output) = diagnostics_out {

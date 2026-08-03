@@ -59,6 +59,20 @@ pub(super) struct NativeRejection {
     pub(super) bytecode_instructions: u32,
 }
 
+/// Return the source-free static shape used by context-tier admission.
+///
+/// This performs no code generation. Unsupported or otherwise ineligible
+/// bodies stay on the ordinary interpreter path; the explicit low-level JIT
+/// API retains its complete-semantics shim fallback.
+pub(super) fn admission_profile(code: &CodeBlock) -> Option<NativeStaticProfile> {
+    if eligibility_blocker(code).is_some() {
+        return None;
+    }
+    decode(code, false)
+        .ok()
+        .map(|instructions| instructions.static_profile())
+}
+
 impl NativeRejection {
     fn new(
         kind: JitCompileBlockerKind,
