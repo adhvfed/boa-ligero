@@ -149,17 +149,25 @@ branch kernel: one native artifact, 999 normal returns, zero deopts, checksum
 `499500000`, 387 display items, and 258 paint segments. This closes Slice 2A's
 measured stop/go gate while keeping the JIT build- and runtime-opt-in.
 
-## Required checkpoint before Slice 2B
+## Completed checkpoint before Slice 2B
 
-The scheduler and admission work are two behavior slices, so the next commit
-must be a separately revertible behavior-neutral refactor. Consolidate the two
-frame-change interpreter loops and centralize scheduler-token lifetime only if
-the denied-control parity gate remains green; keep the current specialized
-loops if an abstraction measurably restores dispatch overhead.
+Boa `612c7dc6` is the separately revertible behavior-neutral refactor required
+after the scheduler and admission slices. It replaces the duplicate denied-
+frame dispatch loops with one frame-change interpreter path. Five fresh-process
+samples retain the parity gate: the 9-, 21-, and 33-instruction denied controls
+measure +1.73%, +0.32%, and −3.47% against JIT-disabled medians. The abstraction
+therefore does not restore the scheduler tax.
 
-After that refactor, add a bounded source-free admission record keyed only by
-runtime-local code ID and static counts/reason. Aggregate `admission_denials`
-is sufficient for the present stop/go result but not for attributing later
-mixed-workload suppressions. Only then begin Slice 2B's guarded `This` design
+Boa `a7036d71` advances the detailed diagnostic schema to 3. It retains a
+separately bounded admission stream keyed only by runtime-local code ID with an
+allow/deny reason, leaf-path flag, static counts, and an optional static blocker,
+opcode, and PC. Records are sorted deterministically, report their own dropped
+count, and contain no source, URL, function/property names, values, or pointers.
+Ligero `05690d09` projects the stream without depending on Boa enums. Fresh W0
+records two exception-handler denials and one allowed backward-branch kernel,
+with zero dropped records; the kernel still compiles once, returns 999 times,
+and deopts zero times with the established checksum and paint structure.
+
+The checkpoint is closed. Slice 2B may now begin with the guarded `This` design
 review; binding reads, OSR, compiled calls, and direct storage remain separate
 evidence-selected decisions.

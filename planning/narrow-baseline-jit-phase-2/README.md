@@ -62,7 +62,10 @@ Every Phase 2 entry and exit ABI inherits that rule.
 3. Pay the scheduled refactoring checkpoint: consolidate the duplicated
    frame-change interpreter loops without changing dispatch semantics, then
    add bounded source-free per-code admission records so later profiles can
-   distinguish suppression from compilation.
+   distinguish suppression from compilation. **Complete:** Boa `612c7dc6`
+   unifies dormant dispatch with the negative controls still inside the parity
+   gate; Boa `a7036d71` and Ligero `05690d09` add and project schema-3 bounded
+   admission decisions.
 4. Lower only the smallest measured blocker batch needed to expose useful
    native regions, first deciding whether the current whole-CodeBlock compiler
    can express the result or explicit region metadata is required.
@@ -75,7 +78,7 @@ Every Phase 2 entry and exit ABI inherits that rule.
 8. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
-The first slice is deliberately measurement-only. OSR and compiled calls are
+The first slice was deliberately measurement-only. OSR and compiled calls are
 alternative evidence-selected branches, not a pre-approved sequence. Both
 remain Phase 2 targets, but either may be deferred with a checked-in profile
 showing that another boundary dominates.
