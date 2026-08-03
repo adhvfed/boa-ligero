@@ -1318,21 +1318,28 @@ impl Context {
             crate::jit::JitLoopScheduleAction::Break => {
                 self.vm.frame_mut().mark_jit_osr_closed();
                 let Some(record) = self.vm.jit_pending.take() else {
-                    return InterpreterJitControl::Break(CompletionRecord::Throw(
-                        JsError::from_native(JsNativeError::error()),
-                    ));
+                    return self.invalid_jit_loop_metadata(backend);
                 };
                 self.vm.jit_exit_pending = None;
                 InterpreterJitControl::Break(record)
             }
-            crate::jit::JitLoopScheduleAction::Invalid => {
-                self.vm.frame_mut().mark_jit_osr_closed();
-                self.vm.jit_pending = None;
-                self.vm.jit_exit_pending = None;
-                InterpreterJitControl::Break(CompletionRecord::Throw(JsError::from_native(
-                    JsNativeError::error(),
-                )))
-            }
+            crate::jit::JitLoopScheduleAction::Invalid => self.invalid_jit_loop_metadata(backend),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    fn invalid_jit_loop_metadata(
+        &mut self,
+        backend: &mut crate::jit::JitBackend,
+    ) -> InterpreterJitControl {
+        self.vm.frame_mut().mark_jit_osr_closed();
+        self.vm.jit_pending = None;
+        self.vm.jit_exit_pending = None;
+        backend.mark_compromised();
+        let error = crate::error::PanicError::new("invalid JIT loop exit metadata").into();
+        match self.handle_error(error) {
+            ControlFlow::Break(record) => InterpreterJitControl::Break(record),
+            ControlFlow::Continue(()) => unreachable!("engine errors are uncatchable"),
         }
     }
 
@@ -1450,7 +1457,9 @@ impl Context {
         self.active_jit_backend_id = backend.id();
         let record = self.run_with_jit_backend(&mut backend);
         self.active_jit_backend_id = 0;
-        self.jit_backend = Some(backend);
+        if !backend.is_compromised() {
+            self.jit_backend = Some(backend);
+        }
         record
     }
 

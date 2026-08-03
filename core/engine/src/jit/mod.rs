@@ -1198,6 +1198,12 @@ struct LoopCachedEntry {
     instruction_pcs: Box<[u32]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JitBackendHealth {
+    Active,
+    Compromised,
+}
+
 /// If `instr` is a **same-frame** branch (no frame push), return its target
 /// `pc`. The JIT can then lower it to a native edge to that target's block.
 ///
@@ -1232,6 +1238,10 @@ fn same_frame_jump_target(instr: &Instruction) -> Option<u32> {
 /// real tier will hold one of these per realm.
 pub struct JitBackend {
     id: u64,
+    /// Set after generated code returns metadata that cannot be reconciled
+    /// with the immutable artifact contract. A compromised backend is never
+    /// retained or entered again by the context-owned scheduler.
+    health: JitBackendHealth,
     pub(super) module: JITModule,
     /// Monotonic counter for unique symbol names. `JITModule::declare_function`
     /// deduplicates by name, so reusing a fixed name (e.g. "`jit_codeblock`")
@@ -1300,6 +1310,7 @@ impl JitBackend {
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         Self {
             id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
+            health: JitBackendHealth::Active,
             module: JITModule::new(builder),
             next_fn_id: 0,
             cache: FxHashMap::default(),
@@ -1327,6 +1338,19 @@ impl JitBackend {
     /// Runtime-local generation used to scope cached admission decisions.
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) const fn is_compromised(&self) -> bool {
+        matches!(self.health, JitBackendHealth::Compromised)
+    }
+
+    pub(crate) fn mark_compromised(&mut self) {
+        self.health = JitBackendHealth::Compromised;
+    }
+
+    fn invalid_loop_state(&mut self) -> JitLoopScheduleAction {
+        self.mark_compromised();
+        JitLoopScheduleAction::Invalid
     }
 
     /// Enable bounded detailed diagnostics for cached runtime-tier compilation
@@ -1555,6 +1579,9 @@ impl JitBackend {
         backedge_pc: u32,
         context: &mut Context,
     ) -> JitLoopScheduleAction {
+        if self.is_compromised() {
+            return JitLoopScheduleAction::Invalid;
+        }
         let budgeted = context.instruction_budget_remaining().is_some();
         let diagnostic = self.diagnostics.is_some();
         let i32_key = JitCacheKey::loop_region(
@@ -1731,10 +1758,10 @@ impl JitBackend {
                             .is_some_and(|cached| cached.instruction_pcs.contains(&exit.pc))
                 });
             if !valid {
-                return JitLoopScheduleAction::Invalid;
+                return self.invalid_loop_state();
             }
             let Some(exit) = pending_exit else {
-                return JitLoopScheduleAction::Invalid;
+                return self.invalid_loop_state();
             };
             self.record_loop_exit(JitExitKind::Budget);
             if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
@@ -1744,7 +1771,7 @@ impl JitBackend {
         }
 
         let Some(exit) = JitExit::decode(status) else {
-            return JitLoopScheduleAction::Invalid;
+            return self.invalid_loop_state();
         };
         let valid = match exit.kind {
             JitExitKind::EntryRejected => {
@@ -1773,7 +1800,7 @@ impl JitBackend {
             | JitExitKind::Budget => false,
         };
         if !valid {
-            return JitLoopScheduleAction::Invalid;
+            return self.invalid_loop_state();
         }
         self.record_loop_exit(exit.kind);
         if let (Some(diagnostics), Some(started)) = (&mut self.diagnostics, started) {
@@ -4780,6 +4807,66 @@ mod tests {
         );
         context.active_jit_backend_id = 0;
         context.vm.pop_frame();
+        assert!(backend.is_compromised());
+    }
+
+    #[test]
+    fn context_owned_jit_disables_backend_after_invalid_osr_metadata() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context.set_jit_thresholds(JitThresholds {
+            function_entries: u32::MAX,
+            loop_backedges: 1,
+        });
+        crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { Math.abs(limit); let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition")
+        .evaluate(&mut context)
+        .expect("define function");
+
+        let evaluate_once = |context: &mut Context| {
+            crate::Script::parse(crate::Source::from_bytes("once(3)"), None, context)
+                .expect("parse call")
+                .evaluate(context)
+        };
+        assert_eq!(
+            evaluate_once(&mut context)
+                .expect("prime loop artifact")
+                .as_number(),
+            Some(3.5)
+        );
+        let backend = context.jit_backend.as_mut().expect("JIT backend");
+        assert_eq!(backend.loop_cache.len(), 1);
+        backend
+            .loop_cache
+            .values_mut()
+            .next()
+            .expect("cached loop artifact")
+            .resume_pc += 1;
+
+        let error = evaluate_once(&mut context).expect_err("invalid metadata must abort JIT");
+        assert!(matches!(
+            error.as_engine(),
+            Some(EngineError::Panic(error))
+                if error.message() == "invalid JIT loop exit metadata"
+        ));
+        assert!(!context.jit_enabled());
+        assert_eq!(context.active_jit_backend_id, 0);
+        assert!(context.vm.jit_pending.is_none());
+        assert!(context.vm.jit_exit_pending.is_none());
+        assert_eq!(context.vm.frames.len(), 1);
+
+        assert_eq!(
+            evaluate_once(&mut context)
+                .expect("continue in interpreter after backend removal")
+                .as_number(),
+            Some(3.5)
+        );
     }
 
     #[test]
