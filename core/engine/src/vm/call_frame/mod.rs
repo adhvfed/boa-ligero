@@ -41,6 +41,11 @@ bitflags::bitflags! {
         /// The JIT tier has attempted the native entry for this frame.
         #[cfg(feature = "jit")]
         const JIT_ENTRY_ATTEMPTED = 0b0010_0000;
+
+        /// This frame has observed that its code block is already hot, so
+        /// later nonzero-PC backedges need only update aggregate counters.
+        #[cfg(feature = "jit")]
+        const JIT_LOOP_HOTNESS_SATURATED = 0b0100_0000;
     }
 }
 
@@ -257,18 +262,33 @@ impl CallFrame {
         self.flags.insert(CallFrameFlags::JIT_ENTRY_COUNTED);
     }
 
-    /// Whether the optional JIT runtime has attempted this frame's native
-    /// entry. A failed entry must not restart at bytecode PC zero after a
-    /// deoptimization.
+    /// Whether the optional JIT runtime has closed this frame's native-entry
+    /// decision. A failed entry must not restart at bytecode PC zero after a
+    /// deoptimization, and a hot nonzero-PC frame that cannot branch to zero
+    /// can remain on dormant interpreter dispatch.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_entry_attempted(&self) -> bool {
         self.flags.contains(CallFrameFlags::JIT_ENTRY_ATTEMPTED)
     }
 
-    /// Mark this frame as having attempted its native entry.
+    /// Mark this frame's native-entry decision as closed.
     #[cfg(feature = "jit")]
     pub(crate) fn mark_jit_entry_attempted(&mut self) {
         self.flags.insert(CallFrameFlags::JIT_ENTRY_ATTEMPTED);
+    }
+
+    /// Whether this frame can skip further code-block hotness mutations.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_loop_hotness_saturated(&self) -> bool {
+        self.flags
+            .contains(CallFrameFlags::JIT_LOOP_HOTNESS_SATURATED)
+    }
+
+    /// Mark this frame's code-block hotness as saturated.
+    #[cfg(feature = "jit")]
+    pub(crate) fn mark_jit_loop_hotness_saturated(&mut self) {
+        self.flags
+            .insert(CallFrameFlags::JIT_LOOP_HOTNESS_SATURATED);
     }
 }
 

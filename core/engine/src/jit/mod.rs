@@ -15,7 +15,7 @@ use crate::Context;
 use crate::builtins::function::OrdinaryFunction;
 use crate::vm::CodeBlock;
 use crate::vm::CompletionRecord;
-use crate::vm::opcode::{Instruction, JIT_OP_SHIMS, Opcode};
+use crate::vm::opcode::{Instruction, InstructionIterator, JIT_OP_SHIMS, Opcode};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, types};
@@ -153,6 +153,14 @@ pub struct JitStats {
     pub function_entries: u64,
     /// Number of backward edges observed by the tiering loop.
     pub loop_backedges: u64,
+    /// Number of code blocks that crossed either configured hotness threshold.
+    pub hotness_threshold_crossings: u64,
+    /// Number of loop backedges that bypassed code-block hotness updates after
+    /// their frame had already observed a hot code block.
+    pub saturated_loop_backedges: u64,
+    /// Number of hot nonzero-PC frames handed to dormant interpreter dispatch
+    /// after proving that they cannot branch back to PC zero.
+    pub dormant_loop_frames: u64,
     /// Number of native baseline entries invoked.
     pub native_entries: u64,
     /// Number of native entries that returned to the interpreter.
@@ -848,7 +856,12 @@ impl JitBackend {
         if code.jit_admission(self.id) != crate::vm::JitAdmissionState::Unknown {
             return;
         }
+        let was_hot = self.is_hot(code);
         code.record_jit_function_entry(self.id);
+        if !was_hot && self.is_hot(code) {
+            self.stats.hotness_threshold_crossings =
+                self.stats.hotness_threshold_crossings.saturating_add(1);
+        }
     }
 
     /// Apply and cache the context-tier's static native-entry admission rule.
@@ -968,9 +981,48 @@ impl JitBackend {
     }
 
     /// Record a backward edge for tiering.
-    pub(crate) fn record_loop_backedge(&mut self, code: &CodeBlock) {
+    pub(crate) fn record_loop_backedge(&mut self, code: &CodeBlock) -> bool {
         self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
+        let was_hot = self.is_hot(code);
         code.record_jit_loop_backedge(self.id);
+        let is_hot = self.is_hot(code);
+        if !was_hot && is_hot {
+            self.stats.hotness_threshold_crossings =
+                self.stats.hotness_threshold_crossings.saturating_add(1);
+        }
+        is_hot
+    }
+
+    /// Count one backedge after the current frame no longer needs to mutate
+    /// code-block hotness.
+    pub(crate) fn record_saturated_loop_backedge(&mut self) {
+        self.stats.loop_backedges = self.stats.loop_backedges.saturating_add(1);
+        self.stats.saturated_loop_backedges = self.stats.saturated_loop_backedges.saturating_add(1);
+    }
+
+    /// Count one hot nonzero-PC frame handed to dormant interpreter dispatch.
+    pub(crate) fn record_dormant_loop_frame(&mut self) {
+        self.stats.dormant_loop_frames = self.stats.dormant_loop_frames.saturating_add(1);
+    }
+
+    /// Whether the current run must retain exact post-threshold loop records.
+    /// Headline timing keeps diagnostics disabled and may use dormant dispatch.
+    pub(crate) const fn observes_loop_backedges(&self) -> bool {
+        self.diagnostics.is_some()
+    }
+
+    /// Whether any same-frame branch can make a nonzero-PC frame eligible for
+    /// the existing whole-function entry by returning to PC zero.
+    pub(crate) fn can_reenter_at_pc_zero(code: &CodeBlock) -> bool {
+        InstructionIterator::new(&code.bytecode).any(|(pc, _, instruction)| {
+            pc > 0
+                && match &instruction {
+                    Instruction::JumpTable { addresses, .. } => {
+                        addresses.iter().any(|address| address.as_u32() == 0)
+                    }
+                    _ => same_frame_jump_target(&instruction) == Some(0),
+                }
+        })
     }
 
     /// Record a native entry that returned to the interpreter.
@@ -2153,6 +2205,7 @@ mod tests {
         assert!(!first.is_hot(&code));
         first.record_function_entry(&code);
         assert!(first.is_hot(&code));
+        assert_eq!(first.stats().hotness_threshold_crossings, 1);
 
         let mut replacement = JitBackend::new();
         replacement.set_thresholds(thresholds);
@@ -2160,11 +2213,126 @@ mod tests {
             !replacement.is_hot(&code),
             "a replacement backend must not inherit the prior generation's hotness"
         );
-        replacement.record_loop_backedge(&code);
-        replacement.record_loop_backedge(&code);
+        assert!(!replacement.record_loop_backedge(&code));
+        assert!(!replacement.record_loop_backedge(&code));
         assert!(!replacement.is_hot(&code));
-        replacement.record_loop_backedge(&code);
+        assert!(replacement.record_loop_backedge(&code));
         assert!(replacement.is_hot(&code));
+        assert_eq!(replacement.stats().hotness_threshold_crossings, 1);
+    }
+
+    #[test]
+    fn context_owned_jit_latches_hot_nonzero_backedges_and_enters_on_next_call() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("define function");
+
+        let first =
+            crate::Script::parse(crate::Source::from_bytes("once(1024)"), None, &mut context)
+                .expect("parse first call");
+        assert_eq!(
+            first
+                .evaluate(&mut context)
+                .expect("evaluate first call")
+                .as_number(),
+            Some(523_776.5)
+        );
+        let first_stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(first_stats.compilations, 0, "stats: {first_stats:?}");
+        assert_eq!(first_stats.native_entries, 0, "stats: {first_stats:?}");
+        assert_eq!(first_stats.loop_backedges, 256, "stats: {first_stats:?}");
+        assert_eq!(
+            first_stats.hotness_threshold_crossings, 1,
+            "stats: {first_stats:?}"
+        );
+        assert_eq!(
+            first_stats.saturated_loop_backedges, 0,
+            "stats: {first_stats:?}"
+        );
+        assert_eq!(first_stats.dormant_loop_frames, 1, "stats: {first_stats:?}");
+
+        let second =
+            crate::Script::parse(crate::Source::from_bytes("once(1024)"), None, &mut context)
+                .expect("parse second call");
+        assert_eq!(
+            second
+                .evaluate(&mut context)
+                .expect("evaluate second call")
+                .as_number(),
+            Some(523_776.5)
+        );
+        let second_stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(
+            second_stats.hotness_threshold_crossings, 1,
+            "stats: {second_stats:?}"
+        );
+        assert!(
+            second_stats.native_compilations >= 1,
+            "stats: {second_stats:?}"
+        );
+        assert!(second_stats.native_entries >= 1, "stats: {second_stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_latches_statically_ineligible_one_shot_loop() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = (total + i) | 0; } return total; } once(1024)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(523_776)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.native_entries, 0, "stats: {stats:?}");
+        assert_eq!(stats.loop_backedges, 256, "stats: {stats:?}");
+        assert_eq!(stats.hotness_threshold_crossings, 1, "stats: {stats:?}");
+        assert_eq!(stats.saturated_loop_backedges, 0, "stats: {stats:?}");
+        assert_eq!(stats.dormant_loop_frames, 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn jit_diagnostics_retain_exact_post_threshold_backedge_counts() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function once(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = (total + i) | 0; } return total; } once(1024)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(523_776)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(stats.loop_backedges, 1024, "stats: {stats:?}");
+        assert_eq!(stats.hotness_threshold_crossings, 1, "stats: {stats:?}");
+        assert_eq!(
+            stats.saturated_loop_backedges,
+            1024 - 256,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats.dormant_loop_frames, 0, "stats: {stats:?}");
     }
 
     #[test]

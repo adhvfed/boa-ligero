@@ -1347,35 +1347,21 @@ impl Context {
                 }
             }
 
-            match self.vm.frame().code_block.jit_admission(backend.id()) {
-                JitAdmissionState::DeniedLeaf => {
-                    let frame_depth = self.vm.frames.len();
-                    if let ControlFlow::Break(value) =
-                        self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
-                    {
-                        return value;
-                    }
-                    continue 'scheduler;
+            if self.vm.frame().jit_entry_attempted() {
+                let frame_depth = self.vm.frames.len();
+                if let ControlFlow::Break(value) =
+                    self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
+                {
+                    return value;
                 }
-                JitAdmissionState::Denied => {
-                    let frame_depth = self.vm.frames.len();
-                    if let ControlFlow::Break(value) =
-                        self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
-                    {
-                        return value;
-                    }
-                    continue 'scheduler;
-                }
-                JitAdmissionState::Unknown | JitAdmissionState::Allowed => {}
+                continue 'scheduler;
             }
 
-            // Once this frame has passed its one entry decision, keep it on the
-            // ordinary interpreter dispatch path. Tiering only needs control
-            // again when an opcode pushes or pops a frame, or when a backward
-            // edge reaches PC zero and makes this frame eligible for its first
-            // whole-CodeBlock entry. This avoids repeating entry/hotness work
-            // around every ordinary bytecode while retaining the existing
-            // call, return, exception-unwind, and PC-zero entry semantics.
+            // This frame's entry decision is still open. Keep control until a
+            // frame transition, a backward edge makes it hot, or a backward
+            // edge reaches PC zero. Once a hot nonzero-PC frame proves it
+            // cannot return to zero, the scheduler marks the decision closed
+            // and hands it to the dormant interpreter path above.
             loop {
                 let frame = self.vm.frame();
                 let old_pc = frame.pc;
@@ -1428,8 +1414,21 @@ impl Context {
 
                 if self.vm.frame().code_block.debug_id == old_code_id && self.vm.frame().pc < old_pc
                 {
-                    let code = self.vm.frame().code_block.clone();
-                    backend.record_loop_backedge(&code);
+                    if self.vm.frame().jit_loop_hotness_saturated() {
+                        backend.record_saturated_loop_backedge();
+                    } else {
+                        let code = self.vm.frame().code_block.clone();
+                        if backend.record_loop_backedge(&code) {
+                            self.vm.frame_mut().mark_jit_loop_hotness_saturated();
+                            if !backend.observes_loop_backedges()
+                                && !crate::jit::JitBackend::can_reenter_at_pc_zero(&code)
+                            {
+                                self.vm.frame_mut().mark_jit_entry_attempted();
+                                backend.record_dormant_loop_frame();
+                                continue 'scheduler;
+                            }
+                        }
+                    }
 
                     if self.vm.frame().pc == 0 && !self.vm.frame().jit_entry_attempted() {
                         continue 'scheduler;
