@@ -546,6 +546,14 @@ cross-platform, PC-zero containment, and release-candidate gates in Gate D all
 pass, land a separate default-feature/runtime-default flip with an explicit
 interpreter opt-out and its own rollback commit.
 
+Gate D is decomposed into D0–D5 in the
+[default-JIT admission plan](30-default-jit-admission-plan-2026-08-03.md).
+In order: finish Decision B under a recorded quiescence preflight; bound the
+whole-function and loop tier together; close the PC-zero containment matrix;
+run the named Tier-A W2 A/B corpus; pass the two supported native platforms and
+security review; then land only the default/opt-out flip. No second ABI or
+remote-script policy change may ride with that sequence.
+
 Suggested commits:
 
 ```text

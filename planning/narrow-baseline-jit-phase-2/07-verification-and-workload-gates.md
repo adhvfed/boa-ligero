@@ -274,23 +274,38 @@ default enablement. See the
 JIT becomes the default only after all of these are checked in against one
 identified release candidate:
 
-- W2 representative breadth has stable semantic and cold/warm results, with no
-  negative workload above its recorded rollback bound;
-- the older PC-zero pending-completion boundary has the same fail-closed status,
-  frame-unwind, GC, exception, and finite-budget coverage now required of OSR;
-- the supported AArch64 and x86-64 native matrices pass, while unsupported
-  platforms retain a clean interpreter-only build and runtime path;
-- default-on security tests cover malformed native statuses, executable-memory
-  publication/lifetime, backend compromise, runtime limits, host re-entry, and
-  untrusted-script fallback without exposing source or pointer data;
-- a release feature/default flip is separately revertible, retains an explicit
-  runtime opt-out, and passes the full workspace, Ligero integration, browser
-  workload, and rollback suites with diagnostics disabled by default.
+- Decision checkpoint B passes its fixed micro/engine/W0 rollback matrix under
+  a recorded quiescence preflight and selects no ABI without both dynamic
+  opportunity and a consumable native path;
+- an independently reviewed D1 record fixes numerical backend-wide entry,
+  code, compile-time, diagnostic, and metadata bounds before implementation,
+  then acceptance tests prove those bounds and ready-entry reuse at capacity;
+- W2 runs the checked-in 16-site Tier-A frozen-mirror corpus at both declared
+  viewports using one JIT-built binary, explicit runtime force-on/force-off,
+  seven alternating cold and precisely defined warm pairs, at most 0.1%
+  `structuralAaPct` mismatch, a +5% per-cell and +2% geomean ceiling, a +10%
+  peak-RSS ceiling, and zero-drop separate diagnostics;
+- the older PC-zero pending-completion boundary passes the enumerated malformed
+  status/metadata, frame, GC, exception, finite-budget, host-re-entry, backend-
+  disable, and interpreter-recovery matrix;
+- native matrices pass on `aarch64-apple-darwin` and
+  `x86_64-unknown-linux-gnu`, while unsupported platforms retain a clean
+  interpreter-only build and runtime path;
+- the threat/acceptance matrix covers executable-memory publication/lifetime,
+  backend ownership and compromise, runtime/resource limits, GC, host re-entry,
+  status/cache-key fuzzing, and source/pointer-free diagnostic serialization;
+- the separately revertible release flip retains an explicit interpreter-only
+  runtime/embedding opt-out with force-off precedence and passes the named
+  workspace, Ligero, W0, W2, security, platform, remote-script non-escalation,
+  and rollback suites with diagnostics disabled by default.
 
 Gate D authorizes making the tier build- and runtime-default; it does not make
 remote scripts default. Remote-script policy remains a separate security and
 product decision. If the default-on candidate fails any binding row, revert
 only the feature/default flip and keep the opt-in tier available for diagnosis.
+The binding protocol, thresholds, missing cache boundary, containment cases,
+and release sequence are recorded in the
+[default-JIT admission plan](30-default-jit-admission-plan-2026-08-03.md).
 
 ## Platform matrix
 

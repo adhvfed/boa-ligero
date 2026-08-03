@@ -296,6 +296,10 @@ showing that another boundary dominates.
   — the separately revertible typed exit-validation cleanup, semantic and
   containment reruns, Earley sentinel, clean W0 evidence, and checkpoint-B
   handoff.
+- [Default-JIT admission plan, 2026-08-03](30-default-jit-admission-plan-2026-08-03.md)
+  — executable D0–D5 gates for reproducible Decision-B profiling, backend-wide
+  cache bounds, PC-zero containment, the named W2 mirror corpus, supported
+  platforms/security, and the separately revertible default flip.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
