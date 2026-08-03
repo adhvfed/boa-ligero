@@ -29,19 +29,26 @@ the leading candidates:
 
 - `This`, which is the most frequent first blocker in the measured engine
   subset and independently blocks the monomorphic-method control;
-- an exact read of the current VM frame's already-established `this` value,
-  specialized only when the existing value/materialization model can represent
-  it safely;
-- a pre-effect representation guard and exact-PC deopt for every value shape
-  the first lowering does not support.
+- an exact boxed read through the VM-owned interpreter operation, including its
+  cached-frame and environment-resolution paths;
+- a pre-effect representation guard and exact-PC deopt only if a later lowering
+  specializes instead of supporting every boxed receiver shape.
 
-This is a frame-value read, not permission to cache a raw object pointer in
+This is a VM binding read, not permission to cache a raw object pointer in
 generated code. The implementation review must cover strict/sloppy receiver
-normalization, primitive and object receivers, bound/ordinary calls, GC while
-the value is live, and finite-budget replay. The measured method control has
+normalization, lexical `this`, uninitialized derived constructors, primitive
+and object receivers, bound/ordinary calls, GC while the value is live, and
+finite-budget replay. The measured method control has
 `This` at PC 18 after a supported prefix, so first determine whether adding this
 operation makes the existing PC-zero whole-CodeBlock entry useful. Do not add a
 nonzero entry merely to bypass it.
+
+The [2026-08-03 receiver frontier review](11-receiver-frontier-review-2026-08-03.md)
+answers that question: standalone `This` lowering is a no-go. The method next
+reaches unsupported `SetPropertyByName`, and even a combined receiver/store
+allowlist would leave the 16-instruction straight-line helper below production
+admission. Retain receiver semantics and tests for a later useful region; do not
+add an opcode solely to move the diagnostic frontier.
 
 ### Environment and constant reads
 
@@ -53,6 +60,12 @@ nonzero entry merely to bypass it.
 
 A binding guard must use VM-owned identity/version information. Do not cache a
 raw environment pointer in generated code without a lifetime contract.
+
+This is now the next scheduled design checkpoint. `GetName` blocks every
+measured microbenchmark caller, while a safe stable read of the floating-point
+control's `N` binding would complete an otherwise-supported native loop. Treat
+the call-heavy callers as negative controls: binding coverage is accepted only
+if complete-workload time remains neutral or improves.
 
 ### Integer representation operations
 

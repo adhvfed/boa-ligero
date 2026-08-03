@@ -20,6 +20,8 @@ interpreter as the reference implementation.
 
 ### Coverage and regions
 
+- strict/sloppy/lexical/derived-constructor receiver reads if `This` is ever
+  selected as part of an admitted useful region;
 - global/lexical binding reads and mutation/deletion invalidation;
 - bitwise and `ToInt32` edge cases, including NaN, infinities, `-0`, and
   out-of-range numbers;
@@ -94,6 +96,11 @@ the next slice. No new specialization lands based only on the synthetic loop.
 The selected primitive/array workload executes a measured native region through
 its hot loop, with a warm speedup over the interpreter and no semantic or cold
 regression outside the target shape.
+
+Moving a first-blocker diagnostic to the next unsupported opcode does not
+satisfy Gate C. The selected CodeBlock must pass production admission and
+execute the complete measured hot region; a helper that remains denied or exits
+at the immediately following opcode is a no-go.
 
 ### Gate O — OSR
 

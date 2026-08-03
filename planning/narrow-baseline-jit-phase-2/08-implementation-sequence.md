@@ -74,7 +74,7 @@ Suggested commit:
 perf(jit): suppress unprofitable function entries
 ```
 
-## Slice 2B — unblock one measured primitive region
+## Slice 2B — review receiver frontier (complete; no-go)
 
 After Slice 2A, review guarded `This` loading as the smallest measured blocker
 batch: it is the leading engine frontier and blocks the method control at PC 18.
@@ -82,21 +82,50 @@ First record whether the current PC-zero whole-CodeBlock compiler can express
 the useful result. Add exact receiver representation, GC, strict/sloppy call,
 and finite-budget guards and differential tests before adding another opcode.
 
-Name/global reads remain the next measured candidate, but they are not part of
-the receiver patch. They require a separate VM-owned binding identity and
-invalidation design; if that contract is unavailable, do not substitute a raw
-environment pointer. Bitwise/conversion and loop-edge operations remain
-candidates, not a checklist.
+The [dated review](11-receiver-frontier-review-2026-08-03.md) found that it
+cannot. `SetPropertyByName` is the next unsupported opcode in the measured
+method, and the complete 16-instruction helper is below the production admission
+threshold even if both operations were supported. Standalone receiver lowering
+therefore stops at review: no allowlist or ABI change is scheduled.
 
-**Stop/go:** the selected method control must execute a useful native body and
-preserve or improve complete-workload time. If it only adds a losing tiny
-helper entry, revisit admission/transition cost instead of starting OSR or
-calls.
+Name/global reads remain the next measured candidate. They require a separate
+VM-owned binding identity and invalidation design; if that contract is
+unavailable, do not substitute a raw environment pointer. Bitwise/conversion
+and loop-edge operations remain candidates, not a checklist.
 
-Suggested commits:
+**Stop/go:** no-go. The selected method control cannot execute an admitted
+native body after standalone `This` lowering. Revisit receiver coverage only as
+part of a separately reviewed region that passes production admission and
+complete-workload timing.
+
+Review commit:
 
 ```text
-perf(jit): lower guarded receiver reads
+docs(jit): reject standalone receiver lowering
+```
+
+## Slice 2C — review binding identity and invalidation
+
+Identify the existing VM-owned identity and invalidation signal for stable
+global-declarative and global-object reads. The first implementation candidate
+is the narrow binding form needed by the floating-point arithmetic control,
+because that single read is its only unsupported operation and the body already
+contains an admitted backward branch. Do not combine bitwise conversion, array
+storage, receiver reads, or call ABI changes into this slice.
+
+The review must cover mutable lexical bindings, global-object replacement and
+deletion, direct `eval`, realm teardown, GC/lifetime ownership, TDZ/ReferenceError
+behavior, and exact finite-budget replay. It must also state whether current
+whole-CodeBlock entry and materialization metadata suffice.
+
+**Stop/go:** proceed to a binding lowering only if a VM-owned guard can be
+checked without retaining a raw environment pointer and the floating-point
+control becomes a complete admitted body. Otherwise check in the missing
+versioning design and re-rank OSR/calls/storage without an implementation patch.
+
+Suggested commit:
+
+```text
 docs(jit): review binding-read identity and invalidation
 ```
 

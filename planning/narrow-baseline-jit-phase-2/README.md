@@ -8,9 +8,12 @@ micro/engine/browser profile. Slice 2A then measured and removed a dormant-tier
 scheduler tax before landing a conservative loop-or-45-instruction admission
 rule. The rejected controls are now within the recorded 5% interpreter-parity
 gate, the profitable straight-line controls retain clear wins, and the W0
-browser kernel remains native. Before guarded receiver loading, the sequence
-now requires a separately revertible behavior-neutral scheduler refactor and a
-bounded per-code admission diagnostic; each new execution ABI still requires
+browser kernel remains native. The scheduled behavior-neutral scheduler
+refactor and bounded per-code admission diagnostics are complete. The guarded
+receiver review then rejected standalone `This` lowering: the measured method
+immediately reaches an unsupported named store and remains below the production
+admission threshold. The next scheduled checkpoint is the VM-owned identity and
+invalidation contract for binding reads; each new execution ABI still requires
 its own design review before implementation.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
@@ -66,16 +69,20 @@ Every Phase 2 entry and exit ABI inherits that rule.
    unifies dormant dispatch with the negative controls still inside the parity
    gate; Boa `a7036d71` and Ligero `05690d09` add and project schema-3 bounded
    admission decisions.
-4. Lower only the smallest measured blocker batch needed to expose useful
-   native regions, first deciding whether the current whole-CodeBlock compiler
-   can express the result or explicit region metadata is required.
-5. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
+4. Review the smallest measured blocker batch against complete CodeBlocks and
+   production admission before changing the allowlist. **Complete for
+   receivers:** standalone `This` lowering is a no-go because the method's next
+   frontier is `SetPropertyByName` and the 16-instruction helper remains denied.
+5. Review the VM-owned binding identity/invalidation contract. Only if that
+   contract is safe, lower the smallest binding form that makes the measured
+   floating-point loop complete; keep call-heavy controls as regressions.
+6. At a recorded decision checkpoint, rank loop OSR, compiled calls, and
    helper-backed storage by measured lost time and transition count.
-6. Implement the highest-ranked boundary behind its own ABI review; re-profile
+7. Implement the highest-ranked boundary behind its own ABI review; re-profile
    before selecting the next boundary rather than assuming the original order.
-7. Apply cache bounds, failure suppression, and cold-start guardrails throughout
+8. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
-8. Keep direct storage last unless helper attribution proves it dominates and
+9. Keep direct storage last unless helper attribution proves it dominates and
    a GC/layout-lifetime review approves the snapshot contract.
 
 The first slice was deliberately measurement-only. OSR and compiled calls are
@@ -108,6 +115,9 @@ showing that another boundary dominates.
 - [Admission crossover and scheduler finding, 2026-08-03](10-admission-crossover-2026-08-03.md)
   — static native shape, the rejected admission prototype, and revised Slice
   2A order.
+- [Receiver frontier review, 2026-08-03](11-receiver-frontier-review-2026-08-03.md)
+  — exact `this` semantics, whole-CodeBlock/admission analysis, and the no-go
+  decision for standalone receiver lowering.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
