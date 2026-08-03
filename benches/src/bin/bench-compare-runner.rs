@@ -295,6 +295,7 @@ fn run_osr_cold(
     let sample = collect_osr_cold_sample(script_path, code, diagnostic_limits);
     let stats = sample.stats;
     let osr = stats.osr;
+    let resources = stats.resources;
     let total_compile_time_ns = stats.compile_time_ns.saturating_add(osr.compile_time_ns);
     let function_native_entries = stats.native_entries.saturating_sub(osr.entries);
 
@@ -309,7 +310,15 @@ fn run_osr_cold(
             "osr_hotness_crossings={} osr_compile_attempts={} ",
             "osr_compilations={} osr_entries={} osr_entry_rejections={} ",
             "osr_continuations={} osr_deopts={} osr_compile_time_ns={} ",
-            "osr_code_bytes={}"
+            "osr_code_bytes={} osr_rejection_compiler_failure={} ",
+            "osr_suppression_region_capacity={} osr_suppression_code_bytes={} ",
+            "osr_suppression_compile_time={} resource_function_capacity={} ",
+            "resource_oversized_functions={} resource_terminal_failure_hits={} ",
+            "resource_call_target_capacity={} resource_code_bytes={} ",
+            "resource_compile_time={} resource_slow_attempt={} ",
+            "resource_payload_overrun_retirements={} ",
+            "resource_compilation_failure_retirements={} resource_retained_code_bytes={} ",
+            "resource_compile_time_ns={}"
         ),
         sample.elapsed_ns,
         sample.elapsed_ns,
@@ -337,6 +346,21 @@ fn run_osr_cold(
         osr.deopts,
         osr.compile_time_ns,
         osr.code_bytes,
+        osr.rejections.compiler_failure,
+        osr.suppressions.region_capacity,
+        osr.suppressions.code_bytes,
+        osr.suppressions.compile_time,
+        resources.function_capacity,
+        resources.oversized_functions,
+        resources.terminal_failure_hits,
+        resources.call_target_capacity,
+        resources.code_bytes,
+        resources.compile_time,
+        resources.slow_attempt,
+        resources.payload_overrun_retirements,
+        resources.compilation_failure_retirements,
+        resources.retained_code_bytes,
+        resources.compile_time_ns,
     );
 
     if let (Some(output), Some(snapshot)) = (diagnostics_out, sample.diagnostics) {
@@ -389,6 +413,7 @@ fn run_jit(
     let cold_elapsed_ns = cold_start.elapsed().as_nanos();
     let cold_acc = cold_value.to_i32(cold_context).unwrap_or(0);
     let cold_stats = cold_context.jit_stats().expect("JIT stats");
+    let cold_resources = cold_stats.resources;
     let cold_diagnostics = diagnostics_out.map(|_| {
         cold_context
             .jit_diagnostic_snapshot()
@@ -422,6 +447,7 @@ fn run_jit(
     }
     let elapsed_ns = start.elapsed().as_nanos();
     let stats = context.jit_stats().expect("JIT stats");
+    let resources = stats.resources;
     let diagnostics =
         diagnostics_out.map(|_| context.jit_diagnostic_snapshot().expect("JIT diagnostics"));
 
@@ -437,7 +463,17 @@ fn run_jit(
             "shim_compilations={} native_entries={} deopts={} ",
             "scheduler_call_exits={} loop_backedges={} hotness_threshold_crossings={} ",
             "saturated_loop_backedges={} dormant_loop_frames={} ",
-            "cold_admission_denials={} admission_denials={}"
+            "cold_admission_denials={} admission_denials={} ",
+            "cold_resource_function_capacity={} resource_function_capacity={} ",
+            "cold_resource_code_bytes={} resource_code_bytes={} ",
+            "cold_resource_compile_time={} resource_compile_time={} ",
+            "cold_resource_slow_attempt={} resource_slow_attempt={} ",
+            "cold_resource_payload_overrun_retirements={} ",
+            "resource_payload_overrun_retirements={} ",
+            "cold_resource_compilation_failure_retirements={} ",
+            "resource_compilation_failure_retirements={} ",
+            "cold_resource_retained_code_bytes={} resource_retained_code_bytes={} ",
+            "cold_resource_compile_time_ns={} resource_compile_time_ns={}"
         ),
         elapsed_ns,
         runs,
@@ -467,6 +503,22 @@ fn run_jit(
         stats.dormant_loop_frames,
         cold_stats.admission_denials,
         stats.admission_denials,
+        cold_resources.function_capacity,
+        resources.function_capacity,
+        cold_resources.code_bytes,
+        resources.code_bytes,
+        cold_resources.compile_time,
+        resources.compile_time,
+        cold_resources.slow_attempt,
+        resources.slow_attempt,
+        cold_resources.payload_overrun_retirements,
+        resources.payload_overrun_retirements,
+        cold_resources.compilation_failure_retirements,
+        resources.compilation_failure_retirements,
+        cold_resources.retained_code_bytes,
+        resources.retained_code_bytes,
+        cold_resources.compile_time_ns,
+        resources.compile_time_ns,
     );
 
     if let Some(output) = diagnostics_out {
@@ -598,6 +650,21 @@ mod tests {
         assert_eq!(diagnostics.dropped_call_observations, 0);
         assert_eq!(diagnostics.dropped_loop_observations, 0);
         assert_eq!(diagnostics.dropped_storage_observations, 0);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resource_saturation_fixture_reaches_production_function_and_loop_limits() {
+        let source = include_str!("../../scripts/microbench/jit-resource-saturation.js");
+        let sample = super::collect_osr_cold_sample("jit-resource-saturation.js", source, None);
+
+        assert_eq!(sample.acc, 616_416);
+        assert!(sample.stats.hotness_threshold_crossings >= 192);
+        assert!(sample.stats.osr.cache_requests >= 64);
+        assert!(sample.stats.resources.retained_code_bytes > 0);
+        assert!(sample.stats.resources.compile_time_ns > 0);
+        assert_eq!(sample.stats.resources.payload_overrun_retirements, 0);
+        assert_eq!(sample.stats.resources.compilation_failure_retirements, 0);
     }
 
     #[test]
