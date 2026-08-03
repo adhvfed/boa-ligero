@@ -30,7 +30,7 @@ Suggested commit:
 test(jit): add native coverage and fallback diagnostics
 ```
 
-## Slice 2A1 — remove interpreter-only scheduler tax
+## Slice 2A1 — remove interpreter-only scheduler tax (complete)
 
 The first admission prototype is rejected. Although it emitted neither native
 code nor a shim for losing bodies, those bodies remained roughly 1.8–2.0×
@@ -50,7 +50,7 @@ Suggested commit:
 perf(jit): bypass dormant tiering in interpreter frames
 ```
 
-## Slice 2A2 — enforce measured admission before widening coverage
+## Slice 2A2 — enforce measured admission before widening coverage (complete)
 
 Use the Gate P positive and negative controls to select the smallest explicit
 native-admission rule that suppresses known losing tiny/helper-dominated
@@ -104,29 +104,67 @@ Review commit:
 docs(jit): reject standalone receiver lowering
 ```
 
-## Slice 2C — review binding identity and invalidation
+## Slice 2C0 — reject non-continuable call entries
 
-Identify the existing VM-owned identity and invalidation signal for stable
-global-declarative and global-object reads. The first implementation candidate
-is the narrow binding form needed by the floating-point arithmetic control,
-because that single read is its only unsupported operation and the body already
-contains an admitted backward branch. Do not combine bitwise conversion, array
-storage, receiver reads, or call ABI changes into this slice.
+The binding prototype exposed a production-admission hole: a backward branch
+currently admits a caller even when its static profile contains calls, although
+generated code has no continuation after the first call. Deny call-containing
+function entries before compilation, install neither native nor shim artifact,
+and publish `denied_call_boundary`. Preserve a deliberate test-only override
+for the existing call guard/deopt semantic tests.
 
-The review must cover mutable lexical bindings, global-object replacement and
-deletion, direct `eval`, realm teardown, GC/lifetime ownership, TDZ/ReferenceError
-behavior, and exact finite-budget replay. It must also state whether current
-whole-CodeBlock entry and materialization metadata suffice.
-
-**Stop/go:** proceed to a binding lowering only if a VM-owned guard can be
-checked without retaining a raw environment pointer and the floating-point
-control becomes a complete admitted body. Otherwise check in the missing
-versioning design and re-rank OSR/calls/storage without an implementation patch.
+**Stop/go:** the method, flat-call, and property negative controls must compile
+zero artifacts and remain within 5% of interpreter medians. The floating-point
+control and W0 contain no call boundary and must retain their native entries.
 
 Suggested commit:
 
 ```text
-docs(jit): review binding-read identity and invalidation
+perf(jit): reject non-continuable call entries
+```
+
+## Slice 2C1 — lower one global-declarative binding read
+
+The [dated review](12-binding-read-and-call-boundary-review-2026-08-03.md)
+approves exactly `GetName` with a compile-time `GlobalDeclarative` locator. On
+every entry, validate locator stability, read the current binding through the
+active frame's realm, and copy it into a VM register before specializing or
+using it. Retain no raw environment pointer, binding value, or cross-realm
+snapshot. Do not combine `GetNameGlobal`, global-object, stack, eval-affected,
+write/delete, bitwise, array-storage, receiver, region, OSR, or call ABI work.
+
+Differential coverage must prove same-representation reassignment, changed-
+representation guard deopt, TDZ/`ReferenceError`, direct-eval rejection, realm
+separation, forced GC, and exact finite-budget replay. Global-object replacement
+and deletion are exclusions to be reviewed separately, not acceptance criteria
+for this lowering. Current PC-zero whole-CodeBlock and VM-register
+materialization are sufficient for the target loop.
+
+**Stop/go:** the floating-point control must execute one complete admitted body,
+retain at least a 2× warm win with a matching sink and zero steady-state deopts,
+and pass all semantic tests. Slice 2C0's negative controls and W0 remain gates.
+
+Suggested commit:
+
+```text
+perf(jit): lower stable global binding reads
+```
+
+## Slice 2C2 — behavior-neutral helper refactor
+
+The admission correction and binding lowering are two behavior slices. Pay the
+scheduled refactor before selecting another execution ABI: consolidate the
+duplicated generated-helper declaration or VM-register materialization plumbing
+exposed by 2C, without widening the allowlist or changing diagnostics.
+
+**Stop/go:** the float positive control, call-heavy negative controls, focused
+JIT suite, feature-disabled checks, formatting, and affected strict Clippy must
+remain unchanged.
+
+Suggested commit:
+
+```text
+refactor(jit): unify binding helper materialization
 ```
 
 ## Slice 3 — region stitching, only if selected

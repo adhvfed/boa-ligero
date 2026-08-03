@@ -52,20 +52,26 @@ add an opcode solely to move the diagnostic frontier.
 
 ### Environment and constant reads
 
-- `GetName`, `GetNameGlobal`, and the corresponding locator/undefined forms
-  needed to read immutable or stable global bindings;
+- first, only `GetName` whose compile-time locator is exactly
+  `GlobalDeclarative`;
+- later `GetNameGlobal`, global-object, stack, module, and dynamic-environment
+  forms only after their own measured semantic/lifetime review;
 - constant and accumulator/register moves that currently break value tracking;
-- a guarded binding/version snapshot so a global reassignment, `delete`,
-  `eval`, or dynamic environment change deopts before the read.
+- a current-frame/current-realm read after the existing locator-stability
+  guard, with a pre-effect representation guard before native use.
 
-A binding guard must use VM-owned identity/version information. Do not cache a
-raw environment pointer in generated code without a lifetime contract.
+A binding guard must use VM-owned identity/version information. The selected
+first form needs no new version: generated code validates the compile-time
+global-declarative locator, re-reads the current value through the active frame
+and realm on every entry, and stores it in a rooted VM register. Do not cache a
+raw environment pointer or binding value in generated code.
 
-This is now the next scheduled design checkpoint. `GetName` blocks every
-measured microbenchmark caller, while a safe stable read of the floating-point
-control's `N` binding would complete an otherwise-supported native loop. Treat
-the call-heavy callers as negative controls: binding coverage is accepted only
-if complete-workload time remains neutral or improves.
+The [2026-08-03 binding review](12-binding-read-and-call-boundary-review-2026-08-03.md)
+approves this narrow form. `GetName` blocks every measured microbenchmark
+caller, while the floating-point control's `N` binding completes an otherwise-
+supported native loop. The call-heavy callers are negative controls and now
+also expose a prerequisite admission correction: until a compiled caller can
+resume after a call, bodies containing calls must install no artifact.
 
 ### Integer representation operations
 
@@ -91,21 +97,23 @@ not be lowered as a floating-point or wrapping shortcut without a guard.
 Exception-handler ranges, environment-changing operations, calls, and returns
 remain explicit boundaries until their dedicated Phase 2 contracts exist.
 
-## Binding feedback snapshot
+## Binding read state
 
-At compile request time, capture only the facts the native region needs:
+For the first global-declarative read, compile-time state is limited to:
 
 ```text
-binding identity / environment version
-binding mutability facts
+binding locator index and GlobalDeclarative scope
 value representation, if specialized
-realm/code-block identity
+CodeBlock identity
 ```
 
-On every native read, guard the snapshot before producing a value. If the
-binding can invoke user code or has dynamic lookup semantics, leave it as an
-interpreter/helper exit. Materialize all live primitive SSA values before the
-guarded helper or deopt.
+On every native entry, validate locator stability and use the active frame's
+realm to read the current value into a VM register. Same-representation
+reassignment is therefore visible without invalidation. Missing/TDZ values,
+representation changes, and unstable locators deopt before the read and replay
+through the interpreter. If lookup can invoke user code or has dynamic/object
+semantics, leave it unsupported. Materialize all live primitive SSA values
+before the guarded helper or deopt.
 
 ## Region selection
 
@@ -130,11 +138,11 @@ The first implementation may still compile a whole CodeBlock when it is
 simple, but its metadata should model regions so OSR and later variants do not
 need a second compiler architecture.
 
-Before adding binding specialization, identify the existing VM-owned binding
-identity and invalidation signal. If Boa has no suitable versioned contract,
-the slice must first design and test one with environment mutation, deletion,
-direct eval, and realm teardown. A JIT-only counter or raw environment pointer
-is not an acceptable substitute.
+The binding review found that the selected global-declarative form can use the
+existing stable locator plus a current VM read instead of adding a versioned
+snapshot. Global-object deletion/replacement, stack bindings, direct-eval-
+affected scopes, and other locator forms remain unsupported and require their
+own contract. A JIT-only counter or raw environment pointer remains forbidden.
 
 ## Done criteria
 

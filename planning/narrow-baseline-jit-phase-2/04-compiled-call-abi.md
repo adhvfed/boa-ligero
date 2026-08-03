@@ -13,6 +13,14 @@ trips are a leading cost and report a useful monomorphic hit rate to an already
 compiled target. Call-heavy source alone is not evidence that the compiled
 transition is the bottleneck.
 
+Until this ABI exists, production function-entry admission must reject static
+profiles containing calls. A backward branch does not make such a caller
+continuous: the first call returns to the VM scheduler and generated code has
+no continuation at the following PC. The temporary `denied_call_boundary`
+reason and its no-artifact requirement are specified in the
+[binding/call-boundary review](12-binding-read-and-call-boundary-review-2026-08-03.md).
+Gate K may relax that denial only after a compiled caller resumes natively.
+
 ## Recommended shape
 
 Keep the existing public `extern "C" fn(*mut Context) -> u64` entry contract

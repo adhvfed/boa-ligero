@@ -22,7 +22,9 @@ interpreter as the reference implementation.
 
 - strict/sloppy/lexical/derived-constructor receiver reads if `This` is ever
   selected as part of an admitted useful region;
-- global/lexical binding reads and mutation/deletion invalidation;
+- global-declarative binding reads, same- and changed-representation mutation,
+  TDZ, realm separation, forced GC, exact budget replay, and explicit rejection
+  of global-object, stack, dynamic-environment, and direct-eval-affected forms;
 - bitwise and `ToInt32` edge cases, including NaN, infinities, `-0`, and
   out-of-range numbers;
 - region fallthrough, forward branches, backward branches, zero-iteration
@@ -101,6 +103,12 @@ Moving a first-blocker diagnostic to the next unsupported opcode does not
 satisfy Gate C. The selected CodeBlock must pass production admission and
 execute the complete measured hot region; a helper that remains denied or exits
 at the immediately following opcode is a no-go.
+
+For Slice 2C, Gate C additionally requires the floating-point binding control
+to retain at least a 2× warm win with matching sink and zero steady-state
+deopts. Call-containing entries must compile no artifact and keep the method,
+flat-call, and property negative controls within 5% of interpreter medians.
+W0 must retain its native loop, checksum, paint structure, and cold guardrail.
 
 ### Gate O — OSR
 

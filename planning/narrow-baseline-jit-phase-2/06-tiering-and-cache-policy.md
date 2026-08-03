@@ -59,10 +59,20 @@ The context-owned tier still wrapped every interpreted opcode with scheduler
 bookkeeping. That prototype was reverted and is recorded in
 [the dated admission checkpoint](10-admission-crossover-2026-08-03.md).
 
-Admission is therefore blocked on a dormant-tier interpreter fast path. A
-rejected function must run within 5% of the JIT-disabled control before a work
-floor can be judged on entry/compilation economics. Do not tune the floor or
-expand opcode coverage to compensate for scheduler overhead.
+That prerequisite is complete: `fcfc2659` moves tiering decisions to frame
+boundaries and `f0eeef75` lands the measured loop-or-45 rule. Rejected controls
+are within the 5% JIT-disabled parity guardrail and profitable straight-line
+entries plus W0 retain their wins. `612c7dc6` subsequently consolidates the
+dormant interpreter path without changing that result.
+
+The binding prototype exposed a narrower admission hole. A body with a
+backward branch is currently admitted even when its static profile contains
+calls, but generated callers cannot resume natively after a call. Production
+admission must therefore deny call-containing function entries, emit no shim
+or native artifact, and report `denied_call_boundary`. Keep a test-only
+override for call-lowering semantics. This temporary rule is relaxed only by
+the reviewed compiled-call ABI and Gate K, not by adding lowering for
+instructions before the call.
 
 ## Thresholds and hysteresis
 
