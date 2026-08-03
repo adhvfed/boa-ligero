@@ -584,7 +584,6 @@ struct Helper {
     signature: cranelift_codegen::ir::SigRef,
 }
 
-#[derive(Clone, Copy)]
 struct Helpers {
     ptr: cranelift_codegen::ir::Type,
     guard: Helper,
@@ -629,7 +628,6 @@ struct NativeCompiler<'a> {
     mode: NativeMode,
     analysis: RegisterAnalysis,
     current_instruction: usize,
-    helpers: Option<Helpers>,
     variables: Vec<Variable>,
     dirty: BTreeSet<usize>,
     charge_instruction_budget: bool,
@@ -651,7 +649,6 @@ impl<'a> NativeCompiler<'a> {
             mode,
             analysis,
             current_instruction: 0,
-            helpers: None,
             variables: Vec::new(),
             dirty: BTreeSet::new(),
             charge_instruction_budget,
@@ -689,9 +686,8 @@ impl<'a> NativeCompiler<'a> {
         };
 
         let helpers = self.build_helpers(&mut bcx, ptr);
-        self.helpers = Some(helpers);
 
-        let guard_ok = self.emit_entry_guard(&mut bcx, ctx_val, entry_deopt, helpers);
+        let guard_ok = self.emit_entry_guard(&mut bcx, ctx_val, entry_deopt, &helpers);
         if !guard_ok {
             return None;
         }
@@ -699,7 +695,7 @@ impl<'a> NativeCompiler<'a> {
         bcx.ins().jump(code_blocks[0], &[]);
 
         bcx.switch_to_block(entry_deopt);
-        self.emit_set_pc(&mut bcx, ctx_val, helpers, 0);
+        self.emit_set_pc(&mut bcx, ctx_val, &helpers, 0);
         let entry_deopt_status = bcx.ins().iconst(
             types::I64,
             JitExit::encode_with_reason(JitExitKind::Deopt, JitExitReason::EntryGuard, 0) as i64,
@@ -721,13 +717,13 @@ impl<'a> NativeCompiler<'a> {
             self.current_instruction = index;
 
             if self.charge_instruction_budget {
-                self.emit_consume_instruction_budget(&mut bcx, ctx_val, helpers, pc, break_block);
+                self.emit_consume_instruction_budget(&mut bcx, ctx_val, &helpers, pc, break_block);
             }
 
             if !self.emit_instruction(
                 &mut bcx,
                 ctx_val,
-                helpers,
+                &helpers,
                 pc,
                 next_pc,
                 &instruction,
@@ -959,7 +955,7 @@ impl<'a> NativeCompiler<'a> {
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
-        helpers: Helpers,
+        helpers: &Helpers,
         pc: usize,
         break_block: Block,
     ) {
@@ -987,7 +983,7 @@ impl<'a> NativeCompiler<'a> {
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
         entry_deopt: Block,
-        helpers: Helpers,
+        helpers: &Helpers,
     ) -> bool {
         let guard = bcx.ins().iconst(helpers.ptr, helpers.guard.address as i64);
         let charge_instruction_budget = bcx
@@ -1009,7 +1005,7 @@ impl<'a> NativeCompiler<'a> {
         &mut self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
-        helpers: Helpers,
+        helpers: &Helpers,
         pc: usize,
         next_pc: usize,
         instruction: &Instruction,
@@ -1892,7 +1888,7 @@ impl<'a> NativeCompiler<'a> {
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
-        helpers: Helpers,
+        helpers: &Helpers,
         pc: usize,
         reason: JitExitReason,
     ) -> bool {
@@ -1941,7 +1937,7 @@ impl<'a> NativeCompiler<'a> {
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
-        helpers: Helpers,
+        helpers: &Helpers,
         pc: usize,
     ) {
         let helper = bcx.ins().iconst(helpers.ptr, helpers.set_pc.address as i64);
