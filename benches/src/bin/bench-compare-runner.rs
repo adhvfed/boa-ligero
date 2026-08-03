@@ -225,9 +225,10 @@ fn run_jit(
             "elapsed_ns={} runs={} ns_per_run={} acc={} mode=jit ",
             "cold_elapsed_ns={} cold_ns_per_run={} cold_acc={} ",
             "cold_compile_time_ns={} cold_native_entries={} cold_deopts={} ",
+            "cold_scheduler_call_exits={} ",
             "compile_time_ns={} compilations={} native_compilations={} ",
             "shim_compilations={} native_entries={} deopts={} ",
-            "cold_admission_denials={} admission_denials={}"
+            "scheduler_call_exits={} cold_admission_denials={} admission_denials={}"
         ),
         elapsed_ns,
         runs,
@@ -239,12 +240,14 @@ fn run_jit(
         cold_stats.compile_time_ns,
         cold_stats.native_entries,
         cold_stats.deopts,
+        cold_stats.scheduler_call_exits,
         stats.compile_time_ns,
         stats.compilations,
         stats.native_compilations,
         stats.shim_compilations,
         stats.native_entries,
         stats.deopts,
+        stats.scheduler_call_exits,
         cold_stats.admission_denials,
         stats.admission_denials,
     );

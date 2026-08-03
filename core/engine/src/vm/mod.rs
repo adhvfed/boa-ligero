@@ -1177,18 +1177,24 @@ impl Context {
     /// soon as the depth changes so the tiering scheduler owns the new frame
     /// before its next bytecode executes.
     #[cfg(feature = "jit")]
-    pub(crate) fn run_interpreter_until_frame_change(
+    fn run_interpreter_until_frame_change_with<F>(
         &mut self,
         frame_depth: usize,
-    ) -> ControlFlow<CompletionRecord> {
+        mut before_execute: F,
+    ) -> ControlFlow<CompletionRecord>
+    where
+        F: FnMut(&mut Self, Opcode, u32),
+    {
         while self.vm.frames.len() == frame_depth {
             let frame = self.vm.frame();
+            let pc = frame.pc;
             let Some(byte) = frame.code_block.bytecode.bytes.get(frame.pc as usize) else {
                 return ControlFlow::Break(CompletionRecord::Throw(JsError::from_native(
                     JsNativeError::error(),
                 )));
             };
             let opcode = Opcode::decode(*byte);
+            before_execute(self, opcode, pc);
 
             if let ControlFlow::Break(value) = self.execute_one(
                 |context, opcode| {
@@ -1204,6 +1210,53 @@ impl Context {
         }
 
         ControlFlow::Continue(())
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_interpreter_until_frame_change(
+        &mut self,
+        frame_depth: usize,
+    ) -> ControlFlow<CompletionRecord> {
+        self.run_interpreter_until_frame_change_with(frame_depth, |_, _, _| {})
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_interpreter_until_frame_change_with_jit(
+        &mut self,
+        frame_depth: usize,
+        backend: &mut crate::jit::JitBackend,
+    ) -> ControlFlow<CompletionRecord> {
+        if backend.observes_call_sites() {
+            self.run_interpreter_until_frame_change_with(frame_depth, |context, opcode, pc| {
+                context.observe_jit_call_site(backend, opcode, pc);
+            })
+        } else {
+            self.run_interpreter_until_frame_change(frame_depth)
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    fn observe_jit_call_site(&self, backend: &mut crate::jit::JitBackend, opcode: Opcode, pc: u32) {
+        if opcode != Opcode::Call {
+            return;
+        }
+        let (Instruction::Call { argument_count }, _) = self
+            .vm
+            .frame()
+            .code_block
+            .bytecode
+            .next_instruction(pc as usize)
+        else {
+            return;
+        };
+        let code = self.vm.frame().code_block.clone();
+        backend.observe_call_site(
+            &code,
+            pc,
+            self,
+            usize::from(argument_count),
+            !self.vm.frame().jit_entry_attempted(),
+        );
     }
 
     #[cfg(feature = "jit")]
@@ -1298,7 +1351,7 @@ impl Context {
                 JitAdmissionState::DeniedLeaf => {
                     let frame_depth = self.vm.frames.len();
                     if let ControlFlow::Break(value) =
-                        self.run_interpreter_until_frame_change(frame_depth)
+                        self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
                     {
                         return value;
                     }
@@ -1307,7 +1360,7 @@ impl Context {
                 JitAdmissionState::Denied => {
                     let frame_depth = self.vm.frames.len();
                     if let ControlFlow::Break(value) =
-                        self.run_interpreter_until_frame_change(frame_depth)
+                        self.run_interpreter_until_frame_change_with_jit(frame_depth, backend)
                     {
                         return value;
                     }
@@ -1333,17 +1386,8 @@ impl Context {
                 };
                 let opcode = Opcode::decode(*byte);
 
-                if opcode == Opcode::Call
-                    && !self.vm.frame().jit_entry_attempted()
-                    && let (Instruction::Call { argument_count }, _) = self
-                        .vm
-                        .frame()
-                        .code_block
-                        .bytecode
-                        .next_instruction(old_pc as usize)
-                {
-                    let code = self.vm.frame().code_block.clone();
-                    backend.record_call_target(&code, old_pc, self, usize::from(argument_count));
+                if backend.observes_call_sites() {
+                    self.observe_jit_call_site(backend, opcode, old_pc);
                 }
 
                 match self.execute_one(
@@ -1367,8 +1411,11 @@ impl Context {
                         self.vm.frame_mut().mark_jit_entry_counted();
                         self.vm.frame_mut().mark_jit_entry_attempted();
                         backend.record_function_entry(self.vm.frame().code_block.as_ref());
-                        if let ControlFlow::Break(value) =
-                            self.run_interpreter_until_frame_change(old_frame_depth + 1)
+                        if let ControlFlow::Break(value) = self
+                            .run_interpreter_until_frame_change_with_jit(
+                                old_frame_depth + 1,
+                                backend,
+                            )
                         {
                             return value;
                         }

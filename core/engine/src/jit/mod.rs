@@ -157,6 +157,8 @@ pub struct JitStats {
     pub native_entries: u64,
     /// Number of native entries that returned to the interpreter.
     pub deopts: u64,
+    /// Number of native call exits handed to the general VM scheduler.
+    pub scheduler_call_exits: u64,
     /// Number of static context-tier admission decisions that kept a code
     /// block on the interpreter path.
     pub admission_denials: u64,
@@ -165,7 +167,7 @@ pub struct JitStats {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 4;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 5;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -183,6 +185,9 @@ pub struct JitDiagnosticLimits {
     pub admission_records: usize,
     /// Maximum number of distinct exit records retained by a context.
     pub exit_records: usize,
+    /// Maximum number of distinct interpreted call-site records retained by a
+    /// context.
+    pub call_records: usize,
 }
 
 impl JitDiagnosticLimits {
@@ -195,6 +200,7 @@ impl JitDiagnosticLimits {
                 .admission_records
                 .min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
             exit_records: self.exit_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
+            call_records: self.call_records.min(MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND),
         }
     }
 }
@@ -205,6 +211,7 @@ impl Default for JitDiagnosticLimits {
             compile_records: 256,
             admission_records: 256,
             exit_records: 256,
+            call_records: 256,
         }
     }
 }
@@ -431,6 +438,39 @@ pub struct JitAdmissionRecord {
     pub native_property_instructions: u32,
 }
 
+/// One bounded, source-free interpreted call-site record.
+///
+/// The target identity used to classify first/same/changed observations is
+/// retained only inside the context's bounded diagnostic state. It is never
+/// included in this public snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitCallSiteRecord {
+    /// Runtime-local caller code-block identity.
+    pub caller_code_id: u64,
+    /// Bytecode PC of the interpreted `Call` instruction.
+    pub pc: u32,
+    /// Total calls observed at this site.
+    pub calls: u64,
+    /// Calls whose current target satisfies the narrow ordinary-function
+    /// predicate used by the existing native call lowering.
+    pub ordinary_calls: u64,
+    /// Calls to every other target, including values that later throw as
+    /// non-callable and native, proxy, bound, or constructor targets.
+    pub non_ordinary_calls: u64,
+    /// First retained ordinary-target observation at this site.
+    pub first_ordinary_target_calls: u64,
+    /// Ordinary calls matching the last retained target at this site.
+    pub same_ordinary_target_calls: u64,
+    /// Ordinary calls differing from the last retained target at this site.
+    pub changed_ordinary_target_calls: u64,
+    /// Ordinary calls whose target already had a cached native entry for the
+    /// current instruction-budget mode.
+    pub cached_native_target_calls: u64,
+    /// Ordinary calls whose target already had a cached shim entry for the
+    /// current instruction-budget mode.
+    pub cached_shim_target_calls: u64,
+}
+
 /// Stable snapshot of opt-in detailed JIT diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct JitDiagnosticSnapshot {
@@ -444,12 +484,32 @@ pub struct JitDiagnosticSnapshot {
     pub admission_records: Vec<JitAdmissionRecord>,
     /// Aggregated native exits in deterministic key order.
     pub exit_records: Vec<JitExitRecord>,
+    /// Aggregated interpreted calls in deterministic caller/PC order.
+    pub call_records: Vec<JitCallSiteRecord>,
     /// Compilation records omitted after reaching the configured bound.
     pub dropped_compile_records: u64,
     /// Admission records omitted after reaching the configured bound.
     pub dropped_admission_records: u64,
     /// Exit records omitted after reaching the configured bound.
     pub dropped_exit_records: u64,
+    /// Call observations omitted because their site was not retained after
+    /// reaching the configured bound.
+    pub dropped_call_observations: u64,
+}
+
+#[derive(Debug)]
+struct JitCallSiteDiagnosticState {
+    record: JitCallSiteRecord,
+    last_ordinary_target_code_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum JitCallTargetObservation {
+    NonOrdinary,
+    Ordinary {
+        code_id: u64,
+        cached_native: Option<bool>,
+    },
 }
 
 #[derive(Debug)]
@@ -458,9 +518,12 @@ struct JitDiagnosticState {
     compile_records: Vec<JitCompileRecord>,
     admission_records: Vec<JitAdmissionRecord>,
     exit_records: Vec<JitExitRecord>,
+    call_records: Vec<JitCallSiteDiagnosticState>,
+    call_record_indices: FxHashMap<(u64, u32), usize>,
     dropped_compile_records: u64,
     dropped_admission_records: u64,
     dropped_exit_records: u64,
+    dropped_call_observations: u64,
 }
 
 impl JitDiagnosticState {
@@ -471,9 +534,12 @@ impl JitDiagnosticState {
             compile_records: Vec::with_capacity(limits.compile_records.min(64)),
             admission_records: Vec::with_capacity(limits.admission_records.min(64)),
             exit_records: Vec::with_capacity(limits.exit_records.min(64)),
+            call_records: Vec::with_capacity(limits.call_records.min(64)),
+            call_record_indices: FxHashMap::default(),
             dropped_compile_records: 0,
             dropped_admission_records: 0,
             dropped_exit_records: 0,
+            dropped_call_observations: 0,
         }
     }
 
@@ -522,6 +588,67 @@ impl JitDiagnosticState {
         }
     }
 
+    fn record_call_site(&mut self, caller_code_id: u64, pc: u32, target: JitCallTargetObservation) {
+        let key = (caller_code_id, pc);
+        let state = if let Some(index) = self.call_record_indices.get(&key).copied() {
+            &mut self.call_records[index]
+        } else if self.call_records.len() < self.limits.call_records {
+            let index = self.call_records.len();
+            self.call_records.push(JitCallSiteDiagnosticState {
+                record: JitCallSiteRecord {
+                    caller_code_id,
+                    pc,
+                    ..JitCallSiteRecord::default()
+                },
+                last_ordinary_target_code_id: None,
+            });
+            self.call_record_indices.insert(key, index);
+            &mut self.call_records[index]
+        } else {
+            self.dropped_call_observations = self.dropped_call_observations.saturating_add(1);
+            return;
+        };
+
+        state.record.calls = state.record.calls.saturating_add(1);
+        match target {
+            JitCallTargetObservation::NonOrdinary => {
+                state.record.non_ordinary_calls = state.record.non_ordinary_calls.saturating_add(1);
+            }
+            JitCallTargetObservation::Ordinary {
+                code_id,
+                cached_native,
+            } => {
+                state.record.ordinary_calls = state.record.ordinary_calls.saturating_add(1);
+                match state.last_ordinary_target_code_id {
+                    None => {
+                        state.record.first_ordinary_target_calls =
+                            state.record.first_ordinary_target_calls.saturating_add(1);
+                    }
+                    Some(previous) if previous == code_id => {
+                        state.record.same_ordinary_target_calls =
+                            state.record.same_ordinary_target_calls.saturating_add(1);
+                    }
+                    Some(_) => {
+                        state.record.changed_ordinary_target_calls =
+                            state.record.changed_ordinary_target_calls.saturating_add(1);
+                    }
+                }
+                state.last_ordinary_target_code_id = Some(code_id);
+                match cached_native {
+                    Some(true) => {
+                        state.record.cached_native_target_calls =
+                            state.record.cached_native_target_calls.saturating_add(1);
+                    }
+                    Some(false) => {
+                        state.record.cached_shim_target_calls =
+                            state.record.cached_shim_target_calls.saturating_add(1);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
         compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
@@ -537,15 +664,23 @@ impl JitDiagnosticState {
                 record.reason,
             )
         });
+        let mut call_records = self
+            .call_records
+            .iter()
+            .map(|state| state.record)
+            .collect::<Vec<_>>();
+        call_records.sort_by_key(|record| (record.caller_code_id, record.pc));
         JitDiagnosticSnapshot {
             schema_version: JIT_DIAGNOSTIC_SCHEMA_VERSION,
             limits: self.limits,
             compile_records,
             admission_records,
             exit_records,
+            call_records,
             dropped_compile_records: self.dropped_compile_records,
             dropped_admission_records: self.dropped_admission_records,
             dropped_exit_records: self.dropped_exit_records,
+            dropped_call_observations: self.dropped_call_observations,
         }
     }
 }
@@ -853,32 +988,63 @@ impl JitBackend {
         self.stats.deopts = self.stats.deopts.saturating_add(1);
     }
 
-    /// Record the ordinary function target observed before an interpreter
-    /// `Call` opcode executes. This is deliberately last-target feedback: the
-    /// first baseline tier is monomorphic and a changed target deopts rather
-    /// than widening the native call sequence.
-    pub(crate) fn record_call_target(
+    /// Whether the interpreter needs to report call sites to this backend.
+    ///
+    /// Production call-target feedback is disabled until compiled callers
+    /// have a continuation ABI. Detailed diagnostics remain independently
+    /// opt-in and bounded.
+    pub(crate) const fn observes_call_sites(&self) -> bool {
+        self.diagnostics.is_some() || self.admission_allow_call_boundaries
+    }
+
+    /// Observe one interpreted `Call` without changing production admission.
+    ///
+    /// Detailed records are bounded and source-free. The legacy last-target
+    /// feedback remains available only to the existing in-crate native-call
+    /// semantic tests, and only before the caller has attempted its entry.
+    pub(crate) fn observe_call_site(
         &mut self,
         code: &CodeBlock,
         pc: u32,
         context: &Context,
         argument_count: usize,
+        record_legacy_feedback: bool,
     ) {
+        if !self.observes_call_sites() {
+            return;
+        }
+
         let function = context
             .vm
             .stack
             .calling_convention_get_function(argument_count);
-        let Some(object) = function.as_object() else {
-            return;
+        let ordinary_target = function.as_object().and_then(|object| {
+            let function = object.downcast_ref::<OrdinaryFunction>()?;
+            (function.codeblock().is_ordinary() && !function.codeblock().is_class_constructor())
+                .then(|| function.codeblock().debug_id)
+        });
+
+        let target = if let Some(target_code_id) = ordinary_target {
+            if self.admission_allow_call_boundaries && record_legacy_feedback {
+                self.call_targets
+                    .insert((code.debug_id, pc), target_code_id);
+            }
+            let budgeted = context.instruction_budget_remaining().is_some();
+            let cached_native = self
+                .cache
+                .get(&(target_code_id, budgeted))
+                .map(|entry| entry.native);
+            JitCallTargetObservation::Ordinary {
+                code_id: target_code_id,
+                cached_native,
+            }
+        } else {
+            JitCallTargetObservation::NonOrdinary
         };
-        let Some(function) = object.downcast_ref::<OrdinaryFunction>() else {
-            return;
-        };
-        if !function.codeblock().is_ordinary() || function.codeblock().is_class_constructor() {
-            return;
+
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.record_call_site(code.debug_id, pc, target);
         }
-        self.call_targets
-            .insert((code.debug_id, pc), function.codeblock().debug_id);
     }
 
     /// Return the monomorphic target recorded for a bytecode call site.
@@ -1006,8 +1172,19 @@ impl JitBackend {
         // SAFETY: `context` is exclusively borrowed for the duration of the
         // native call, and the backend owns the generated code pointer.
         let status = (cached.entry)(std::ptr::from_mut(context));
+        let decoded_exit = JitExit::decode(status);
+        if matches!(
+            decoded_exit,
+            Some(JitExit {
+                kind: JitExitKind::Call,
+                reason: JitExitReason::Scheduler,
+                ..
+            })
+        ) {
+            self.stats.scheduler_call_exits = self.stats.scheduler_call_exits.saturating_add(1);
+        }
         if let Some(started) = started {
-            let exit = JitExit::decode(status).or_else(|| {
+            let exit = decoded_exit.or_else(|| {
                 if status & JIT_BREAK_BIT != 0 {
                     context.vm.jit_exit_pending.take().or(Some(JitExit {
                         kind: JitExitKind::Completion,
@@ -1473,6 +1650,7 @@ mod tests {
             compile_records: 1,
             admission_records: 0,
             exit_records: 0,
+            call_records: 0,
         });
         let _ = bounded.cached_entry(&native_code, false);
         let _ = bounded.cached_entry(&unsupported_code, false);
@@ -1485,6 +1663,7 @@ mod tests {
             compile_records: usize::MAX,
             admission_records: usize::MAX,
             exit_records: usize::MAX,
+            call_records: usize::MAX,
         });
         let hard_bounded = hard_bounded
             .diagnostic_snapshot()
@@ -1495,6 +1674,7 @@ mod tests {
                 compile_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 admission_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
                 exit_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
+                call_records: MAX_JIT_DIAGNOSTIC_RECORDS_PER_KIND,
             }
         );
     }
@@ -1566,6 +1746,7 @@ mod tests {
             compile_records: 0,
             admission_records: 1,
             exit_records: 0,
+            call_records: 0,
         });
         assert!(!bounded.admit_function_entry(&tiny_code));
         assert!(bounded.admit_function_entry(&loop_code));
@@ -1594,6 +1775,7 @@ mod tests {
         assert_eq!(stats.compilations, 0, "stats: {stats:?}");
         assert_eq!(stats.shim_compilations, 0, "stats: {stats:?}");
         assert_eq!(stats.native_compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
         let diagnostics = context
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
@@ -1604,6 +1786,108 @@ mod tests {
                 && record.native_backward_branches > 0
                 && record.native_call_instructions > 0
         }));
+        let call = diagnostics
+            .call_records
+            .iter()
+            .find(|record| record.ordinary_calls > 0 && record.same_ordinary_target_calls > 0)
+            .expect("the denied caller's dynamic call site was retained");
+        assert_eq!(call.calls, call.ordinary_calls + call.non_ordinary_calls);
+        assert_eq!(
+            call.ordinary_calls,
+            call.first_ordinary_target_calls
+                + call.same_ordinary_target_calls
+                + call.changed_ordinary_target_calls
+        );
+        assert_eq!(call.first_ordinary_target_calls, 1);
+        assert_eq!(call.changed_ordinary_target_calls, 0);
+        assert_eq!(diagnostics.dropped_call_observations, 0);
+        let serialized = serde_json::to_string(&diagnostics).expect("serialize diagnostics");
+        assert!(!serialized.contains("increment"));
+        assert!(!serialized.contains("sum"));
+    }
+
+    #[test]
+    fn context_owned_jit_call_diagnostics_attribute_targets_without_compiling_callers() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; } return total; } function subtract(value) { return value - 1; } function apply(callback, value) { return callback(value); } let answer = 0; for (let index = 0; index < 70; index++) { answer = hot(10); } for (let index = 0; index < 70; index++) { answer = apply(hot, 10); } answer = answer + apply(subtract, 5); answer = answer + apply(Math.max, 5); answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(54));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        let call = diagnostics
+            .call_records
+            .iter()
+            .find(|record| {
+                record.same_ordinary_target_calls > 0
+                    && record.changed_ordinary_target_calls > 0
+                    && record.non_ordinary_calls > 0
+            })
+            .expect("the mixed dynamic call site was retained");
+        assert_eq!(call.calls, call.ordinary_calls + call.non_ordinary_calls);
+        assert_eq!(
+            call.ordinary_calls,
+            call.first_ordinary_target_calls
+                + call.same_ordinary_target_calls
+                + call.changed_ordinary_target_calls
+        );
+        assert_eq!(call.first_ordinary_target_calls, 1);
+        assert!(call.cached_native_target_calls >= 70, "call: {call:?}");
+        assert_eq!(call.cached_shim_target_calls, 0);
+        assert!(diagnostics.admission_records.iter().any(|record| {
+            record.code_id == call.caller_code_id
+                && !record.allowed
+                && record.reason == JitAdmissionReason::DeniedCallBoundary
+        }));
+        assert!(
+            diagnostics
+                .compile_records
+                .iter()
+                .all(|record| record.code_id != call.caller_code_id),
+            "the denied caller must not install an artifact: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn jit_call_diagnostics_are_hard_bounded() {
+        let source = "function increment(value) { return value + 1; } function first(callback, value) { return callback(value); } function second(callback, value) { return callback(value); } first(increment, 1) + second(increment, 2)";
+
+        let run = |call_records| {
+            let mut context = Context::default();
+            context.enable_jit_diagnostics(JitDiagnosticLimits {
+                call_records,
+                ..JitDiagnosticLimits::default()
+            });
+            let script =
+                crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+                    .expect("parse");
+            let result = script.evaluate(&mut context).expect("evaluate");
+            assert_eq!(result.as_i32(), Some(5));
+            context
+                .jit_diagnostic_snapshot()
+                .expect("diagnostics were enabled")
+        };
+
+        let one = run(1);
+        assert_eq!(one.call_records.len(), 1);
+        assert!(one.dropped_call_observations >= 1, "snapshot: {one:?}");
+
+        let zero = run(0);
+        assert!(zero.call_records.is_empty());
+        assert!(zero.dropped_call_observations >= 2, "snapshot: {zero:?}");
     }
 
     #[test]
@@ -2013,6 +2297,7 @@ mod tests {
                 compile_records: 0,
                 admission_records: 0,
                 exit_records: 1,
+                call_records: 0,
             },
         );
         let overflow = crate::Script::parse(
@@ -2409,7 +2694,10 @@ mod tests {
     #[test]
     fn context_owned_jit_dispatches_native_ordinary_function_call() {
         let mut context = Context::default();
-        enable_jit_without_admission_floor(&mut context);
+        enable_jit_diagnostics_without_admission_floor(
+            &mut context,
+            JitDiagnosticLimits::default(),
+        );
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let answer = 0; for (let i = 0; i < 80; i++) { answer = apply(add, 20, 22); } answer",
@@ -2425,6 +2713,15 @@ mod tests {
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 2, "stats: {stats:?}");
         assert!(stats.native_entries >= 2, "stats: {stats:?}");
+        assert!(stats.scheduler_call_exits > 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Call
+                && record.reason == JitExitReason::Scheduler
+                && record.count > 0
+        }));
     }
 
     #[test]
