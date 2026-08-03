@@ -315,9 +315,10 @@ showing that another boundary dominates.
   body-size, feedback, and diagnostic bounds; suppression/retirement semantics;
   raw-emitter closure; and the implementation acceptance matrix.
 - [Default-JIT resource governor checkpoint, 2026-08-03](32-default-jit-resource-governor-checkpoint-2026-08-03.md)
-  — landed D1 implementation commits, schema-10 projection, verification
-  evidence, and the exact combined-capacity, diagnostics, failure, structural,
-  cold-start, and RSS work still blocking D1 closure.
+  — landed D1 implementation commits, schema-10 projection, deterministic
+  acceptance, release-runner saturation fixture, and automated process gate;
+  only the binding seven-pair cold-start/RSS run awaits a quiet host before D1
+  closure.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

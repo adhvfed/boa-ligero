@@ -2,15 +2,21 @@
 
 ## Result
 
-The two D1 implementation commits are landed, but D1 is not closed. Boa
+The D1 implementation and deterministic acceptance commits are landed, but D1
+is not closed. Boa
 `42623234` bounds retained function-entry state, decoded PC-zero bodies, legacy
 call-target feedback, and unseen loop planning. Boa `2888c024` adds unified
-payload/time accounting, initial schema-9 source-free counters, and immediate backend
-retirement when a finalized artifact would cross the retained-payload bound.
+payload/time accounting, initial schema-9 source-free counters, and immediate
+backend retirement when a finalized artifact would cross the retained-payload
+bound.
 Ligero `72568c9a` projects the new instruction-limit blocker and `dfdc0714`
 projects those initial schema-9 resource counters. Returned compiler/module-
-failure containment adds a source-free retirement counter and deliberately
-advances the completed contract to schema 10.
+failure containment in `1fb773d8` adds a source-free retirement counter,
+deliberately advances the completed contract to schema 10, and drops a module
+that returned a native, shim, or loop compilation failure before interpreter
+continuation. Boa `e69830aa` covers the combined capacity/variant, maximum-
+diagnostic, and governed-emitter matrix. Boa `c1b17cd1` adds the release-runner
+saturation workload, and `273508f8` automates the matched process gate.
 
 The implementation does not change opcode eligibility, hotness thresholds,
 remote-script policy, the JIT build default, or the runtime default. D0 and the
@@ -36,10 +42,11 @@ cached nor invoked. The backend enters `RetiringResourceOverrun`, returns the
 distinct `RetireAndInterpret` scheduler outcome, and the outer VM drops the
 owning `JITModule` before resuming the interpreter from the current VM state.
 
-The resource counters are fixed-size and source-free. Schema 9 reports
+The resource counters are fixed-size and source-free. Schema 10 reports
 function-capacity, oversized-body, terminal-failure-hit, call-target-capacity,
-payload, cumulative-time, slow-attempt, and payload-retirement events together
-with retained payload bytes and observed compilation nanoseconds. Ligero
+payload, cumulative-time, slow-attempt, payload-retirement, and returned-
+compilation-failure retirement events together with retained payload bytes and
+observed compilation nanoseconds. Ligero
 projects those numeric counters without page source, URL, names, values,
 identities, or pointers.
 
@@ -47,8 +54,8 @@ identities, or pointers.
 
 The implementation checkpoint passes:
 
-- focused JIT tests: 79 passed, one performance benchmark ignored;
-- full JIT engine library: 1,225 passed, one benchmark ignored;
+- focused JIT tests: 87 passed, one performance benchmark ignored;
+- full JIT engine library: 1,233 passed, one benchmark ignored;
 - interpreter/default engine library: 1,138 passed;
 - `cargo check -p boa_engine --lib --no-default-features`;
 - `cargo fmt --all -- --check` and `git diff --check`;
@@ -73,26 +80,19 @@ D1 remains open until all of the following are checked in:
    diagnostics fixtures. Record raw peak RSS, cold time, payload, compile time,
    cache reuse, hashes, OS, and allocator. Enforce the +5% no-artifact median
    and 64 MiB per-pair RSS-delta rollback bounds.
-2. Add the combined capacity/variant matrix in both fill orders. It must prove
-   coexistence of 192 function and 64 loop keys and non-aliasing of budgeted,
-   diagnostic, entry-PC, and numeric-representation variants.
-3. Saturate every detailed diagnostic class at the 4,096 hard cap and assert
-   each index map remains no larger than its vector, all serialized fields are
-   source-free, and the process-level RSS gate still passes.
-4. Resolve the recoverable compilation-failure contract. The current
-   production compiler treats Cranelift declaration/definition/finalization
-   failures as fatal panics, while `FunctionEntryState::TerminalFailure` is a
-   test-only ownership state. Either make production compilation return a
-   contained failure that occupies one already-admitted key without retry, or
-   move that failure class explicitly into D2's fail-closed backend-retirement
-   contract and remove the unsupported D1 claim.
-5. Add a structural/source audit proving production code has no direct raw
-   emitter outside the governed native, shim, and loop producers. The two old
-   convenience emitters are now private test-only seams, but the invariant
-   should fail automatically if another production escape hatch appears.
+   The automated one-pair smoke run preserves sinks and passes the rollback
+   limits, but is non-binding. The seven-pair run was correctly deferred when
+   `apfsd` and `mediaanalysisd` each occupied approximately one CPU core and
+   metadata/window services added further load; no timing or RSS result from
+   that preflight is admission evidence.
 
-The default flip is not scheduled for implementation by this checkpoint. D1
-must close first, then D2–D4 must pass against one identified release
+The combined capacity/variant matrix, maximum diagnostic cardinality and
+source-free serialization checks, structural emitter audit, and returned
+failure containment are complete. They do not need to be repeated as open
+work unless the resource policy changes.
+
+The default flip is scheduled as D5 but is not yet eligible for implementation.
+D1 must close first, then D2–D4 must pass against one identified release
 candidate. D5 remains a separately revertible policy-only commit with an
 explicit interpreter opt-out and a regression proving it does not enable
 remote scripts.
