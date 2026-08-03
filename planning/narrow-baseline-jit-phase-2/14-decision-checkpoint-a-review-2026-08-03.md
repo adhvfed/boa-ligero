@@ -113,6 +113,12 @@ observation without retaining a dropped-site set. Production admission remains
 unchanged. The existing in-crate override may characterize the old scheduler
 bridge, but cannot satisfy Gate K.
 
+Follow-up: the bounded schema-5 call sub-slice landed in Boa `0bc757a2` and
+Ligero `1d58914a`. The fixed flat and method sites are dynamically monomorphic,
+but neither target is native-cached; see the
+[Slice 3A call-attribution checkpoint](15-slice-3a-call-attribution-2026-08-03.md).
+Loop/storage attribution and Gate H still precede ABI selection.
+
 ## Storage and coverage evidence gap
 
 Admission records expose static property instruction counts and the native
