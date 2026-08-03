@@ -2742,6 +2742,98 @@ mod tests {
         42
     }
 
+    extern "C" fn malformed_loop_untagged(_: *mut Context) -> u64 {
+        0
+    }
+
+    extern "C" fn malformed_loop_unknown_kind(_: *mut Context) -> u64 {
+        JIT_EXIT_BIT | 0xff
+    }
+
+    extern "C" fn malformed_loop_unknown_reason(_: *mut Context) -> u64 {
+        JIT_EXIT_BIT | (0xff << JIT_EXIT_REASON_SHIFT) | JitExitKind::Deopt as u64
+    }
+
+    extern "C" fn malformed_loop_return(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::Return, JitExitReason::Return)
+    }
+
+    extern "C" fn malformed_loop_call(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::Call, JitExitReason::Scheduler)
+    }
+
+    extern "C" fn malformed_loop_completion(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::Completion, JitExitReason::Exception)
+    }
+
+    extern "C" fn malformed_loop_budget(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::Budget, JitExitReason::RuntimeLimit)
+    }
+
+    extern "C" fn malformed_loop_entry_rejected(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::EntryRejected, JitExitReason::Unknown)
+    }
+
+    extern "C" fn malformed_loop_continuation(context: *mut Context) -> u64 {
+        malformed_loop_status(context, JitExitKind::Continuation, JitExitReason::LoopExit)
+    }
+
+    extern "C" fn malformed_loop_deopt(_: *mut Context) -> u64 {
+        JitExit::encode_with_reason(JitExitKind::Deopt, JitExitReason::IntegerOverflow, u32::MAX)
+    }
+
+    extern "C" fn malformed_loop_break_without_pending(_: *mut Context) -> u64 {
+        JIT_BREAK_BIT
+    }
+
+    extern "C" fn malformed_loop_break_without_completion(context: *mut Context) -> u64 {
+        // SAFETY: the production scheduler passes an exclusive pointer to the
+        // live context for the duration of the native entry.
+        let context = unsafe { &mut *context };
+        context.vm.jit_exit_pending = Some(JitExit {
+            kind: JitExitKind::Budget,
+            reason: JitExitReason::RuntimeLimit,
+            pc: context.vm.frame().pc,
+        });
+        JIT_BREAK_BIT
+    }
+
+    extern "C" fn malformed_loop_break_without_exit(context: *mut Context) -> u64 {
+        // SAFETY: the production scheduler passes an exclusive pointer to the
+        // live context for the duration of the native entry.
+        let context = unsafe { &mut *context };
+        context.vm.jit_pending = Some(CompletionRecord::Throw(
+            crate::error::PanicError::new("synthetic malformed JIT break").into(),
+        ));
+        JIT_BREAK_BIT
+    }
+
+    extern "C" fn malformed_loop_break_mismatched_exit(context: *mut Context) -> u64 {
+        // SAFETY: the production scheduler passes an exclusive pointer to the
+        // live context for the duration of the native entry.
+        let context = unsafe { &mut *context };
+        context.vm.jit_pending = Some(CompletionRecord::Throw(
+            crate::error::PanicError::new("synthetic malformed JIT break").into(),
+        ));
+        context.vm.jit_exit_pending = Some(JitExit {
+            kind: JitExitKind::Budget,
+            reason: JitExitReason::RuntimeLimit,
+            pc: u32::MAX,
+        });
+        JIT_BREAK_BIT
+    }
+
+    fn malformed_loop_status(
+        context: *mut Context,
+        kind: JitExitKind,
+        reason: JitExitReason,
+    ) -> u64 {
+        // SAFETY: each caller is a test native entry invoked with the
+        // scheduler's exclusive pointer to a live context.
+        let context = unsafe { &mut *context };
+        JitExit::encode_with_reason(kind, reason, context.vm.frame().pc)
+    }
+
     fn first_function_code(source: &str) -> boa_gc::Gc<CodeBlock> {
         let mut context = Context::default();
         let script = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
@@ -5008,6 +5100,106 @@ mod tests {
                 .as_number(),
             Some(3.5)
         );
+    }
+
+    #[test]
+    fn context_owned_jit_contains_every_malformed_osr_status_class() {
+        type FakeLoopEntry = extern "C" fn(*mut Context) -> u64;
+
+        let cases: &[(&str, FakeLoopEntry)] = &[
+            ("untagged status", malformed_loop_untagged),
+            ("unknown exit kind", malformed_loop_unknown_kind),
+            ("unknown exit reason", malformed_loop_unknown_reason),
+            ("return exit", malformed_loop_return),
+            ("call exit", malformed_loop_call),
+            ("completion exit", malformed_loop_completion),
+            ("budget exit", malformed_loop_budget),
+            ("bad entry rejection", malformed_loop_entry_rejected),
+            ("bad continuation", malformed_loop_continuation),
+            ("bad deopt", malformed_loop_deopt),
+            (
+                "break without pending state",
+                malformed_loop_break_without_pending,
+            ),
+            (
+                "break without completion",
+                malformed_loop_break_without_completion,
+            ),
+            ("break without exit", malformed_loop_break_without_exit),
+            (
+                "break with mismatched exit",
+                malformed_loop_break_mismatched_exit,
+            ),
+        ];
+
+        for &(label, fake_entry) in cases {
+            let mut context = Context::default();
+            context.enable_jit();
+            context.set_jit_thresholds(JitThresholds {
+                function_entries: u32::MAX,
+                loop_backedges: 1,
+            });
+            crate::Script::parse(
+                crate::Source::from_bytes(
+                    "function once(limit) { Math.abs(limit); let total = 0.5; for (let i = 0; i < limit; i++) { total = total + i; } return total; }",
+                ),
+                None,
+                &mut context,
+            )
+            .unwrap_or_else(|error| panic!("{label}: parse definition: {error}"))
+            .evaluate(&mut context)
+            .unwrap_or_else(|error| panic!("{label}: define function: {error}"));
+
+            let evaluate_once = |context: &mut Context| {
+                crate::Script::parse(crate::Source::from_bytes("once(3)"), None, context)
+                    .expect("parse call")
+                    .evaluate(context)
+            };
+            assert_eq!(
+                evaluate_once(&mut context)
+                    .unwrap_or_else(|error| panic!("{label}: prime loop artifact: {error}"))
+                    .as_number(),
+                Some(3.5),
+                "{label}"
+            );
+            let backend = context.jit_backend.as_mut().expect("JIT backend");
+            assert_eq!(backend.loop_cache.len(), 1, "{label}");
+            backend
+                .loop_cache
+                .values_mut()
+                .next()
+                .expect("cached loop artifact")
+                .compiled
+                .entry = fake_entry;
+
+            let error = match evaluate_once(&mut context) {
+                Ok(value) => {
+                    panic!("{label}: malformed status must abort JIT, returned {value:?}")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.as_engine(),
+                    Some(EngineError::Panic(error))
+                        if error.message() == "invalid JIT loop exit metadata"
+                ),
+                "{label}: {error}"
+            );
+            assert!(!context.jit_enabled(), "{label}");
+            assert_eq!(context.active_jit_backend_id, 0, "{label}");
+            assert!(context.vm.jit_pending.is_none(), "{label}");
+            assert!(context.vm.jit_exit_pending.is_none(), "{label}");
+            assert_eq!(context.vm.frames.len(), 1, "{label}");
+
+            assert_eq!(
+                evaluate_once(&mut context)
+                    .unwrap_or_else(|error| panic!("{label}: interpreter recovery: {error}"))
+                    .as_number(),
+                Some(3.5),
+                "{label}"
+            );
+        }
     }
 
     #[test]
