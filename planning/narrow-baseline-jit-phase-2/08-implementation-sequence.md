@@ -383,11 +383,13 @@ Land the shape through these independently reversible boundaries:
 5. **4A1.5 — verification-only differential and workload gate.** Change no
    opcode eligibility, representation, threshold, cache policy, or execution
    ABI. Close these independently reviewable evidence groups:
-   - **4A1.5a, semantic/accounting:** cold-compile and cache-hit interpreter
+   - **4A1.5a, semantic/accounting (complete, Boa `92acfa22`):** cold-compile and cache-hit interpreter
      differential at one instruction before/at/after OSR entry, first native
      header opcode, `IncrementLoopIteration`, each pre-effect replay guard, and
      the external exit; unbudgeted→budgeted variant separation; exact loop-
-     limit/error/remaining-budget/PC/sink state.
+     limit/error/remaining-budget/PC/sink state. The landed production-path
+     harness sweeps every budget boundary rather than only the three required
+     points and covers Add/Sub/Mul/Inc overflow replay in both cache modes.
    - **4A1.5b, containment/lifetime:** forced GC around compile/cache entry/
      return, recursion and nested frames, dynamic representation change,
      malformed status/resume/pending-completion containment, stale guard

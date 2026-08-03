@@ -53,11 +53,13 @@ materializes its validated continuation. Boa `55701ef4` now completes Slice
 4A1.4's production wiring at the reviewed post-backedge ownership boundary. A
 separate per-frame OSR decision, exact cached-metadata validation, and dormant-
 dispatch handoff make the first numeric shape reachable without changing
-opcode eligibility. Slice 4A1 is not closed yet: 4A1.5 must complete the exact
-boundary differential, security/cache containment, fixed performance matrix,
-and browser rollback gates before the scheduler edge is accepted. The
-separately revertible 4A1.R refactor remains mandatory after that gate and
-before Decision checkpoint B.
+opcode eligibility. Boa `92acfa22` closes 4A1.5a with exhaustive cold/cache-hit
+instruction-budget and loop-limit differentials through the production path,
+including every first-shape opcode PC and every arithmetic replay guard. Slice
+4A1 is not closed yet: 4A1.5b must close security/cache containment and 4A1.5c
+must close the fixed performance/browser rollback matrix before the scheduler
+edge is accepted. The separately revertible 4A1.R refactor remains mandatory
+after that gate and before Decision checkpoint B.
 
 Phase 1 proved the important safety boundary: Cranelift can execute selected
 Boa bytecode against the real VM stack, guard primitive/object assumptions, and
@@ -161,9 +163,11 @@ Every Phase 2 entry and exit ABI inherits that rule.
     already charged latch, compiles or reuses the exact bounded artifact,
     enters it under strict live-frame guards, validates every returned status
     and PC against immutable metadata, and closes one independent OSR decision
-    per frame. **Next:** Slice 4A1.5's verification-only differential,
-    containment, and fixed workload gate; then the behavior-neutral 4A1.R
-    refactor.
+    per frame. **Semantic/accounting complete:** Boa `92acfa22` exhaustively
+    compares cold and cache-hit instruction budgets, loop limits, exact exit
+    PCs, replay guards, and budget-mode cache separation through the real
+    scheduler. **Next:** Slice 4A1.5b containment/lifetime, then 4A1.5c's fixed
+    workload gate and the behavior-neutral 4A1.R refactor.
 11. Apply cache bounds, failure suppression, and cold-start guardrails throughout
    the program, then tune thresholds after the entry kinds are stable.
 12. Keep direct storage last unless helper attribution proves it dominates and
