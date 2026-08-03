@@ -17,7 +17,7 @@ use crate::{Context, JsValue};
 use super::{
     JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind,
     JitEntryPoint, JitExit, JitExitKind, JitExitReason, JitOsrRejectionReason,
-    JitOsrRepresentation,
+    JitOsrRepresentation, MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -65,15 +65,15 @@ pub(super) struct NativeRejection {
 /// Return the source-free static shape used by context-tier admission.
 ///
 /// This performs no code generation. Unsupported or otherwise ineligible
-/// bodies stay on the ordinary interpreter path; the explicit low-level JIT
-/// API retains its complete-semantics shim fallback.
+/// bodies stay on the ordinary interpreter path; the private differential-test
+/// seam retains its complete-semantics shim fallback.
 pub(super) fn admission_profile(
     code: &CodeBlock,
     collect_diagnostic_metadata: bool,
 ) -> Result<NativeStaticProfile, NativeRejection> {
     if let Some(kind) = eligibility_blocker(code) {
         let bytecode_instructions = if collect_diagnostic_metadata {
-            match decode(code, true) {
+            match decode(code, true, MAX_FUNCTION_BYTECODE_INSTRUCTIONS) {
                 Ok(instructions) => instructions.instructions.len(),
                 Err(rejection) => rejection.bytecode_instructions as usize,
             }
@@ -88,7 +88,12 @@ pub(super) fn admission_profile(
             bytecode_instructions,
         ));
     }
-    decode(code, collect_diagnostic_metadata).map(|instructions| instructions.static_profile())
+    decode(
+        code,
+        collect_diagnostic_metadata,
+        MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
+    )
+    .map(|instructions| instructions.static_profile())
 }
 
 /// Apply the conservative static screen for a first loop-OSR candidate.
@@ -710,7 +715,7 @@ pub(super) fn compile(
     let eligibility_blocker = eligibility_blocker(code);
     if let Some(kind) = eligibility_blocker {
         let bytecode_instructions = if collect_diagnostic_metadata {
-            match decode(code, true) {
+            match decode(code, true, MAX_FUNCTION_BYTECODE_INSTRUCTIONS) {
                 Ok(instructions) => instructions.instructions.len(),
                 Err(rejection) => rejection.bytecode_instructions as usize,
             }
@@ -726,7 +731,11 @@ pub(super) fn compile(
         ));
     }
 
-    let instructions = match decode(code, collect_diagnostic_metadata) {
+    let instructions = match decode(
+        code,
+        collect_diagnostic_metadata,
+        MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
+    ) {
         Ok(instructions) => instructions,
         Err(rejection) => return NativeCompileResult::Rejected(rejection),
     };
@@ -805,6 +814,7 @@ impl DecodedInstructions {
 fn decode(
     code: &CodeBlock,
     collect_diagnostic_metadata: bool,
+    instruction_limit: usize,
 ) -> Result<DecodedInstructions, NativeRejection> {
     let mut instructions = Vec::new();
     let mut pc_to_index = HashMap::new();
@@ -812,6 +822,15 @@ fn decode(
     let mut first_unsupported = None;
 
     while let Some((pc, opcode, instruction)) = iterator.next() {
+        if instructions.len() >= instruction_limit {
+            return Err(NativeRejection::new(
+                JitCompileBlockerKind::InstructionLimit,
+                Some(opcode),
+                Some(pc as u32),
+                instructions.len(),
+                instructions.len().saturating_add(1),
+            ));
+        }
         if pc_to_index.insert(pc, instructions.len()).is_some() {
             return Err(NativeRejection::new(
                 JitCompileBlockerKind::DuplicateInstructionBoundary,

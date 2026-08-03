@@ -183,6 +183,29 @@ pub struct JitStats {
     /// Fixed-size counters for the loop-OSR tier. These remain zero until the
     /// scheduler slice begins observing typed loop regions.
     pub osr: JitOsrCounters,
+    /// Fixed-size counters for backend-lifetime resource admission.
+    pub resources: JitResourceCounters,
+}
+
+/// Source-free counters for backend-lifetime JIT resource admission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct JitResourceCounters {
+    /// Unseen function variants suppressed after the function-state table filled.
+    pub function_capacity: u64,
+    /// Function bodies denied after the bounded decoder reached its limit.
+    pub oversized_functions: u64,
+    /// Exact function variants that hit an already-retained terminal failure.
+    pub terminal_failure_hits: u64,
+    /// Legacy call-target observations dropped after their bounded map filled.
+    pub call_target_capacity: u64,
+    /// Unseen artifacts suppressed after the aggregate code-payload threshold.
+    pub code_bytes: u64,
+    /// Unseen artifacts suppressed after the cumulative compile-time threshold.
+    pub compile_time: u64,
+    /// Unseen artifacts suppressed after one anomalously slow compile attempt.
+    pub slow_attempt: u64,
+    /// Backends retired after a finalized artifact crossed a payload limit.
+    pub payload_overrun_retirements: u64,
 }
 
 /// Uniform numeric representation selected for one loop-OSR artifact.
@@ -426,6 +449,8 @@ pub enum JitCompileBlockerKind {
     ExceptionHandlers,
     /// The register file exceeds the current native compiler bound.
     RegisterLimit,
+    /// The decoded function body exceeds the runtime compiler input bound.
+    InstructionLimit,
     /// The code block contains no instructions.
     EmptyCodeBlock,
     /// Decoding produced the same bytecode boundary more than once.
@@ -1099,6 +1124,13 @@ struct CachedEntry {
     native: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FunctionEntryState {
+    Ready(CachedEntry),
+    #[cfg(test)]
+    TerminalFailure,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum JitEntryPoint {
     Function,
@@ -1151,6 +1183,9 @@ impl JitCacheKey {
 const MAX_LOOP_REGION_STATES: usize = 64;
 const MAX_LOOP_CODE_BYTES: usize = 1024 * 1024;
 const MAX_LOOP_COMPILE_NS: u128 = 10_000_000;
+const MAX_FUNCTION_ENTRY_STATES: usize = 192;
+const MAX_FUNCTION_BYTECODE_INSTRUCTIONS: usize = 1_024;
+const MAX_CALL_TARGET_SITES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopRegionStateKind {
@@ -1276,7 +1311,7 @@ pub struct JitBackend {
     /// is unique for the lifetime of the current thread, which is sufficient
     /// because a backend is not shared across threads or realms. Budgeted and
     /// unbudgeted entries are distinct so the latter keep their fast path.
-    cache: FxHashMap<JitCacheKey, CachedEntry>,
+    cache: FxHashMap<JitCacheKey, FunctionEntryState>,
     /// Bounded per-key loop hotness and terminal admission state. No generated
     /// loop entry can be invoked until the following scheduler slice.
     loop_regions: FxHashMap<JitCacheKey, LoopRegionState>,
@@ -1430,6 +1465,24 @@ impl JitBackend {
             (self.loop_regions.len() >= MAX_LOOP_REGION_STATES)
                 .then_some(JitOsrSuppressionReason::RegionCapacity)
         })
+    }
+
+    /// Refuse planner work for an unseen loop key after a backend-wide bound
+    /// has closed. The planner is intentionally downstream of this check so a
+    /// page cannot keep paying CFG/liveness work with allocation-free misses.
+    fn suppress_unseen_loop_before_planning(&mut self, key: JitCacheKey) -> bool {
+        if self.loop_regions.contains_key(&key) {
+            return false;
+        }
+        let Some(reason) = self.new_loop_suppression_reason() else {
+            return false;
+        };
+        self.update_osr_counters(|counters| {
+            counters.cache_requests = counters.cache_requests.saturating_add(1);
+            counters.cache_misses = counters.cache_misses.saturating_add(1);
+        });
+        self.record_loop_suppression(reason);
+        true
     }
 
     fn record_loop_suppression(&mut self, reason: JitOsrSuppressionReason) {
@@ -1635,6 +1688,9 @@ impl JitBackend {
         } else if let Some(plan) = self.loop_plans.get(&f64_key) {
             let all_i32 = Self::loop_live_ins_match(plan, context, true);
             if !plan.requires_f64 && all_i32 {
+                if self.suppress_unseen_loop_before_planning(i32_key) {
+                    return JitLoopScheduleAction::Closed;
+                }
                 let Ok(plan) = native::plan_loop_region(
                     code,
                     header_pc,
@@ -1664,6 +1720,9 @@ impl JitBackend {
             ) {
                 return JitLoopScheduleAction::Closed;
             }
+            if self.suppress_unseen_loop_before_planning(f64_key) {
+                return JitLoopScheduleAction::Closed;
+            }
             let f64_plan = match native::plan_loop_region(
                 code,
                 header_pc,
@@ -1684,6 +1743,9 @@ impl JitBackend {
                 }
             };
             if !f64_plan.requires_f64 && Self::loop_live_ins_match(&f64_plan, context, true) {
+                if self.suppress_unseen_loop_before_planning(i32_key) {
+                    return JitLoopScheduleAction::Closed;
+                }
                 let Ok(plan) = native::plan_loop_region(
                     code,
                     header_pc,
@@ -1973,6 +2035,13 @@ impl JitBackend {
         {
             state = JitAdmissionState::DeniedNoLoop;
         }
+        if rejection
+            .as_ref()
+            .is_some_and(|rejection| rejection.kind == JitCompileBlockerKind::InstructionLimit)
+        {
+            self.stats.resources.oversized_functions =
+                self.stats.resources.oversized_functions.saturating_add(1);
+        }
         code.set_jit_admission(self.id, state);
         if !allowed {
             self.stats.admission_denials = self.stats.admission_denials.saturating_add(1);
@@ -2233,6 +2302,15 @@ impl JitBackend {
         }
     }
 
+    fn record_legacy_call_target(&mut self, key: (u64, u32), target_code_id: u64) {
+        if self.call_targets.contains_key(&key) || self.call_targets.len() < MAX_CALL_TARGET_SITES {
+            self.call_targets.insert(key, target_code_id);
+        } else {
+            self.stats.resources.call_target_capacity =
+                self.stats.resources.call_target_capacity.saturating_add(1);
+        }
+    }
+
     /// Observe one interpreted `Call` without changing production admission.
     ///
     /// Detailed records are bounded and source-free. The legacy last-target
@@ -2262,18 +2340,19 @@ impl JitBackend {
 
         let target = if let Some(target_code_id) = ordinary_target {
             if self.admission_allow_call_boundaries && record_legacy_feedback {
-                self.call_targets
-                    .insert((code.debug_id, pc), target_code_id);
+                self.record_legacy_call_target((code.debug_id, pc), target_code_id);
             }
             let budgeted = context.instruction_budget_remaining().is_some();
-            let cached_native = self
-                .cache
-                .get(&JitCacheKey::function(
-                    target_code_id,
-                    budgeted,
-                    self.diagnostics.is_some(),
-                ))
-                .map(|entry| entry.native);
+            let cached_native = match self.cache.get(&JitCacheKey::function(
+                target_code_id,
+                budgeted,
+                self.diagnostics.is_some(),
+            )) {
+                Some(FunctionEntryState::Ready(entry)) => Some(entry.native),
+                #[cfg(test)]
+                Some(FunctionEntryState::TerminalFailure) => None,
+                None => None,
+            };
             JitCallTargetObservation::Ordinary {
                 code_id: target_code_id,
                 cached_native,
@@ -2301,17 +2380,34 @@ impl JitBackend {
     }
 
     /// Return a cached entry if one exists, compiling and caching it otherwise.
-    fn cached_entry(&mut self, code: &CodeBlock, charge_instruction_budget: bool) -> CachedEntry {
+    fn cached_entry(
+        &mut self,
+        code: &CodeBlock,
+        charge_instruction_budget: bool,
+    ) -> Option<CachedEntry> {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
         let cache_key = JitCacheKey::function(code.debug_id, charge_instruction_budget, diagnostic);
 
-        if let Some(cached) = self.cache.get(&cache_key) {
+        if let Some(state) = self.cache.get(&cache_key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-            return *cached;
+            return match state {
+                FunctionEntryState::Ready(cached) => Some(*cached),
+                #[cfg(test)]
+                FunctionEntryState::TerminalFailure => {
+                    self.stats.resources.terminal_failure_hits =
+                        self.stats.resources.terminal_failure_hits.saturating_add(1);
+                    None
+                }
+            };
         }
 
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
+        if self.cache.len() >= MAX_FUNCTION_ENTRY_STATES {
+            self.stats.resources.function_capacity =
+                self.stats.resources.function_capacity.saturating_add(1);
+            return None;
+        }
         let started = Instant::now();
         let (entry, native, code_bytes, native_profile, rejection) =
             self.compile_codeblock_with_kind(code, charge_instruction_budget, diagnostic);
@@ -2324,7 +2420,8 @@ impl JitBackend {
             self.stats.shim_compilations = self.stats.shim_compilations.saturating_add(1);
         }
         let cached = CachedEntry { entry, native };
-        self.cache.insert(cache_key, cached);
+        self.cache
+            .insert(cache_key, FunctionEntryState::Ready(cached));
         if let Some(diagnostics) = &mut self.diagnostics {
             let (
                 blocker,
@@ -2390,14 +2487,18 @@ impl JitBackend {
                 code_bytes,
             });
         }
-        cached
+        Some(cached)
     }
 
     /// Invoke a cached entry for the current frame. This is the shared runtime
     /// hook used by both the explicit API and the context-owned tier.
-    pub(crate) fn invoke_cached_entry(&mut self, code: &CodeBlock, context: &mut Context) -> u64 {
+    pub(crate) fn invoke_cached_entry(
+        &mut self,
+        code: &CodeBlock,
+        context: &mut Context,
+    ) -> Option<u64> {
         let charge_instruction_budget = context.instruction_budget_remaining().is_some();
-        let cached = self.cached_entry(code, charge_instruction_budget);
+        let cached = self.cached_entry(code, charge_instruction_budget)?;
         if cached.native {
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         }
@@ -2444,7 +2545,7 @@ impl JitBackend {
                 diagnostics.record_exit(code.debug_id, 0, exit, started.elapsed().as_nanos());
             }
         }
-        status
+        Some(status)
     }
 
     /// Invoke a cached entry and finish it through the existing interpreter
@@ -2456,7 +2557,9 @@ impl JitBackend {
         code: &CodeBlock,
         context: &mut Context,
     ) -> CompletionRecord {
-        let status = self.invoke_cached_entry(code, context);
+        let Some(status) = self.invoke_cached_entry(code, context) else {
+            return context.run_interpreter();
+        };
 
         if status & JIT_BREAK_BIT != 0 {
             return context
@@ -2499,7 +2602,8 @@ impl JitBackend {
     /// # Panics
     /// Panics if Cranelift codegen fails.
     #[must_use]
-    pub fn compile_ctx_thunk(
+    #[cfg(test)]
+    fn compile_ctx_thunk(
         &mut self,
         helper: extern "C" fn(*mut Context) -> i64,
     ) -> extern "C" fn(*mut Context) -> i64 {
@@ -2553,7 +2657,8 @@ impl JitBackend {
     /// # Panics
     /// Panics if Cranelift codegen fails.
     #[must_use]
-    pub fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
+    #[cfg(test)]
+    fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
         self.compile_codeblock_with_kind(code, false, false).0
     }
 
@@ -2955,6 +3060,95 @@ mod tests {
             .as_mut()
             .expect("JIT was enabled")
             .allow_small_native_entries_for_tests();
+    }
+
+    #[test]
+    fn jit_function_entry_states_are_bounded_and_terminal() {
+        let ready_code = first_function_code("function ready(value) { return value + 1; }");
+        let failed_code = first_function_code("function failed(value) { return value + 2; }");
+        let unseen_code = first_function_code("function unseen(value) { return value + 3; }");
+        let ready = CachedEntry {
+            entry: malformed_loop_untagged,
+            native: true,
+        };
+        let mut backend = JitBackend::new();
+        backend.cache.insert(
+            JitCacheKey::function(ready_code.debug_id, false, false),
+            FunctionEntryState::Ready(ready),
+        );
+        backend.cache.insert(
+            JitCacheKey::function(failed_code.debug_id, false, false),
+            FunctionEntryState::TerminalFailure,
+        );
+        for index in 0..MAX_FUNCTION_ENTRY_STATES - 2 {
+            backend.cache.insert(
+                JitCacheKey::function(u64::MAX - index as u64, false, false),
+                FunctionEntryState::Ready(ready),
+            );
+        }
+        assert_eq!(backend.cache.len(), MAX_FUNCTION_ENTRY_STATES);
+
+        let retained = backend
+            .cached_entry(&ready_code, false)
+            .expect("ready entry remains reusable at capacity");
+        assert_eq!(retained.entry as usize, ready.entry as usize);
+        assert!(backend.cached_entry(&failed_code, false).is_none());
+        assert!(backend.cached_entry(&unseen_code, false).is_none());
+        assert_eq!(backend.cache.len(), MAX_FUNCTION_ENTRY_STATES);
+        assert_eq!(backend.stats().cache_hits, 2);
+        assert_eq!(backend.stats().cache_misses, 1);
+        assert_eq!(backend.stats().resources.terminal_failure_hits, 1);
+        assert_eq!(backend.stats().resources.function_capacity, 1);
+    }
+
+    #[test]
+    fn jit_admission_stops_decoding_oversized_functions_before_compilation() {
+        let mut source = String::from("function oversized(value) {");
+        for _ in 0..=MAX_FUNCTION_BYTECODE_INSTRUCTIONS {
+            source.push_str("value = value + 1;");
+        }
+        source.push_str("return value; }");
+        let code = first_function_code(&source);
+        let mut backend = JitBackend::new();
+        backend.enable_diagnostics(JitDiagnosticLimits::default());
+
+        assert!(!backend.admit_function_entry(&code));
+        assert!(!backend.admit_function_entry(&code));
+        assert!(backend.cache.is_empty());
+        assert_eq!(backend.stats().compilations, 0);
+        assert_eq!(backend.stats().compile_time_ns, 0);
+        assert_eq!(backend.stats().resources.oversized_functions, 1);
+        let snapshot = backend.diagnostic_snapshot().expect("diagnostics enabled");
+        let admission = snapshot
+            .admission_records
+            .first()
+            .expect("oversized admission record");
+        assert!(!admission.allowed);
+        assert_eq!(admission.reason, JitAdmissionReason::DeniedNativeIneligible);
+        assert_eq!(
+            admission.blocker,
+            Some(JitCompileBlockerKind::InstructionLimit)
+        );
+        assert_eq!(
+            admission.bytecode_instructions,
+            MAX_FUNCTION_BYTECODE_INSTRUCTIONS as u32 + 1
+        );
+    }
+
+    #[test]
+    fn jit_legacy_call_targets_are_bounded_without_replacing_retained_sites() {
+        let mut backend = JitBackend::new();
+        for index in 0..MAX_CALL_TARGET_SITES {
+            backend.record_legacy_call_target((index as u64, index as u32), index as u64 + 10);
+        }
+        assert_eq!(backend.call_targets.len(), MAX_CALL_TARGET_SITES);
+
+        backend.record_legacy_call_target((0, 0), 999);
+        backend.record_legacy_call_target((u64::MAX, u32::MAX), 123);
+        assert_eq!(backend.call_targets.len(), MAX_CALL_TARGET_SITES);
+        assert_eq!(backend.call_targets.get(&(0, 0)), Some(&999));
+        assert!(!backend.call_targets.contains_key(&(u64::MAX, u32::MAX)));
+        assert_eq!(backend.stats().resources.call_target_capacity, 1);
     }
 
     #[test]

@@ -1517,7 +1517,9 @@ impl Context {
                     if !backend.admit_function_entry(&code) {
                         continue;
                     }
-                    let status = backend.invoke_cached_entry(&code, self);
+                    let Some(status) = backend.invoke_cached_entry(&code, self) else {
+                        continue;
+                    };
 
                     if status & crate::jit::JIT_BREAK_BIT != 0 {
                         return self
