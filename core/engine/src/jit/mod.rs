@@ -1617,15 +1617,27 @@ impl JitBackend {
 
     /// Return a source-free module failure at a deterministic private test
     /// seam. Production builds contain no injectable emitter path.
+    #[cfg(test)]
+    pub(super) fn before_module_stage(
+        &mut self,
+        stage: JitModuleFailureStage,
+    ) -> Result<(), JitModuleFailureStage> {
+        if self.compile_fault == Some(stage) {
+            self.compile_fault = None;
+            return Err(stage);
+        }
+        Ok(())
+    }
+
+    /// Production builds contain no injectable emitter path, so this always
+    /// succeeds. The `Result` return type is kept so call sites don't need a
+    /// `#[cfg]`-conditional shape between test and production builds.
+    #[cfg(not(test))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     pub(super) fn before_module_stage(
         &mut self,
         _stage: JitModuleFailureStage,
     ) -> Result<(), JitModuleFailureStage> {
-        #[cfg(test)]
-        if self.compile_fault == Some(_stage) {
-            self.compile_fault = None;
-            return Err(_stage);
-        }
         Ok(())
     }
 
@@ -2706,8 +2718,7 @@ impl JitBackend {
                 self.diagnostics.is_some(),
             )) {
                 Some(FunctionEntryState::Ready(entry)) => Some(entry.native),
-                Some(FunctionEntryState::TerminalFailure) => None,
-                None => None,
+                Some(FunctionEntryState::TerminalFailure) | None => None,
             };
             JitCallTargetObservation::Ordinary {
                 code_id: target_code_id,
@@ -3104,7 +3115,6 @@ impl JitBackend {
 
     /// Compile a code block using the legacy shim bridge. This remains the
     /// complete-semantics fallback while the native allowlist grows.
-    #[must_use]
     fn compile_shim_codeblock(
         &mut self,
         code: &CodeBlock,

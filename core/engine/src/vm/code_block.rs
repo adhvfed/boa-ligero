@@ -661,10 +661,8 @@ impl CodeBlock {
                 dst,
                 binding_index,
                 ic_index,
-            } => {
-                format!("dst:{dst}, binding_index:{binding_index}, ic_index:{ic_index}")
             }
-            Instruction::GetNameGlobalAndLocator {
+            | Instruction::GetNameGlobalAndLocator {
                 dst,
                 binding_index,
                 ic_index,

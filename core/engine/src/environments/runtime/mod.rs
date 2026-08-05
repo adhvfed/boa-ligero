@@ -371,7 +371,7 @@ impl EnvironmentStack {
     /// Pop a private environment from the private environment stack.
     pub(crate) fn pop_private(&mut self) {
         if let Some(node) = self.private_tip.take() {
-            self.private_tip = node.parent.clone();
+            self.private_tip.clone_from(&node.parent);
         }
     }
 

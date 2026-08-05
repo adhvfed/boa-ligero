@@ -484,6 +484,9 @@ pub(super) struct CompiledLoopRegion {
     pub(super) code_bytes: usize,
 }
 
+// returned once per loop-region compile attempt, not stored in bulk, so the
+// larger `Compiled` variant doesn't cost anything worth boxing for
+#[allow(variant_size_differences)]
 pub(super) enum LoopNativeCompileResult {
     Compiled(CompiledLoopRegion),
     Rejected(JitOsrRejectionReason),
@@ -1696,6 +1699,9 @@ impl<'a> NativeCompiler<'a> {
         }
     }
 
+    // kept as a method for a uniform `self.emit_*` dispatch style with the
+    // sibling emitters below that do read `self`
+    #[allow(clippy::unused_self)]
     fn emit_consume_instruction_budget(
         &self,
         bcx: &mut FunctionBuilder<'_>,
@@ -1746,6 +1752,10 @@ impl<'a> NativeCompiler<'a> {
         true
     }
 
+    // the instruction dispatch loop threads codegen context (bcx/ctx/helpers)
+    // plus per-instruction addressing through every emit_* call; bundling
+    // that into a context struct is a real follow-up, not a lint dodge
+    #[allow(clippy::too_many_arguments)]
     fn emit_instruction(
         &mut self,
         bcx: &mut FunctionBuilder<'_>,
@@ -1810,7 +1820,7 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::GetArgument { index, dst } => {
-                let index = bcx.ins().iconst(types::I32, u32::from(*index) as i64);
+                let index = bcx.ins().iconst(types::I32, i64::from(u32::from(*index)));
                 let dst = register(*dst);
                 if self.defined_register_kind(dst) == RegisterKind::Boxed {
                     let helper = bcx
@@ -1986,7 +1996,9 @@ impl<'a> NativeCompiler<'a> {
                 }
                 let dst = register(*dst);
                 let object = bcx.ins().iconst(types::I32, usize::from(*value) as i64);
-                let ic_index = bcx.ins().iconst(types::I32, u32::from(*ic_index) as i64);
+                let ic_index = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 let mode = bcx
                     .ins()
                     .iconst(types::I32, i64::from(self.mode == NativeMode::F64));
@@ -2040,7 +2052,9 @@ impl<'a> NativeCompiler<'a> {
                 };
                 let dst = register(*dst);
                 let object = bcx.ins().iconst(types::I32, object as i64);
-                let ic_index = bcx.ins().iconst(types::I32, u32::from(*ic_index) as i64);
+                let ic_index = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
                 let guard = if self.mode == NativeMode::F64 {
                     let guard_helper = bcx
@@ -2109,7 +2123,7 @@ impl<'a> NativeCompiler<'a> {
                     .iconst(helpers.ptr, helpers.call_ordinary.address as i64);
                 let argument_count = bcx
                     .ins()
-                    .iconst(types::I32, u32::from(*argument_count) as i64);
+                    .iconst(types::I32, i64::from(u32::from(*argument_count)));
                 let expected_target = bcx.ins().iconst(types::I64, expected_target as i64);
                 let status = bcx.ins().call_indirect(
                     helpers.call_ordinary.signature,
@@ -2607,6 +2621,9 @@ impl<'a> NativeCompiler<'a> {
         }
     }
 
+    // kept as a method for a uniform `self.emit_*` dispatch style, see
+    // emit_consume_instruction_budget above
+    #[allow(clippy::unused_self)]
     fn sign_bit(
         &self,
         bcx: &mut FunctionBuilder<'_>,
@@ -2632,6 +2649,8 @@ impl<'a> NativeCompiler<'a> {
             .copied()
     }
 
+    // see emit_instruction above
+    #[allow(clippy::too_many_arguments)]
     fn emit_compare_branch(
         &self,
         bcx: &mut FunctionBuilder<'_>,
@@ -2726,6 +2745,9 @@ impl<'a> NativeCompiler<'a> {
         true
     }
 
+    // kept as a method for a uniform `self.emit_*` dispatch style, see
+    // emit_consume_instruction_budget above
+    #[allow(clippy::unused_self)]
     fn emit_set_pc(
         &self,
         bcx: &mut FunctionBuilder<'_>,
@@ -3783,7 +3805,7 @@ fn dense_array_value_f64(
     index: f64,
     ic_index: u32,
 ) -> Option<(IndexedKind, JsValue)> {
-    if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > u32::MAX as f64 {
+    if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > f64::from(u32::MAX) {
         return None;
     }
     dense_array_value_at(context, register, index as u32, ic_index)
@@ -4054,8 +4076,7 @@ extern "C" fn jit_call_ordinary(
     );
     let call = match call {
         Ok(call) => call,
-        Err(error) => {
-            let mut error = crate::JsError::from(error);
+        Err(mut error) => {
             context.capture_error_backtrace(&mut error);
             let pc = context.vm.frame().pc;
             return jit_break(
@@ -4074,8 +4095,7 @@ extern "C" fn jit_call_ordinary(
             JitExitReason::Scheduler,
             context.vm.frame().pc,
         ),
-        Err(error) => {
-            let mut error = crate::JsError::from(error);
+        Err(mut error) => {
             context.capture_error_backtrace(&mut error);
             let pc = context.vm.frame().pc;
             jit_break(
@@ -4231,8 +4251,7 @@ extern "C" fn jit_increment_loop(context: *mut Context) -> u64 {
     let context = unsafe { &mut *context };
     match context.consume_loop_iterations(1) {
         Ok(()) => 0,
-        Err(error) => {
-            let mut error = crate::JsError::from(error);
+        Err(mut error) => {
             context.capture_error_backtrace(&mut error);
             let pc = context.vm.frame().pc;
             jit_break(
