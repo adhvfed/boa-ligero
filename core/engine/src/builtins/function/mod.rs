@@ -988,7 +988,10 @@ pub(crate) fn function_call(
     )]
     context: &mut InternalMethodCallContext<'_>,
 ) -> JsResult<CallValue> {
-    context.check_runtime_limits()?;
+    if let Err(mut error) = context.check_runtime_limits() {
+        context.capture_error_backtrace(&mut error);
+        return Err(error);
+    }
 
     // SAFETY: `function_call` is only reachable through the `__call__` vtable
     // entry installed by `OrdinaryFunction::internal_methods`, so the inner
@@ -1107,7 +1110,10 @@ fn function_construct(
     argument_count: usize,
     context: &mut InternalMethodCallContext<'_>,
 ) -> JsResult<CallValue> {
-    context.check_runtime_limits()?;
+    if let Err(mut error) = context.check_runtime_limits() {
+        context.capture_error_backtrace(&mut error);
+        return Err(error);
+    }
 
     // SAFETY: `function_construct` is only reachable via the `__construct__`
     // vtable entry installed by `OrdinaryFunction::internal_methods` (which

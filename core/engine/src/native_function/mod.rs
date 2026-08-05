@@ -334,7 +334,10 @@ pub(crate) fn native_function_call(
 
     // We technically don't need this since native functions don't push any new frames to the
     // vm, but we'll eventually have to combine the native stack with the vm stack.
-    context.check_runtime_limits()?;
+    if let Err(mut error) = context.check_runtime_limits() {
+        context.capture_error_backtrace(&mut error);
+        return Err(error);
+    }
     let this_function_object = obj.clone();
 
     let NativeFunctionObject {
@@ -389,7 +392,10 @@ fn native_function_construct(
 ) -> JsResult<CallValue> {
     // We technically don't need this since native functions don't push any new frames to the
     // vm, but we'll eventually have to combine the native stack with the vm stack.
-    context.check_runtime_limits()?;
+    if let Err(mut error) = context.check_runtime_limits() {
+        context.capture_error_backtrace(&mut error);
+        return Err(error);
+    }
     let this_function_object = obj.clone();
 
     let NativeFunctionObject {

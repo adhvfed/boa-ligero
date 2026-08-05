@@ -498,9 +498,13 @@ fn recursion_runtime_limit() {
         TestAction::inspect_context(|context| {
             context.runtime_limits_mut().set_recursion_limit(10);
         }),
-        TestAction::assert_runtime_limit_error("factorial(11)", RuntimeLimitError::Recursion),
+        TestAction::assert_native_error(
+            "factorial(11)",
+            JsNativeErrorKind::Range,
+            "Maximum call stack size exceeded",
+        ),
         TestAction::assert_eq("factorial(8)", JsValue::new(40_320)),
-        TestAction::assert_runtime_limit_error(
+        TestAction::assert_native_error(
             indoc! {r#"
                 function x() {
                     x()
@@ -508,7 +512,8 @@ fn recursion_runtime_limit() {
 
                 x()
             "#},
-            RuntimeLimitError::Recursion,
+            JsNativeErrorKind::Range,
+            "Maximum call stack size exceeded",
         ),
     ]);
 }
@@ -632,13 +637,20 @@ fn long_object_chain_gc_trace_stack_overflow() {
 }
 
 // See: https://github.com/boa-dev/boa/issues/4515
+//
+// The recursion limit must terminate the thenable `then`-getter recursion.
+// Since call-depth overflow is a catchable `RangeError`, the async-generator
+// machinery converts it into a promise rejection (matching real engines)
+// instead of bubbling an engine error out of `evaluate`, so the assertion is
+// that evaluation completes with a promise value rather than hanging or
+// overflowing the native stack.
 #[test]
-fn recursion_in_async_gen_throws_uncatchable_error() {
+fn recursion_in_async_gen_terminates_into_promise_rejection() {
     run_test_actions([
         TestAction::inspect_context(|context| {
             context.runtime_limits_mut().set_recursion_limit(128);
         }),
-        TestAction::assert_runtime_limit_error(
+        TestAction::assert_with_op(
             indoc! {r#"
                 async function* f() {}
                 f().return({
@@ -647,18 +659,18 @@ fn recursion_in_async_gen_throws_uncatchable_error() {
                   },
                 });
             "#},
-            RuntimeLimitError::Recursion,
+            |value, _context| value.is_object(),
         ),
     ]);
 }
 
 #[test]
-fn recursion_in_setter_throws_uncatchable_error() {
+fn recursion_in_setter_throws_catchable_range_error() {
     run_test_actions([
         TestAction::inspect_context(|context| {
             context.runtime_limits_mut().set_recursion_limit(128);
         }),
-        TestAction::assert_runtime_limit_error(
+        TestAction::assert_native_error(
             indoc! {r#"
                 const obj = {
                   set x(value) {
@@ -667,7 +679,8 @@ fn recursion_in_setter_throws_uncatchable_error() {
                 };
                 obj.x = 1;
             "#},
-            RuntimeLimitError::Recursion,
+            JsNativeErrorKind::Range,
+            "Maximum call stack size exceeded",
         ),
     ]);
 }

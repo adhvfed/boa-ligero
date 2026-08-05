@@ -1713,18 +1713,27 @@ impl Context {
 
     /// Checks if we haven't exceeded the defined runtime limits.
     pub(crate) fn check_runtime_limits(&self) -> JsResult<()> {
-        // Must throw if the number of recursive calls exceeds the defined limit.
+        // Call-depth and value-stack overflow surface as a *catchable*
+        // `RangeError`, matching V8/JSC/SpiderMonkey: pages deliberately probe
+        // the maximum call depth with unbounded self-recursion wrapped in
+        // `try`/`catch` (device-fingerprinting SDKs among them), and an
+        // uncatchable error would tear down their whole task instead. Depth
+        // stays bounded either way — catching the error cannot deepen the
+        // stack — so the embedder-safety property of the limit is unchanged.
+        // Loop-iteration and instruction budgets remain uncatchable engine
+        // errors: those exist to stop runaway work, not to mirror engine
+        // behavior the web observes.
         //
         // `host_call_depth` accounts for nested host calls that re-enter the VM by invoking
         // `Context::run()` recursively (for example, accessor calls).
         // Subtract 1 to exclude the dummy frame at index 0.
         let recursion_depth = (self.vm.frames.len() - 1).saturating_add(self.vm.host_call_depth);
-        if self.vm.runtime_limits.recursion_limit() <= recursion_depth {
-            return Err(RuntimeLimitError::Recursion.into());
-        }
-        // Must throw if the stack size exceeds the defined maximum length.
-        if self.vm.runtime_limits.stack_size_limit() <= self.vm.stack.stack.len() {
-            return Err(RuntimeLimitError::StackSize.into());
+        if self.vm.runtime_limits.recursion_limit() <= recursion_depth
+            || self.vm.runtime_limits.stack_size_limit() <= self.vm.stack.stack.len()
+        {
+            return Err(JsNativeError::range()
+                .with_message("Maximum call stack size exceeded")
+                .into());
         }
 
         Ok(())

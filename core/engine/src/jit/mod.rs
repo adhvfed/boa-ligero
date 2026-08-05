@@ -4998,10 +4998,11 @@ mod tests {
         let error = recursive
             .evaluate(&mut context)
             .expect_err("recursion limit must remain enforced");
-        assert_eq!(
-            error.as_engine(),
-            Some(&EngineError::RuntimeLimit(RuntimeLimitError::Recursion))
-        );
+        let native = error
+            .as_native()
+            .expect("recursion overflow surfaces as a catchable native error");
+        assert!(matches!(native.kind, crate::error::JsNativeErrorKind::Range));
+        assert_eq!(native.message(), "Maximum call stack size exceeded");
         assert!(context.jit_enabled());
         assert_eq!(context.vm.frames.len(), 1);
     }
@@ -7554,10 +7555,11 @@ mod tests {
             .evaluate(&mut context)
             .expect_err("native recursion must enforce the runtime limit");
 
-        assert_eq!(
-            error.as_engine(),
-            Some(&EngineError::RuntimeLimit(RuntimeLimitError::Recursion))
-        );
+        let native = error
+            .as_native()
+            .expect("recursion overflow surfaces as a catchable native error");
+        assert!(matches!(native.kind, crate::error::JsNativeErrorKind::Range));
+        assert_eq!(native.message(), "Maximum call stack size exceeded");
     }
 
     #[test]
