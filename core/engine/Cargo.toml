@@ -216,7 +216,7 @@ iana-time-zone = { workspace = true, optional = true }
 cranelift-codegen = { version = "0.130.2", optional = true }
 cranelift-frontend = { version = "0.130.2", optional = true }
 cranelift-jit = { version = "0.130.2", optional = true }
-cranelift-module = { version = "0.130.2", optional = true }
+cranelift-module = { version = "0.133.2", optional = true }
 cranelift-native = { version = "0.130.2", optional = true }
 
 [target.'cfg(all(target_family = "wasm", not(any(target_os = "emscripten", target_os = "wasi"))))'.dependencies]
