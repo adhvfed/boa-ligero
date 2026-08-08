@@ -21,7 +21,7 @@ use super::{
 };
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, types};
+use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, StackSlotData, StackSlotKind, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module};
 
@@ -1264,8 +1264,7 @@ struct Helpers {
     get_argument_i32: Helper,
     get_argument_f64: Helper,
     dense_i32_guarded: Helper,
-    dense_guard_f64: Helper,
-    dense_f64: Helper,
+    dense_f64_guarded: Helper,
     named_guard: Helper,
     named_i32_guarded: Helper,
     named_f64: Helper,
@@ -1587,23 +1586,14 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
-            dense_guard_f64: make(
+            dense_f64_guarded: make(
                 if self.instrument_storage {
-                    jit_diagnostic_dense_array_guard_f64 as *const () as usize
+                    jit_diagnostic_dense_array_f64_guarded as *const () as usize
                 } else {
-                    jit_dense_array_guard_f64 as *const () as usize
+                    jit_dense_array_f64_guarded as *const () as usize
                 },
-                &[ptr, types::I32, types::F64, types::I32],
+                &[ptr, types::I32, types::F64, types::I32, ptr],
                 types::I64,
-            ),
-            dense_f64: make(
-                if self.instrument_storage {
-                    jit_diagnostic_dense_array_f64 as *const () as usize
-                } else {
-                    jit_dense_array_f64 as *const () as usize
-                },
-                &[ptr, types::I32, types::F64, types::I32],
-                types::F64,
             ),
             named_guard: make(
                 if self.instrument_storage {
@@ -2068,14 +2058,26 @@ impl<'a> NativeCompiler<'a> {
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let f64_output = (self.mode == NativeMode::F64).then(|| {
+                    bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ))
+                });
                 let guarded_value = if self.mode == NativeMode::F64 {
-                    let guard_helper = bcx
+                    let helper = bcx
                         .ins()
-                        .iconst(helpers.ptr, helpers.dense_guard_f64.address as i64);
+                        .iconst(helpers.ptr, helpers.dense_f64_guarded.address as i64);
+                    let output = bcx.ins().stack_addr(
+                        helpers.ptr,
+                        f64_output.expect("F64 mode has an output slot"),
+                        0,
+                    );
                     bcx.ins().call_indirect(
-                        helpers.dense_guard_f64.signature,
-                        guard_helper,
-                        &[ctx, object, key, ic_index],
+                        helpers.dense_f64_guarded.signature,
+                        helper,
+                        &[ctx, object, key, ic_index, output],
                     )
                 } else {
                     let guard_helper = bcx
@@ -2103,15 +2105,11 @@ impl<'a> NativeCompiler<'a> {
                 }
                 bcx.switch_to_block(cont);
                 if self.mode == NativeMode::F64 {
-                    let load_helper = bcx
-                        .ins()
-                        .iconst(helpers.ptr, helpers.dense_f64.address as i64);
-                    let result = bcx.ins().call_indirect(
-                        helpers.dense_f64.signature,
-                        load_helper,
-                        &[ctx, object, key, ic_index],
+                    let result = bcx.ins().stack_load(
+                        types::F64,
+                        f64_output.expect("F64 mode has an output slot"),
+                        0,
                     );
-                    let result = bcx.inst_results(result)[0];
                     if !self.define_register(bcx, dst, result) {
                         return false;
                     }
@@ -3812,34 +3810,28 @@ extern "C" fn jit_dense_array_i32_guarded(
     u64::from(value as u32)
 }
 
-extern "C" fn jit_dense_array_guard_f64(
+extern "C" fn jit_dense_array_f64_guarded(
     context: *mut Context,
     register: u32,
     index: f64,
     ic_index: u32,
+    output: *mut f64,
 ) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let Some((kind, value)) = dense_array_value_f64(context, register, index, ic_index) else {
         return 0;
     };
-    u64::from(
-        matches!(kind, IndexedKind::DenseI32 | IndexedKind::DenseF64)
-            && value.as_number().is_some(),
-    )
-}
-
-extern "C" fn jit_dense_array_f64(
-    context: *mut Context,
-    register: u32,
-    index: f64,
-    ic_index: u32,
-) -> f64 {
-    // SAFETY: generated code receives an exclusively borrowed live context.
-    let context = unsafe { &mut *context };
-    dense_array_value_f64(context, register, index, ic_index)
-        .and_then(|(_, value)| value.as_number())
-        .unwrap_or(0.0)
+    if !matches!(kind, IndexedKind::DenseI32 | IndexedKind::DenseF64) {
+        return 0;
+    }
+    let Some(value) = value.as_number() else {
+        return 0;
+    };
+    // SAFETY: generated code passes an aligned eight-byte stack slot owned by
+    // the active native frame and reads it only when this helper returns 1.
+    unsafe { output.write(value) };
+    1
 }
 
 extern "C" fn jit_diagnostic_dense_array_i32_guarded(
@@ -3861,13 +3853,14 @@ extern "C" fn jit_diagnostic_dense_array_i32_guarded(
     result
 }
 
-extern "C" fn jit_diagnostic_dense_array_guard_f64(
+extern "C" fn jit_diagnostic_dense_array_f64_guarded(
     context: *mut Context,
     register: u32,
     index: f64,
     ic_index: u32,
+    output: *mut f64,
 ) -> u64 {
-    let result = jit_dense_array_guard_f64(context, register, index, ic_index);
+    let result = jit_dense_array_f64_guarded(context, register, index, ic_index, output);
     // SAFETY: generated code receives an exclusively borrowed live context,
     // and the delegated helper's borrow ended before this update.
     let counters = unsafe { &mut (*context).vm.jit_native_storage };
@@ -3875,21 +3868,8 @@ extern "C" fn jit_diagnostic_dense_array_guard_f64(
         counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
     } else {
         counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+        counters.dense_loads = counters.dense_loads.saturating_add(1);
     }
-    result
-}
-
-extern "C" fn jit_diagnostic_dense_array_f64(
-    context: *mut Context,
-    register: u32,
-    index: f64,
-    ic_index: u32,
-) -> f64 {
-    let result = jit_dense_array_f64(context, register, index, ic_index);
-    // SAFETY: generated code receives an exclusively borrowed live context,
-    // and the delegated helper's borrow ended before this update.
-    let counters = unsafe { &mut (*context).vm.jit_native_storage };
-    counters.dense_loads = counters.dense_loads.saturating_add(1);
     result
 }
 

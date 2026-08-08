@@ -7071,6 +7071,58 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_preserves_dense_floating_nan() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(values, n) { let result = 0.5; for (let i = 0; i < n; i++) { result = values[0]; } return result; } let values = [NaN]; let answer = 0; for (let j = 0; j < 80; j++) { answer = read(values, 3); } answer !== answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_dense_floating_load_on_hole() {
+        let mut context = Context::default();
+        context.enable_jit();
+
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sumFloat(values, n) { let total = 0.5; for (let i = 0; i < n; i++) { total = total + values[i]; } return total; } let floatValues = [1.25, 2.5]; let warm = 0; for (let i = 0; i < 80; i++) { warm = sumFloat(floatValues, 2); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("setup");
+
+        let hole = crate::Script::parse(
+            crate::Source::from_bytes(
+                "delete floatValues[0]; let result = sumFloat(floatValues, 2); result !== result",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse hole case");
+        let result = hole.evaluate(&mut context).expect("evaluate hole case");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_runs_native_monomorphic_property_load() {
         let mut context = Context::default();
         context.enable_jit();
@@ -8176,6 +8228,46 @@ mod tests {
         assert_eq!(jit_value, interpreter_value);
         eprintln!(
             "jit_dense_load_perf: interpreter={interpreter_time:?} jit={jit_time:?} ratio={:.3} stats={stats:?}",
+            jit_time.as_secs_f64() / interpreter_time.as_secs_f64()
+        );
+    }
+
+    /// Floating dense-load counterpart to `jit_loop_perf`. Run with:
+    /// `cargo test -p boa_engine --features jit --release jit_dense_f64_load_perf -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf measurement; run manually with --release --nocapture"]
+    fn jit_dense_f64_load_perf() {
+        let src = "function sum(values, n) { var total = 0.5; for (var i = 0; i < n; i++) { total = total + values[i]; } return total; } var values = new Array(1000); for (var k = 0; k < 1000; k++) { values[k] = k + 0.25; } var answer = 0.5; for (var j = 0; j < 1000; j++) { answer = answer + sum(values, 1000); } answer";
+
+        let time = |jit: bool| -> (f64, std::time::Duration, Option<JitStats>) {
+            let mut context = Context::default();
+            let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
+                .expect("parse dense floating-load benchmark");
+            if jit {
+                context.enable_jit();
+            }
+            drop(
+                script
+                    .evaluate(&mut context)
+                    .expect("warm dense floating-load benchmark"),
+            );
+            let start = Instant::now();
+            let value = script
+                .evaluate(&mut context)
+                .expect("measure dense floating-load benchmark");
+            (
+                value.as_number().unwrap_or_default(),
+                start.elapsed(),
+                context.jit_stats(),
+            )
+        };
+
+        let (interpreter_value, interpreter_time, _) = time(false);
+        let (jit_value, jit_time, stats) = time(true);
+        assert_eq!(interpreter_value.to_bits(), 499_750_500.5_f64.to_bits());
+        assert_eq!(jit_value.to_bits(), interpreter_value.to_bits());
+        eprintln!(
+            "jit_dense_f64_load_perf: interpreter={interpreter_time:?} jit={jit_time:?} ratio={:.3} stats={stats:?}",
             jit_time.as_secs_f64() / interpreter_time.as_secs_f64()
         );
     }
