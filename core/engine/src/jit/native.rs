@@ -1265,9 +1265,8 @@ struct Helpers {
     get_argument_f64: Helper,
     dense_i32_guarded: Helper,
     dense_f64_guarded: Helper,
-    named_guard: Helper,
     named_i32_guarded: Helper,
-    named_f64: Helper,
+    named_f64_guarded: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
     store_i32_if_defined: Helper,
@@ -1595,15 +1594,6 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::F64, types::I32, ptr],
                 types::I64,
             ),
-            named_guard: make(
-                if self.instrument_storage {
-                    jit_diagnostic_named_property_guard as *const () as usize
-                } else {
-                    jit_named_property_guard as *const () as usize
-                },
-                &[ptr, types::I32, types::I32, types::I32],
-                types::I64,
-            ),
             named_i32_guarded: make(
                 if self.instrument_storage {
                     jit_diagnostic_named_property_i32_guarded as *const () as usize
@@ -1613,14 +1603,14 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32],
                 types::I64,
             ),
-            named_f64: make(
+            named_f64_guarded: make(
                 if self.instrument_storage {
-                    jit_diagnostic_named_property_f64 as *const () as usize
+                    jit_diagnostic_named_property_f64_guarded as *const () as usize
                 } else {
-                    jit_named_property_f64 as *const () as usize
+                    jit_named_property_f64_guarded as *const () as usize
                 },
-                &[ptr, types::I32, types::I32],
-                types::F64,
+                &[ptr, types::I32, types::I32, ptr],
+                types::I64,
             ),
             call_ordinary: make(
                 jit_call_ordinary as *const () as usize,
@@ -1984,15 +1974,26 @@ impl<'a> NativeCompiler<'a> {
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let f64_output = (self.mode == NativeMode::F64).then(|| {
+                    bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ))
+                });
                 let guarded_value = if self.mode == NativeMode::F64 {
-                    let mode = bcx.ins().iconst(types::I32, 1);
-                    let guard_helper = bcx
+                    let helper = bcx
                         .ins()
-                        .iconst(helpers.ptr, helpers.named_guard.address as i64);
+                        .iconst(helpers.ptr, helpers.named_f64_guarded.address as i64);
+                    let output = bcx.ins().stack_addr(
+                        helpers.ptr,
+                        f64_output.expect("F64 mode has an output slot"),
+                        0,
+                    );
                     bcx.ins().call_indirect(
-                        helpers.named_guard.signature,
-                        guard_helper,
-                        &[ctx, object, ic_index, mode],
+                        helpers.named_f64_guarded.signature,
+                        helper,
+                        &[ctx, object, ic_index, output],
                     )
                 } else {
                     let guard_helper = bcx
@@ -2020,14 +2021,11 @@ impl<'a> NativeCompiler<'a> {
                 }
                 bcx.switch_to_block(cont);
                 if self.mode == NativeMode::F64 {
-                    let load_helper = helpers.named_f64;
-                    let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
-                    let result = bcx.ins().call_indirect(
-                        load_helper.signature,
-                        load_address,
-                        &[ctx, object, ic_index],
+                    let result = bcx.ins().stack_load(
+                        types::F64,
+                        f64_output.expect("F64 mode has an output slot"),
+                        0,
                     );
-                    let result = bcx.inst_results(result)[0];
                     if !self.define_register(bcx, dst, result) {
                         return false;
                     }
@@ -3899,22 +3897,23 @@ fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Opti
     }
 }
 
-extern "C" fn jit_named_property_guard(
+extern "C" fn jit_named_property_f64_guarded(
     context: *mut Context,
     register: u32,
     ic_index: u32,
-    mode: u32,
+    output: *mut f64,
 ) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
-    let Some(value) = named_property_value(context, register, ic_index) else {
+    let Some(value) =
+        named_property_value(context, register, ic_index).and_then(|value| value.as_number())
+    else {
         return 0;
     };
-    u64::from(if mode == 0 {
-        value.as_i32().is_some()
-    } else {
-        value.as_number().is_some()
-    })
+    // SAFETY: generated code passes an aligned eight-byte stack slot owned by
+    // the active native frame and reads it only when this helper returns 1.
+    unsafe { output.write(value) };
+    1
 }
 
 extern "C" fn jit_named_property_i32_guarded(
@@ -3934,21 +3933,13 @@ extern "C" fn jit_named_property_i32_guarded(
     u64::from(value as u32)
 }
 
-extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_index: u32) -> f64 {
-    // SAFETY: generated code receives an exclusively borrowed live context.
-    let context = unsafe { &mut *context };
-    named_property_value(context, register, ic_index)
-        .and_then(|value| value.as_number())
-        .unwrap_or(0.0)
-}
-
-extern "C" fn jit_diagnostic_named_property_guard(
+extern "C" fn jit_diagnostic_named_property_f64_guarded(
     context: *mut Context,
     register: u32,
     ic_index: u32,
-    mode: u32,
+    output: *mut f64,
 ) -> u64 {
-    let result = jit_named_property_guard(context, register, ic_index, mode);
+    let result = jit_named_property_f64_guarded(context, register, ic_index, output);
     // SAFETY: generated code receives an exclusively borrowed live context,
     // and the delegated helper's borrow ended before this update.
     let counters = unsafe { &mut (*context).vm.jit_native_storage };
@@ -3956,6 +3947,7 @@ extern "C" fn jit_diagnostic_named_property_guard(
         counters.named_guard_misses = counters.named_guard_misses.saturating_add(1);
     } else {
         counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
+        counters.named_loads = counters.named_loads.saturating_add(1);
     }
     result
 }
@@ -3975,19 +3967,6 @@ extern "C" fn jit_diagnostic_named_property_i32_guarded(
         counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
         counters.named_loads = counters.named_loads.saturating_add(1);
     }
-    result
-}
-
-extern "C" fn jit_diagnostic_named_property_f64(
-    context: *mut Context,
-    register: u32,
-    ic_index: u32,
-) -> f64 {
-    let result = jit_named_property_f64(context, register, ic_index);
-    // SAFETY: generated code receives an exclusively borrowed live context,
-    // and the delegated helper's borrow ended before this update.
-    let counters = unsafe { &mut (*context).vm.jit_native_storage };
-    counters.named_loads = counters.named_loads.saturating_add(1);
     result
 }
 
