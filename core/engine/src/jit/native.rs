@@ -1684,7 +1684,11 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::F64],
                 types::I64,
             ),
-            increment_loop: make(jit_increment_loop as *const () as usize, &[ptr], types::I64),
+            increment_loop: make(
+                jit_increment_loop as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             handle_return: make(jit_handle_return as *const () as usize, &[ptr], types::I64),
             consume_instruction_budget: make(
                 jit_consume_instruction_budget as *const () as usize,
@@ -2386,13 +2390,15 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::IncrementLoopIteration => {
-                self.emit_set_pc(bcx, ctx, helpers, next_pc);
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);
-                let status =
-                    bcx.ins()
-                        .call_indirect(helpers.increment_loop.signature, helper, &[ctx]);
+                let next_pc = bcx.ins().iconst(types::I32, next_pc as i64);
+                let status = bcx.ins().call_indirect(
+                    helpers.increment_loop.signature,
+                    helper,
+                    &[ctx, next_pc],
+                );
                 let status = bcx.inst_results(status)[0];
                 let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
                 let failed = bcx.ins().band(status, break_mask);
@@ -3060,7 +3066,11 @@ impl<'a> LoopRegionCompiler<'a> {
                 &[ptr, types::I32, types::F64],
                 types::I64,
             ),
-            increment_loop: make(jit_increment_loop as *const () as usize, &[ptr], types::I64),
+            increment_loop: make(
+                jit_increment_loop as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             consume_instruction_budget: make(
                 jit_consume_instruction_budget as *const () as usize,
                 &[ptr, types::I32],
@@ -3323,13 +3333,15 @@ impl<'a> LoopRegionCompiler<'a> {
                 loop_exit,
             )?,
             Instruction::IncrementLoopIteration => {
-                Self::emit_set_pc(bcx, ctx, helpers, decoded.next_pc as u32);
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);
-                let status =
-                    bcx.ins()
-                        .call_indirect(helpers.increment_loop.signature, helper, &[ctx]);
+                let next_pc = bcx.ins().iconst(types::I32, decoded.next_pc as i64);
+                let status = bcx.ins().call_indirect(
+                    helpers.increment_loop.signature,
+                    helper,
+                    &[ctx, next_pc],
+                );
                 let status = bcx.inst_results(status)[0];
                 let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
                 let failed = bcx.ins().band(status, break_mask);
@@ -4242,13 +4254,14 @@ extern "C" fn jit_set_return_f64(context: *mut Context, value: f64) -> u64 {
     0
 }
 
-/// Charge one interpreter-visible loop iteration at a native backedge. This
-/// is the initial native safepoint: the PC is written before this helper is
-/// called, and failures are recorded in VM state rather than crossing the C
-/// ABI as Rust values.
-extern "C" fn jit_increment_loop(context: *mut Context) -> u64 {
+/// Publish the next bytecode PC and charge one interpreter-visible loop
+/// iteration at a native backedge. Combining both safepoint operations avoids
+/// a second Rust helper transition on every native loop iteration. Failures
+/// remain recorded in VM state rather than crossing the C ABI as Rust values.
+extern "C" fn jit_increment_loop(context: *mut Context, next_pc: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
+    context.vm.frame_mut().pc = next_pc;
     match context.consume_loop_iterations(1) {
         Ok(()) => 0,
         Err(mut error) => {
