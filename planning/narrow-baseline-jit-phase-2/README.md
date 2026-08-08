@@ -327,6 +327,9 @@ showing that another boundary dominates.
 - [Storage helper fusion checkpoint, 2026-08-09](35-storage-helper-fusion-2026-08-09.md)
   — measured guard/load fusion for dense and named `i32`/`f64` paths, the
   GC-safe tagged/stack-output contracts, and the rejected F64 argument variant.
+- [Ordinary-call continuation design, 2026-08-09](36-ordinary-call-continuation-design-2026-08-09.md)
+  — the bounded VM-owned continuation trampoline selected to keep compiled
+  callers native across ordinary calls before direct compiled-callee entry.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
