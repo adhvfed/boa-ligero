@@ -1267,7 +1267,7 @@ struct Helpers {
     dense_guard_f64: Helper,
     dense_f64: Helper,
     named_guard: Helper,
-    named_i32: Helper,
+    named_i32_guarded: Helper,
     named_f64: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
@@ -1614,14 +1614,14 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
-            named_i32: make(
+            named_i32_guarded: make(
                 if self.instrument_storage {
-                    jit_diagnostic_named_property_i32 as *const () as usize
+                    jit_diagnostic_named_property_i32_guarded as *const () as usize
                 } else {
-                    jit_named_property_i32 as *const () as usize
+                    jit_named_property_i32_guarded as *const () as usize
                 },
                 &[ptr, types::I32, types::I32],
-                types::I32,
+                types::I64,
             ),
             named_f64: make(
                 if self.instrument_storage {
@@ -1993,41 +1993,59 @@ impl<'a> NativeCompiler<'a> {
                 let ic_index = bcx
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
-                let mode = bcx
-                    .ins()
-                    .iconst(types::I32, i64::from(self.mode == NativeMode::F64));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let guard_helper = bcx
-                    .ins()
-                    .iconst(helpers.ptr, helpers.named_guard.address as i64);
-                let guard = bcx.ins().call_indirect(
-                    helpers.named_guard.signature,
-                    guard_helper,
-                    &[ctx, object, ic_index, mode],
-                );
-                let guard = bcx.inst_results(guard)[0];
+                let guarded_value = if self.mode == NativeMode::F64 {
+                    let mode = bcx.ins().iconst(types::I32, 1);
+                    let guard_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.named_guard.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.named_guard.signature,
+                        guard_helper,
+                        &[ctx, object, ic_index, mode],
+                    )
+                } else {
+                    let guard_helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.named_i32_guarded.address as i64);
+                    bcx.ins().call_indirect(
+                        helpers.named_i32_guarded.signature,
+                        guard_helper,
+                        &[ctx, object, ic_index],
+                    )
+                };
+                let guarded_value = bcx.inst_results(guarded_value)[0];
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                bcx.ins().brif(guard, cont, &[], deopt, &[]);
+                if self.mode == NativeMode::F64 {
+                    bcx.ins().brif(guarded_value, cont, &[], deopt, &[]);
+                } else {
+                    let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let failed = bcx.ins().band(guarded_value, fail_mask);
+                    bcx.ins().brif(failed, deopt, &[], cont, &[]);
+                }
                 bcx.switch_to_block(deopt);
                 if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::NamedProperty) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
-                let load_helper = if self.mode == NativeMode::F64 {
-                    helpers.named_f64
+                if self.mode == NativeMode::F64 {
+                    let load_helper = helpers.named_f64;
+                    let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
+                    let result = bcx.ins().call_indirect(
+                        load_helper.signature,
+                        load_address,
+                        &[ctx, object, ic_index],
+                    );
+                    let result = bcx.inst_results(result)[0];
+                    if !self.define_register(bcx, dst, result) {
+                        return false;
+                    }
                 } else {
-                    helpers.named_i32
-                };
-                let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
-                let result = bcx.ins().call_indirect(
-                    load_helper.signature,
-                    load_address,
-                    &[ctx, object, ic_index],
-                );
-                let result = bcx.inst_results(result)[0];
-                if !self.define_register(bcx, dst, result) {
-                    return false;
+                    let value = bcx.ins().ireduce(types::I32, guarded_value);
+                    if !self.define_register(bcx, dst, value) {
+                        return false;
+                    }
                 }
             }
             Instruction::GetPropertyByValue {
@@ -3919,12 +3937,21 @@ extern "C" fn jit_named_property_guard(
     })
 }
 
-extern "C" fn jit_named_property_i32(context: *mut Context, register: u32, ic_index: u32) -> i32 {
+extern "C" fn jit_named_property_i32_guarded(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
-    named_property_value(context, register, ic_index)
-        .and_then(|value| value.as_i32())
-        .unwrap_or_default()
+    let Some(value) =
+        named_property_value(context, register, ic_index).and_then(|value| value.as_i32())
+    else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    // Every successful payload occupies only the low 32 bits, so it cannot
+    // overlap the bit-61 guard-failure tag even when the i32 is negative.
+    u64::from(value as u32)
 }
 
 extern "C" fn jit_named_property_f64(context: *mut Context, register: u32, ic_index: u32) -> f64 {
@@ -3953,16 +3980,21 @@ extern "C" fn jit_diagnostic_named_property_guard(
     result
 }
 
-extern "C" fn jit_diagnostic_named_property_i32(
+extern "C" fn jit_diagnostic_named_property_i32_guarded(
     context: *mut Context,
     register: u32,
     ic_index: u32,
-) -> i32 {
-    let result = jit_named_property_i32(context, register, ic_index);
+) -> u64 {
+    let result = jit_named_property_i32_guarded(context, register, ic_index);
     // SAFETY: generated code receives an exclusively borrowed live context,
     // and the delegated helper's borrow ended before this update.
     let counters = unsafe { &mut (*context).vm.jit_native_storage };
-    counters.named_loads = counters.named_loads.saturating_add(1);
+    if result & JIT_GUARD_FAIL_BIT != 0 {
+        counters.named_guard_misses = counters.named_guard_misses.saturating_add(1);
+    } else {
+        counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
+        counters.named_loads = counters.named_loads.saturating_add(1);
+    }
     result
 }
 
