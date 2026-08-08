@@ -263,9 +263,13 @@ impl SetNameByLocator {
             BindingReference::Global { ic_index } => {
                 SetNameGlobal::set_global(value, ic_index.into(), context)
             }
-            BindingReference::Locator(binding_locator) => {
+            BindingReference::Locator(mut binding_locator) => {
                 let strict = context.vm.frame().code_block.strict();
                 let value = context.vm.get_register(value.into()).clone();
+
+                if context.is_deleted_binding(&binding_locator) {
+                    context.find_runtime_binding(&mut binding_locator)?;
+                }
 
                 verify_initialized(&binding_locator, context)?;
                 context.set_binding(&binding_locator, value, strict)?;

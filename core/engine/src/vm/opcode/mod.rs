@@ -2364,6 +2364,9 @@ generate_opcodes! {
     Reserved55 => Reserved,
     /// Reserved [`Opcode`].
     Reserved56 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved57 => Reserved,
+    /// Declare `var` type variable during eval declaration instantiation.
+    ///
+    /// - Operands:
+    ///   - binding_index: `IndexOperand`
+    DefEvalVar { binding_index: IndexOperand },
 }

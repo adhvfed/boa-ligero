@@ -447,6 +447,7 @@ pub(crate) enum BindingAccessOpcode {
     DeleteName,
     GetLocator,
     DefVar,
+    DefEvalVar,
 }
 
 /// Manages the source position scope, push on creation, pop on drop.
@@ -924,6 +925,9 @@ impl<'ctx> ByteCompiler<'ctx> {
                         .emit_get_locator_global((*index).into(), ic_index.into());
                 }
                 BindingAccessOpcode::DefVar => self.bytecode.emit_def_var((*index).into()),
+                BindingAccessOpcode::DefEvalVar => {
+                    self.bytecode.emit_def_eval_var((*index).into());
+                }
                 BindingAccessOpcode::PutLexicalValue => self
                     .bytecode
                     .emit_put_lexical_value(value.variable(), (*index).into()),
@@ -963,6 +967,9 @@ impl<'ctx> ByteCompiler<'ctx> {
                 }
                 BindingAccessOpcode::GetLocator => self.bytecode.emit_get_locator((*index).into()),
                 BindingAccessOpcode::DefVar => self.bytecode.emit_def_var((*index).into()),
+                BindingAccessOpcode::DefEvalVar => {
+                    self.bytecode.emit_def_eval_var((*index).into());
+                }
                 BindingAccessOpcode::PutLexicalValue => self
                     .bytecode
                     .emit_put_lexical_value(value.variable(), (*index).into()),
@@ -998,7 +1005,9 @@ impl<'ctx> ByteCompiler<'ctx> {
                 | BindingAccessOpcode::GetNameAndLocator => {
                     self.bytecode.emit_move(value.variable(), (*index).into());
                 }
-                BindingAccessOpcode::GetLocator | BindingAccessOpcode::DefVar => {}
+                BindingAccessOpcode::GetLocator
+                | BindingAccessOpcode::DefVar
+                | BindingAccessOpcode::DefEvalVar => {}
                 BindingAccessOpcode::SetName
                 | BindingAccessOpcode::DefInitVar
                 | BindingAccessOpcode::PutLexicalValue
@@ -1264,6 +1273,33 @@ impl<'ctx> ByteCompiler<'ctx> {
         self.patch_jump(jump_to_end);
     }
 
+    /// Generates the `if`-`else` pattern directly from a condition expression,
+    /// fusing a relational condition into the branch when possible.
+    ///
+    /// For a relational condition (`<`, `<=`, `>`, `>=`) this emits a single
+    /// fused comparison+branch opcode (e.g. `if (a < b)` becomes one
+    /// `JumpIfNotLessThan`) instead of computing a boolean into a register with
+    /// `LessThan` and then testing it with `JumpIfFalse` — saving a dispatch and
+    /// a register. Non-relational conditions fall back to compiling the
+    /// condition into a temporary register followed by `JumpIfFalse`.
+    pub(crate) fn compile_if_else(
+        &mut self,
+        condition: &Expression,
+        true_case: impl FnOnce(&mut ByteCompiler<'_>),
+        false_case: impl FnOnce(&mut ByteCompiler<'_>),
+    ) {
+        let jump_false = self.compile_condition_and_branch(condition, None);
+
+        // if true, jump to end to avoid running the code for the `else`
+        true_case(self);
+        let jump_to_end = self.jump();
+
+        // if false, we should be already at the end so no need to do anything.
+        self.patch_jump(jump_false);
+        false_case(self);
+        self.patch_jump(jump_to_end);
+    }
+
     pub(crate) fn jump_if_false(&mut self, value: &Register) -> Label {
         let index = self.next_opcode_location();
         self.bytecode
@@ -1284,7 +1320,10 @@ impl<'ctx> ByteCompiler<'ctx> {
         condition: &Expression,
         hoisted: Option<&HoistedOperand>,
     ) -> Label {
-        if let Expression::Binary(binary) = condition
+        // `flatten()` strips outer parentheses so that conditions like
+        // `(a < b)` (common in ternaries and hand-parenthesized code) still
+        // reach the fused comparison+branch path.
+        if let Expression::Binary(binary) = condition.flatten()
             && let BinaryOp::Relational(op) = binary.op()
             && let Some(label) = self.try_fused_comparison_branch(op, binary, hoisted)
         {

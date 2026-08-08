@@ -186,6 +186,7 @@ impl CodeBlock {
                     graph.add_edge(previous_pc, pc, None, Color::None, EdgeStyle::Line);
                 }
                 Instruction::DefVar { .. }
+                | Instruction::DefEvalVar { .. }
                 | Instruction::DefInitVar { .. }
                 | Instruction::PutLexicalValue { .. }
                 | Instruction::GetName { .. }
@@ -432,8 +433,7 @@ impl CodeBlock {
                 | Instruction::Reserved53
                 | Instruction::Reserved54
                 | Instruction::Reserved55
-                | Instruction::Reserved56
-                | Instruction::Reserved57 => unreachable!("Reserved opcodes are unreachable"),
+                | Instruction::Reserved56 => unreachable!("Reserved opcodes are unreachable"),
             }
         }
 
