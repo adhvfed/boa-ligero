@@ -61,23 +61,12 @@ fn main() {
     let script_path = &args[1];
     let runs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
     let warmup: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let mode = args
-        .get(4)
-        .filter(|mode| !mode.is_empty())
-        .map(String::as_str)
-        .map(RunnerMode::parse)
-        .transpose()
+    let (mode, diagnostic_options) = parse_runner_options(args.get(4..).unwrap_or_default())
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             print_usage();
             process::exit(2);
-        })
-        .unwrap_or(RunnerMode::Interpreter);
-    let diagnostic_options = parse_jit_diagnostic_options(&args[5..]).unwrap_or_else(|error| {
-        eprintln!("{error}");
-        print_usage();
-        process::exit(2);
-    });
+        });
     validate_mode_invocation(mode, runs, warmup).unwrap_or_else(|error| {
         eprintln!("{error}");
         print_usage();
@@ -141,6 +130,15 @@ fn print_usage() {
 struct JitDiagnosticOptions<'a> {
     output: Option<&'a str>,
     record_limit: Option<usize>,
+}
+
+fn parse_runner_options(args: &[String]) -> Result<(RunnerMode, JitDiagnosticOptions<'_>), String> {
+    let (mode, diagnostic_args) = match args.split_first() {
+        Some((mode, rest)) if !mode.starts_with("--") => (RunnerMode::parse(mode)?, rest),
+        _ => (RunnerMode::Interpreter, args),
+    };
+    let diagnostic_options = parse_jit_diagnostic_options(diagnostic_args)?;
+    Ok((mode, diagnostic_options))
 }
 
 fn parse_jit_diagnostic_options(args: &[String]) -> Result<JitDiagnosticOptions<'_>, String> {
@@ -573,7 +571,8 @@ struct JitOsrColdDiagnosticReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        JitDiagnosticOptions, RunnerMode, parse_jit_diagnostic_options, validate_mode_invocation,
+        JitDiagnosticOptions, RunnerMode, parse_jit_diagnostic_options, parse_runner_options,
+        validate_mode_invocation,
     };
 
     #[test]
@@ -587,6 +586,19 @@ mod tests {
         assert!(validate_mode_invocation(RunnerMode::OsrCold, 2, 0).is_err());
         assert!(validate_mode_invocation(RunnerMode::OsrCold, 1, 1).is_err());
         assert_eq!(validate_mode_invocation(RunnerMode::Jit, 2, 1), Ok(()));
+    }
+
+    #[test]
+    fn runner_options_allow_the_documented_default_mode() {
+        assert_eq!(
+            parse_runner_options(&[]),
+            Ok((RunnerMode::Interpreter, JitDiagnosticOptions::default()))
+        );
+        assert_eq!(
+            parse_runner_options(&["jit".to_owned()]),
+            Ok((RunnerMode::Jit, JitDiagnosticOptions::default()))
+        );
+        assert!(parse_runner_options(&["unknown".to_owned()]).is_err());
     }
 
     #[cfg(feature = "jit")]
