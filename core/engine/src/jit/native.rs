@@ -2175,13 +2175,7 @@ impl<'a> NativeCompiler<'a> {
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fadd(lhs, rhs)
                 } else {
-                    let result = bcx.ins().iadd(lhs, rhs);
-                    let lhs_sign = self.sign_bit(bcx, lhs);
-                    let rhs_sign = self.sign_bit(bcx, rhs);
-                    let result_sign = self.sign_bit(bcx, result);
-                    let same_sign = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
-                    let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                    let overflow = bcx.ins().band(same_sign, changed_sign);
+                    let (result, overflow) = bcx.ins().sadd_overflow(lhs, rhs);
                     let deopt = bcx.create_block();
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
@@ -2207,13 +2201,7 @@ impl<'a> NativeCompiler<'a> {
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fsub(lhs, rhs)
                 } else {
-                    let result = bcx.ins().isub(lhs, rhs);
-                    let lhs_sign = self.sign_bit(bcx, lhs);
-                    let rhs_sign = self.sign_bit(bcx, rhs);
-                    let result_sign = self.sign_bit(bcx, result);
-                    let different_sign = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
-                    let changed_sign = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                    let overflow = bcx.ins().band(different_sign, changed_sign);
+                    let (result, overflow) = bcx.ins().ssub_overflow(lhs, rhs);
                     let deopt = bcx.create_block();
                     let cont = bcx.create_block();
                     bcx.ins().brif(overflow, deopt, &[], cont, &[]);
@@ -2239,12 +2227,7 @@ impl<'a> NativeCompiler<'a> {
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fmul(lhs, rhs)
                 } else {
-                    let lhs_wide = bcx.ins().sextend(types::I64, lhs);
-                    let rhs_wide = bcx.ins().sextend(types::I64, rhs);
-                    let wide_result = bcx.ins().imul(lhs_wide, rhs_wide);
-                    let result = bcx.ins().ireduce(types::I32, wide_result);
-                    let round_trip = bcx.ins().sextend(types::I64, result);
-                    let overflow = bcx.ins().icmp(IntCC::NotEqual, wide_result, round_trip);
+                    let (result, overflow) = bcx.ins().smul_overflow(lhs, rhs);
                     let zero = bcx.ins().iconst(types::I32, 0);
                     let is_zero = bcx.ins().icmp(IntCC::Equal, result, zero);
                     let lhs_negative = self.sign_bit(bcx, lhs);
@@ -2293,11 +2276,7 @@ impl<'a> NativeCompiler<'a> {
                     bcx.ins().fadd(old_value, one)
                 } else {
                     let one = bcx.ins().iconst(types::I32, 1);
-                    let new_value = bcx.ins().iadd(old_value, one);
-                    let old_sign = self.sign_bit(bcx, old_value);
-                    let new_sign = self.sign_bit(bcx, new_value);
-                    let not_old_sign = bcx.ins().bnot(old_sign);
-                    let max_overflow = bcx.ins().band(not_old_sign, new_sign);
+                    let (new_value, max_overflow) = bcx.ins().sadd_overflow(old_value, one);
                     let deopt = bcx.create_block();
                     let cont = bcx.create_block();
                     bcx.ins().brif(max_overflow, deopt, &[], cont, &[]);
@@ -3197,13 +3176,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 let result = match self.mode {
                     NativeMode::F64 => bcx.ins().fadd(lhs, rhs),
                     NativeMode::I32 => {
-                        let result = bcx.ins().iadd(lhs, rhs);
-                        let lhs_sign = Self::sign_bit(bcx, lhs);
-                        let rhs_sign = Self::sign_bit(bcx, rhs);
-                        let result_sign = Self::sign_bit(bcx, result);
-                        let same = bcx.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
-                        let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                        let overflow = bcx.ins().band(same, changed);
+                        let (result, overflow) = bcx.ins().sadd_overflow(lhs, rhs);
                         self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
@@ -3216,13 +3189,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 let result = match self.mode {
                     NativeMode::F64 => bcx.ins().fsub(lhs, rhs),
                     NativeMode::I32 => {
-                        let result = bcx.ins().isub(lhs, rhs);
-                        let lhs_sign = Self::sign_bit(bcx, lhs);
-                        let rhs_sign = Self::sign_bit(bcx, rhs);
-                        let result_sign = Self::sign_bit(bcx, result);
-                        let different = bcx.ins().icmp(IntCC::NotEqual, lhs_sign, rhs_sign);
-                        let changed = bcx.ins().icmp(IntCC::NotEqual, result_sign, lhs_sign);
-                        let overflow = bcx.ins().band(different, changed);
+                        let (result, overflow) = bcx.ins().ssub_overflow(lhs, rhs);
                         self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
@@ -3235,12 +3202,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 let result = match self.mode {
                     NativeMode::F64 => bcx.ins().fmul(lhs, rhs),
                     NativeMode::I32 => {
-                        let lhs_wide = bcx.ins().sextend(types::I64, lhs);
-                        let rhs_wide = bcx.ins().sextend(types::I64, rhs);
-                        let wide = bcx.ins().imul(lhs_wide, rhs_wide);
-                        let result = bcx.ins().ireduce(types::I32, wide);
-                        let round_trip = bcx.ins().sextend(types::I64, result);
-                        let overflow = bcx.ins().icmp(IntCC::NotEqual, wide, round_trip);
+                        let (result, overflow) = bcx.ins().smul_overflow(lhs, rhs);
                         let zero = bcx.ins().iconst(types::I32, 0);
                         let is_zero = bcx.ins().icmp(IntCC::Equal, result, zero);
                         let lhs_negative = Self::sign_bit(bcx, lhs);
@@ -3263,11 +3225,7 @@ impl<'a> LoopRegionCompiler<'a> {
                     }
                     NativeMode::I32 => {
                         let one = bcx.ins().iconst(types::I32, 1);
-                        let result = bcx.ins().iadd(old, one);
-                        let old_sign = Self::sign_bit(bcx, old);
-                        let result_sign = Self::sign_bit(bcx, result);
-                        let not_old_sign = bcx.ins().bnot(old_sign);
-                        let overflow = bcx.ins().band(not_old_sign, result_sign);
+                        let (result, overflow) = bcx.ins().sadd_overflow(old, one);
                         self.emit_overflow_guard(bcx, ctx, helpers, decoded.pc, index, overflow)?;
                         result
                     }
