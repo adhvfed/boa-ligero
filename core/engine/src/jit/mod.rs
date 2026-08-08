@@ -7028,6 +7028,28 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_preserves_dense_integer_payload_bits() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(values, index, n) { let result = 0; for (let i = 0; i < n; i++) { result = values[index]; } return result; } let values = [-2147483648, -1, 0, 2147483647]; let answer = 0; for (let j = 0; j < 80; j++) { answer = read(values, 0, 3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(i32::MIN));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_runs_native_dense_floating_array_load() {
         let mut context = Context::default();
         context.enable_jit();
@@ -8093,6 +8115,46 @@ mod tests {
             ti,
             tj,
             tj.as_secs_f64() / ti.as_secs_f64()
+        );
+    }
+
+    /// Dense-load counterpart to `jit_loop_perf`. Run with:
+    /// `cargo test -p boa_engine --features jit --release jit_dense_load_perf -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf measurement; run manually with --release --nocapture"]
+    fn jit_dense_load_perf() {
+        let src = "function sum(values, n) { var total = 0; for (var i = 0; i < n; i++) { total = total + values[i]; } return total; } var values = new Array(1000); for (var k = 0; k < 1000; k++) { values[k] = k; } var answer = 0; for (var j = 0; j < 1000; j++) { answer = answer + sum(values, 1000); } answer";
+
+        let time = |jit: bool| -> (i32, std::time::Duration, Option<JitStats>) {
+            let mut context = Context::default();
+            let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
+                .expect("parse dense-load benchmark");
+            if jit {
+                context.enable_jit();
+            }
+            drop(
+                script
+                    .evaluate(&mut context)
+                    .expect("warm dense-load benchmark"),
+            );
+            let start = Instant::now();
+            let value = script
+                .evaluate(&mut context)
+                .expect("measure dense-load benchmark");
+            (
+                value.as_i32().unwrap_or_default(),
+                start.elapsed(),
+                context.jit_stats(),
+            )
+        };
+
+        let (interpreter_value, interpreter_time, _) = time(false);
+        let (jit_value, jit_time, stats) = time(true);
+        assert_eq!(interpreter_value, 499_500_000);
+        assert_eq!(jit_value, interpreter_value);
+        eprintln!(
+            "jit_dense_load_perf: interpreter={interpreter_time:?} jit={jit_time:?} ratio={:.3} stats={stats:?}",
+            jit_time.as_secs_f64() / interpreter_time.as_secs_f64()
         );
     }
 

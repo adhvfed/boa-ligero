@@ -1263,9 +1263,8 @@ struct Helpers {
     set_return_register: Helper,
     get_argument_i32: Helper,
     get_argument_f64: Helper,
-    dense_guard: Helper,
+    dense_i32_guarded: Helper,
     dense_guard_f64: Helper,
-    dense_i32: Helper,
     dense_f64: Helper,
     named_guard: Helper,
     named_i32: Helper,
@@ -1579,13 +1578,13 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32],
                 types::F64,
             ),
-            dense_guard: make(
+            dense_i32_guarded: make(
                 if self.instrument_storage {
-                    jit_diagnostic_dense_array_guard as *const () as usize
+                    jit_diagnostic_dense_array_i32_guarded as *const () as usize
                 } else {
-                    jit_dense_array_guard as *const () as usize
+                    jit_dense_array_i32_guarded as *const () as usize
                 },
-                &[ptr, types::I32, types::I32, types::I32, types::I32],
+                &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
             dense_guard_f64: make(
@@ -1596,15 +1595,6 @@ impl<'a> NativeCompiler<'a> {
                 },
                 &[ptr, types::I32, types::F64, types::I32],
                 types::I64,
-            ),
-            dense_i32: make(
-                if self.instrument_storage {
-                    jit_diagnostic_dense_array_i32 as *const () as usize
-                } else {
-                    jit_dense_array_i32 as *const () as usize
-                },
-                &[ptr, types::I32, types::I32, types::I32],
-                types::I32,
             ),
             dense_f64: make(
                 if self.instrument_storage {
@@ -2060,7 +2050,7 @@ impl<'a> NativeCompiler<'a> {
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let guard = if self.mode == NativeMode::F64 {
+                let guarded_value = if self.mode == NativeMode::F64 {
                     let guard_helper = bcx
                         .ins()
                         .iconst(helpers.ptr, helpers.dense_guard_f64.address as i64);
@@ -2070,47 +2060,48 @@ impl<'a> NativeCompiler<'a> {
                         &[ctx, object, key, ic_index],
                     )
                 } else {
-                    let mode = bcx.ins().iconst(types::I32, 0);
                     let guard_helper = bcx
                         .ins()
-                        .iconst(helpers.ptr, helpers.dense_guard.address as i64);
+                        .iconst(helpers.ptr, helpers.dense_i32_guarded.address as i64);
                     bcx.ins().call_indirect(
-                        helpers.dense_guard.signature,
+                        helpers.dense_i32_guarded.signature,
                         guard_helper,
-                        &[ctx, object, key, ic_index, mode],
+                        &[ctx, object, key, ic_index],
                     )
                 };
-                let guard = bcx.inst_results(guard)[0];
+                let guarded_value = bcx.inst_results(guarded_value)[0];
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                bcx.ins().brif(guard, cont, &[], deopt, &[]);
+                if self.mode == NativeMode::F64 {
+                    bcx.ins().brif(guarded_value, cont, &[], deopt, &[]);
+                } else {
+                    let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let failed = bcx.ins().band(guarded_value, fail_mask);
+                    bcx.ins().brif(failed, deopt, &[], cont, &[]);
+                }
                 bcx.switch_to_block(deopt);
                 if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::DenseElement) {
                     return false;
                 }
                 bcx.switch_to_block(cont);
-                let result = if self.mode == NativeMode::F64 {
+                if self.mode == NativeMode::F64 {
                     let load_helper = bcx
                         .ins()
                         .iconst(helpers.ptr, helpers.dense_f64.address as i64);
-                    bcx.ins().call_indirect(
+                    let result = bcx.ins().call_indirect(
                         helpers.dense_f64.signature,
                         load_helper,
                         &[ctx, object, key, ic_index],
-                    )
+                    );
+                    let result = bcx.inst_results(result)[0];
+                    if !self.define_register(bcx, dst, result) {
+                        return false;
+                    }
                 } else {
-                    let load_helper = bcx
-                        .ins()
-                        .iconst(helpers.ptr, helpers.dense_i32.address as i64);
-                    bcx.ins().call_indirect(
-                        helpers.dense_i32.signature,
-                        load_helper,
-                        &[ctx, object, key, ic_index],
-                    )
-                };
-                let result = bcx.inst_results(result)[0];
-                if !self.define_register(bcx, dst, result) {
-                    return false;
+                    let value = bcx.ins().ireduce(types::I32, guarded_value);
+                    if !self.define_register(bcx, dst, value) {
+                        return false;
+                    }
                 }
             }
             Instruction::Call { argument_count } => {
@@ -3781,37 +3772,26 @@ fn dense_array_value_f64(
     dense_array_value_at(context, register, index as u32, ic_index)
 }
 
-extern "C" fn jit_dense_array_guard(
+extern "C" fn jit_dense_array_i32_guarded(
     context: *mut Context,
     register: u32,
     index: i32,
     ic_index: u32,
-    mode: u32,
 ) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let Some((kind, value)) = dense_array_value(context, register, index, ic_index) else {
-        return 0;
+        return JIT_GUARD_FAIL_BIT;
     };
-    let kind_ok = if mode == 0 {
-        kind == IndexedKind::DenseI32 && value.as_i32().is_some()
-    } else {
-        matches!(kind, IndexedKind::DenseI32 | IndexedKind::DenseF64) && value.as_number().is_some()
+    if kind != IndexedKind::DenseI32 {
+        return JIT_GUARD_FAIL_BIT;
+    }
+    let Some(value) = value.as_i32() else {
+        return JIT_GUARD_FAIL_BIT;
     };
-    u64::from(kind_ok)
-}
-
-extern "C" fn jit_dense_array_i32(
-    context: *mut Context,
-    register: u32,
-    index: i32,
-    ic_index: u32,
-) -> i32 {
-    // SAFETY: generated code receives an exclusively borrowed live context.
-    let context = unsafe { &mut *context };
-    dense_array_value(context, register, index, ic_index)
-        .and_then(|(_, value)| value.as_i32())
-        .unwrap_or_default()
+    // Every successful payload occupies only the low 32 bits, so it cannot
+    // overlap the bit-61 guard-failure tag even when the i32 is negative.
+    u64::from(value as u32)
 }
 
 extern "C" fn jit_dense_array_guard_f64(
@@ -3844,21 +3824,21 @@ extern "C" fn jit_dense_array_f64(
         .unwrap_or(0.0)
 }
 
-extern "C" fn jit_diagnostic_dense_array_guard(
+extern "C" fn jit_diagnostic_dense_array_i32_guarded(
     context: *mut Context,
     register: u32,
     index: i32,
     ic_index: u32,
-    mode: u32,
 ) -> u64 {
-    let result = jit_dense_array_guard(context, register, index, ic_index, mode);
+    let result = jit_dense_array_i32_guarded(context, register, index, ic_index);
     // SAFETY: generated code receives an exclusively borrowed live context,
     // and the delegated helper's borrow ended before this update.
     let counters = unsafe { &mut (*context).vm.jit_native_storage };
-    if result == 0 {
+    if result & JIT_GUARD_FAIL_BIT != 0 {
         counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
     } else {
         counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+        counters.dense_loads = counters.dense_loads.saturating_add(1);
     }
     result
 }
@@ -3878,20 +3858,6 @@ extern "C" fn jit_diagnostic_dense_array_guard_f64(
     } else {
         counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
     }
-    result
-}
-
-extern "C" fn jit_diagnostic_dense_array_i32(
-    context: *mut Context,
-    register: u32,
-    index: i32,
-    ic_index: u32,
-) -> i32 {
-    let result = jit_dense_array_i32(context, register, index, ic_index);
-    // SAFETY: generated code receives an exclusively borrowed live context,
-    // and the delegated helper's borrow ended before this update.
-    let counters = unsafe { &mut (*context).vm.jit_native_storage };
-    counters.dense_loads = counters.dense_loads.saturating_add(1);
     result
 }
 
