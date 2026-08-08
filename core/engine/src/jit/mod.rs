@@ -5001,10 +5001,7 @@ mod tests {
         let native = error
             .as_native()
             .expect("recursion overflow surfaces as a catchable native error");
-        assert!(matches!(
-            native.kind,
-            crate::error::JsNativeErrorKind::Range
-        ));
+        assert!(matches!(native.kind(), JsNativeErrorKind::Range));
         assert_eq!(native.message(), "Maximum call stack size exceeded");
         assert!(context.jit_enabled());
         assert_eq!(context.vm.frames.len(), 1);
@@ -7561,10 +7558,7 @@ mod tests {
         let native = error
             .as_native()
             .expect("recursion overflow surfaces as a catchable native error");
-        assert!(matches!(
-            native.kind,
-            crate::error::JsNativeErrorKind::Range
-        ));
+        assert!(matches!(native.kind(), JsNativeErrorKind::Range));
         assert_eq!(native.message(), "Maximum call stack size exceeded");
     }
 
