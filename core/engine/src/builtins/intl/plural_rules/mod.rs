@@ -1,7 +1,7 @@
 mod options;
 
 use boa_gc::{Finalize, Trace};
-use fixed_decimal::{CompactDecimal, Decimal, SignedRoundingMode, UnsignedRoundingMode};
+use fixed_decimal::{CompactDecimal, Decimal};
 use icu_locale::Locale;
 use icu_plurals::{
     PluralCategory, PluralRuleType, PluralRules as NativePluralRules, PluralRulesOptions,
@@ -25,7 +25,7 @@ use crate::{
 use super::{
     Service,
     locale::{canonicalize_locale_list, filter_locales, resolve_locale},
-    number_format::{DigitFormatOptions, Extrema, NotationKind},
+    number_format::{DigitFormatOptions, Extrema, NotationKind, rounding_mode_to_js_string},
     options::{IntlOptions, coerce_options_to_object},
 };
 
@@ -405,28 +405,7 @@ impl PluralRules {
             )
             .property(
                 js_string!("roundingMode"),
-                match plural_rules.format_options.rounding_mode {
-                    SignedRoundingMode::Unsigned(UnsignedRoundingMode::Expand) => {
-                        js_string!("expand")
-                    }
-                    SignedRoundingMode::Unsigned(UnsignedRoundingMode::Trunc) => {
-                        js_string!("trunc")
-                    }
-                    SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand) => {
-                        js_string!("halfExpand")
-                    }
-                    SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfTrunc) => {
-                        js_string!("halfTrunc")
-                    }
-                    SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfEven) => {
-                        js_string!("halfEven")
-                    }
-                    SignedRoundingMode::Ceil => js_string!("ceil"),
-                    SignedRoundingMode::Floor => js_string!("floor"),
-                    SignedRoundingMode::HalfCeil => js_string!("halfCeil"),
-                    SignedRoundingMode::HalfFloor => js_string!("halfFloor"),
-                    _ => unreachable!("unhandled variant of `SignedRoundingMode`"),
-                },
+                rounding_mode_to_js_string(plural_rules.format_options.rounding_mode),
                 Attribute::all(),
             )
             .property(

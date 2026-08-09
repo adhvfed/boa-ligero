@@ -889,6 +889,11 @@ impl NumberFormat {
                 Attribute::all(),
             )
             .property(
+                js_string!("roundingMode"),
+                rounding_mode_to_js_string(nf.digit_options.rounding_mode),
+                Attribute::all(),
+            )
+            .property(
                 js_string!("roundingPriority"),
                 nf.digit_options.rounding_priority.to_js_string(),
                 Attribute::all(),

@@ -51,6 +51,23 @@ impl OptionType for SignedRoundingMode {
     }
 }
 
+pub(crate) fn rounding_mode_to_js_string(rounding_mode: SignedRoundingMode) -> JsString {
+    match rounding_mode {
+        SignedRoundingMode::Unsigned(UnsignedRoundingMode::Expand) => js_string!("expand"),
+        SignedRoundingMode::Unsigned(UnsignedRoundingMode::Trunc) => js_string!("trunc"),
+        SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand) => {
+            js_string!("halfExpand")
+        }
+        SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfTrunc) => js_string!("halfTrunc"),
+        SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfEven) => js_string!("halfEven"),
+        SignedRoundingMode::Ceil => js_string!("ceil"),
+        SignedRoundingMode::Floor => js_string!("floor"),
+        SignedRoundingMode::HalfCeil => js_string!("halfCeil"),
+        SignedRoundingMode::HalfFloor => js_string!("halfFloor"),
+        _ => unreachable!("unhandled variant of `SignedRoundingMode`"),
+    }
+}
+
 impl OptionType for NumberingSystem {
     fn from_value(value: JsValue, context: &mut Context) -> JsResult<Self> {
         let s = value.to_string(context)?.to_std_string_escaped();
