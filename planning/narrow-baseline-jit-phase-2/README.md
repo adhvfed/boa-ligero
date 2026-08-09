@@ -330,6 +330,9 @@ showing that another boundary dominates.
 - [Ordinary-call continuation design, 2026-08-09](36-ordinary-call-continuation-design-2026-08-09.md)
   — the bounded VM-owned continuation trampoline selected to keep compiled
   callers native across ordinary calls before direct compiled-callee entry.
+- [Ordinary-call continuation checkpoint, 2026-08-09](37-ordinary-call-continuation-checkpoint-2026-08-09.md)
+  — the accepted continuation ABI, liveness-based safepoints, exception and
+  budget closure, and the measured method-call improvement.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

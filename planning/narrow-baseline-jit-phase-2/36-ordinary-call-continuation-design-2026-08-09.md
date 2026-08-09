@@ -1,7 +1,9 @@
 # Ordinary-call continuation design — 2026-08-09
 
-Status: selected for implementation. This is the first compiled-call ABI
-slice, not the direct compiled-callee entry slice.
+Status: accepted and implemented by `d76d0b9e`. This is the first compiled-call
+ABI slice, not the direct compiled-callee entry slice. The measured result and
+correctness closure are recorded in the
+[implementation checkpoint](37-ordinary-call-continuation-checkpoint-2026-08-09.md).
 
 # Problem
 
