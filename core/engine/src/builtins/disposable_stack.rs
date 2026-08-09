@@ -1,28 +1,21 @@
 //! Boa's implementation of the ECMAScript `DisposableStack` object.
 
 use crate::{
-    Context, JsArgs, JsData, JsError, JsResult, JsString, JsValue, NativeFunction,
-    builtins::{BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject},
+    Context, JsArgs, JsData, JsError, JsResult, JsString, JsValue,
+    builtins::{
+        BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject,
+        resource_management::{DisposableResource, suppress_error},
+    },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_error, js_string,
-    object::{
-        FunctionObjectBuilder, JsFunction, JsObject,
-        internal_methods::get_prototype_from_constructor,
-    },
+    object::{JsObject, internal_methods::get_prototype_from_constructor},
     property::Attribute,
     realm::Realm,
     string::StaticJsStrings,
     symbol::JsSymbol,
 };
 use boa_gc::{Finalize, Trace};
-
-/// A synchronous disposable resource record.
-#[derive(Debug, Clone, Trace, Finalize)]
-struct DisposableResource {
-    value: JsValue,
-    method: JsFunction,
-}
 
 /// The internal data of a `DisposableStack` instance.
 #[derive(Debug, Default, Trace, Finalize, JsData)]
@@ -147,25 +140,14 @@ impl DisposableStack {
             return Err(js_error!(TypeError: "DisposableStack.prototype.use requires an object"));
         }
 
-        let method = value
-            .get_method(JsSymbol::dispose(), context)?
-            .ok_or_else(|| js_error!(TypeError: "value does not have a callable Symbol.dispose"))?;
-        let method = JsFunction::from_object(method)
-            .expect("GetMethod must return a callable function object");
-
-        stack
-            .borrow_mut()
-            .data_mut()
-            .resources
-            .push(DisposableResource {
-                value: value.clone(),
-                method,
-            });
+        let resource = DisposableResource::sync(value.clone(), context)?
+            .expect("non-nullish values always create a resource");
+        stack.borrow_mut().data_mut().resources.push(resource);
         Ok(value.clone())
     }
 
     /// `DisposableStack.prototype.adopt(value, onDispose)`.
-    fn adopt(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn adopt(this: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
         let stack = Self::require(this, "adopt")?;
         Self::ensure_pending(&stack)?;
 
@@ -174,31 +156,11 @@ impl DisposableStack {
             .get_or_undefined(1)
             .as_function()
             .ok_or_else(|| js_error!(TypeError: "onDispose must be callable"))?;
-        let method = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                |_, _, captures, context| {
-                    captures.1.call(
-                        &JsValue::undefined(),
-                        std::slice::from_ref(&captures.0),
-                        context,
-                    )
-                },
-                (value.clone(), on_dispose),
-            ),
-        )
-        .name(js_string!())
-        .length(0)
-        .build();
-
         stack
             .borrow_mut()
             .data_mut()
             .resources
-            .push(DisposableResource {
-                value: JsValue::undefined(),
-                method,
-            });
+            .push(DisposableResource::adopt(value.clone(), on_dispose, false));
         Ok(value)
     }
 
@@ -215,10 +177,7 @@ impl DisposableStack {
             .borrow_mut()
             .data_mut()
             .resources
-            .push(DisposableResource {
-                value: JsValue::undefined(),
-                method,
-            });
+            .push(DisposableResource::defer(method, false));
         Ok(JsValue::undefined())
     }
 
@@ -265,10 +224,10 @@ impl DisposableStack {
 
         let mut completion: Option<JsError> = None;
         while let Some(resource) = resources.pop() {
-            if let Err(error) = resource.method.call(&resource.value, &[], context) {
+            if let Err(error) = resource.invoke(context) {
                 completion = Some(match completion {
                     None => error,
-                    Some(suppressed) => Self::suppress(error, suppressed, context)?,
+                    Some(suppressed) => suppress_error(error, suppressed, context)?,
                 });
             }
         }
@@ -277,18 +236,6 @@ impl DisposableStack {
             Some(error) => Err(error),
             None => Ok(JsValue::undefined()),
         }
-    }
-
-    fn suppress(error: JsError, suppressed: JsError, context: &mut Context) -> JsResult<JsError> {
-        let error = error.into_opaque(context)?;
-        let suppressed = suppressed.into_opaque(context)?;
-        let constructor = context
-            .intrinsics()
-            .constructors()
-            .suppressed_error()
-            .constructor();
-        let object = constructor.construct(&[error, suppressed], None, context)?;
-        Ok(JsError::from_opaque(object.into()))
     }
 }
 

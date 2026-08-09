@@ -30,6 +30,7 @@ pub mod promise;
 pub mod proxy;
 pub mod reflect;
 pub mod regexp;
+pub(crate) mod resource_management;
 pub mod set;
 pub mod string;
 pub mod symbol;

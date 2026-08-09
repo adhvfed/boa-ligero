@@ -2,7 +2,10 @@
 
 use crate::{
     Context, JsArgs, JsData, JsError, JsResult, JsString, JsValue, NativeFunction,
-    builtins::{BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject},
+    builtins::{
+        BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject,
+        resource_management::{DisposableResource, suppress_value},
+    },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_error, js_string,
@@ -17,47 +20,6 @@ use crate::{
 };
 use boa_gc::{Finalize, Gc, GcRefCell, Trace};
 
-#[derive(Debug, Clone, Copy)]
-enum DisposableCall {
-    Use,
-    Adopt,
-    Defer,
-}
-
-/// An asynchronous disposable resource record.
-#[derive(Debug, Clone, Trace, Finalize)]
-struct AsyncDisposableResource {
-    value: JsValue,
-    method: Option<JsFunction>,
-    await_result: bool,
-    #[unsafe_ignore_trace]
-    call: DisposableCall,
-}
-
-impl AsyncDisposableResource {
-    fn invoke(&self, context: &mut Context) -> JsResult<JsValue> {
-        let Some(method) = &self.method else {
-            return Ok(JsValue::undefined());
-        };
-
-        let result = match self.call {
-            DisposableCall::Use => method.call(&self.value, &[], context),
-            DisposableCall::Adopt => method.call(
-                &JsValue::undefined(),
-                std::slice::from_ref(&self.value),
-                context,
-            ),
-            DisposableCall::Defer => method.call(&JsValue::undefined(), &[], context),
-        }?;
-
-        if self.await_result {
-            Ok(result)
-        } else {
-            Ok(JsValue::undefined())
-        }
-    }
-}
-
 #[derive(Debug, Default, Trace, Finalize)]
 struct DisposalCompletion {
     error: Option<JsValue>,
@@ -67,7 +29,7 @@ struct DisposalCompletion {
 #[derive(Debug, Default, Trace, Finalize, JsData)]
 pub(crate) struct AsyncDisposableStack {
     disposed: bool,
-    resources: Vec<AsyncDisposableResource>,
+    resources: Vec<DisposableResource>,
 }
 
 impl IntrinsicObject for AsyncDisposableStack {
@@ -182,12 +144,7 @@ impl AsyncDisposableStack {
 
         let value = args.get_or_undefined(0);
         let resource = if value.is_null_or_undefined() {
-            AsyncDisposableResource {
-                value: value.clone(),
-                method: None,
-                await_result: true,
-                call: DisposableCall::Use,
-            }
+            DisposableResource::asynchronous(value.clone(), context)?
         } else {
             if !value.is_object() {
                 return Err(
@@ -195,24 +152,7 @@ impl AsyncDisposableStack {
                 );
             }
 
-            let (method, await_result) =
-                if let Some(method) = value.get_method(JsSymbol::async_dispose(), context)? {
-                    (method, true)
-                } else {
-                    let method = value.get_method(JsSymbol::dispose(), context)?.ok_or_else(
-                        || js_error!(TypeError: "value does not have a callable disposal method"),
-                    )?;
-                    (method, false)
-                };
-            AsyncDisposableResource {
-                value: value.clone(),
-                method: Some(
-                    JsFunction::from_object(method)
-                        .expect("GetMethod must return a callable function object"),
-                ),
-                await_result,
-                call: DisposableCall::Use,
-            }
+            DisposableResource::asynchronous(value.clone(), context)?
         };
 
         stack.borrow_mut().data_mut().resources.push(resource);
@@ -232,12 +172,7 @@ impl AsyncDisposableStack {
             .borrow_mut()
             .data_mut()
             .resources
-            .push(AsyncDisposableResource {
-                value: value.clone(),
-                method: Some(method),
-                await_result: true,
-                call: DisposableCall::Adopt,
-            });
+            .push(DisposableResource::adopt(value.clone(), method, true));
         Ok(value)
     }
 
@@ -253,12 +188,7 @@ impl AsyncDisposableStack {
             .borrow_mut()
             .data_mut()
             .resources
-            .push(AsyncDisposableResource {
-                value: JsValue::undefined(),
-                method: Some(method),
-                await_result: true,
-                call: DisposableCall::Defer,
-            });
+            .push(DisposableResource::defer(method, true));
         Ok(JsValue::undefined())
     }
 
@@ -329,10 +259,7 @@ impl AsyncDisposableStack {
         Ok(promise.into())
     }
 
-    fn invoke_resource_handler(
-        resource: AsyncDisposableResource,
-        context: &mut Context,
-    ) -> JsFunction {
+    fn invoke_resource_handler(resource: DisposableResource, context: &mut Context) -> JsFunction {
         FunctionObjectBuilder::new(
             context.realm(),
             NativeFunction::from_copy_closure_with_captures(
@@ -346,13 +273,13 @@ impl AsyncDisposableStack {
     }
 
     fn resume_after_error_handler(
-        resource: AsyncDisposableResource,
+        resource: DisposableResource,
         completion: Gc<GcRefCell<DisposalCompletion>>,
         context: &mut Context,
     ) -> JsFunction {
         #[derive(Trace, Finalize)]
         struct Captures {
-            resource: AsyncDisposableResource,
+            resource: DisposableResource,
             completion: Gc<GcRefCell<DisposalCompletion>>,
         }
 
@@ -425,21 +352,10 @@ impl AsyncDisposableStack {
         let suppressed = completion.borrow_mut().error.take();
         let error = match suppressed {
             None => error,
-            Some(suppressed) => Self::suppress(error, suppressed, context)?,
+            Some(suppressed) => suppress_value(error, suppressed, context)?,
         };
         completion.borrow_mut().error = Some(error);
         Ok(())
-    }
-
-    fn suppress(error: JsValue, suppressed: JsValue, context: &mut Context) -> JsResult<JsValue> {
-        let constructor = context
-            .intrinsics()
-            .constructors()
-            .suppressed_error()
-            .constructor();
-        Ok(constructor
-            .construct(&[error, suppressed], None, context)?
-            .into())
     }
 }
 
