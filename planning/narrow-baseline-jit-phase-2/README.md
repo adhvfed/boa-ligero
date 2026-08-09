@@ -350,7 +350,12 @@ showing that another boundary dominates.
   larger branch-heavy artifact lost to the compact Rust helper.
 - [Number bitwise-family design, 2026-08-09](43-number-bitwise-family-design-2026-08-09.md)
   — a measured `BitAnd`/`BitXor` extension of the accepted exact Number
-  conversion contract.
+  conversion contract, partially accepted after the `BitAnd` prototype exposed
+  an unresolved boxed-argument boundary.
+- [Number `BitXor` checkpoint, 2026-08-09](44-number-bitxor-checkpoint-2026-08-09.md)
+  — retained exact Number XOR semantics, correctness and performance gates,
+  the fully removed `BitAnd` regression, and the next representation/call
+  architecture boundaries.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and

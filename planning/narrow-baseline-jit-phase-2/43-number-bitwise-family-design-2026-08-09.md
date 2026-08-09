@@ -1,7 +1,8 @@
 # Number bitwise-family design — 2026-08-09
 
-Status: selected as a narrow extension of the accepted Number `BitOr`
-contract. This slice covers binary `BitAnd` and `BitXor` only.
+Status: partially accepted. Commit `e3e2ac15` retains `BitXor`; the `BitAnd`
+prototype was removed after it exposed an unresolved boxed-argument boundary
+and failed the workload gate.
 
 # Measured frontier
 
@@ -56,3 +57,22 @@ if seven diagnostics-off release pairs:
 - keep `property-poly4` within 5% of its current-JIT median, and retain it only
   as a positive result if its loop caller actually compiles;
 - keep code payload and compilation within the existing governor.
+
+# Decision
+
+`BitXor` passes the semantic and performance gates and is retained. It
+completes the numeric `array-numeric-sum` caller without changing the accepted
+Number conversion contract.
+
+`BitAnd` does not pass as an isolated lowering. Although it made the
+`property-poly4` caller statically compilable, that caller supplies an object
+through `GetPropertyByValue`; the current numeric register representation
+cannot carry the boxed call argument. All eight measured warm entries
+therefore deoptimized, and the 7,130,625 ns median regressed 1.53% against the
+7,023,180 ns preceding-JIT median. The prototype was removed in full.
+
+The rejected result is an architecture finding: computed-property call
+arguments need role-sensitive boxed-value dataflow and materialization. A
+blanket boxed treatment for call arguments would incorrectly perturb numeric
+literal arguments and is not an acceptable shortcut. See the following
+checkpoint for the retained performance and correctness evidence.
