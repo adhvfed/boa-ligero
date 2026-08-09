@@ -15,6 +15,7 @@ use icu_experimental::dimension::provider::{
     percent::PercentEssentialsV1,
 };
 use icu_locale::{Locale, extensions::unicode::Value};
+use icu_plurals::PluralOperands;
 use icu_provider::{
     DataMarker, DataMarkerAttributes, DataPayload, DataProvider, DynamicDataProvider,
     buf::BufferMarker,
@@ -57,6 +58,8 @@ mod percent;
 use percent::FormattedPercent;
 mod currency;
 use currency::FormattedCurrency;
+mod unit;
+use unit::{FormattedUnit, UnitData};
 
 #[cfg(test)]
 mod tests;
@@ -145,6 +148,7 @@ enum FormattedNumber<'a, T> {
     Plain(FormattedNumeric<'a, T>),
     Percent(FormattedPercent<'a, FormattedNumeric<'a, T>>),
     Currency(FormattedCurrency<'a, FormattedNumeric<'a, T>>),
+    Unit(FormattedUnit<'a, FormattedNumeric<'a, T>>),
 }
 
 impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
@@ -153,6 +157,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
             Self::Plain(number) => number.write_to(sink),
             Self::Percent(number) => number.write_to(sink),
             Self::Currency(number) => number.write_to(sink),
+            Self::Unit(number) => number.write_to(sink),
         }
     }
 
@@ -161,6 +166,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
             Self::Plain(number) => number.write_to_parts(sink),
             Self::Percent(number) => number.write_to_parts(sink),
             Self::Currency(number) => number.write_to_parts(sink),
+            Self::Unit(number) => number.write_to_parts(sink),
         }
     }
 
@@ -169,6 +175,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
             Self::Plain(number) => number.writeable_length_hint(),
             Self::Percent(number) => number.writeable_length_hint(),
             Self::Currency(number) => number.writeable_length_hint(),
+            Self::Unit(number) => number.writeable_length_hint(),
         }
     }
 }
@@ -288,6 +295,7 @@ enum StyleData {
     Plain,
     Percent(DataPayload<PercentEssentialsV1>),
     Currency(DataPayload<CurrencyEssentialsV1>),
+    Unit(UnitData),
 }
 
 #[derive(Debug, Finalize, JsData)]
@@ -364,11 +372,13 @@ impl NumberFormat {
         &'l self,
         value: &'l mut IntlMathematicalValue,
     ) -> impl Writeable + 'l {
-        // TODO: Missing support from ICU4X for Unit formatting.
-
         let is_percent = matches!(self.style_data, StyleData::Percent(_));
-        let has_style_pattern = !matches!(self.style_data, StyleData::Plain);
+        let owns_sign = matches!(
+            self.style_data,
+            StyleData::Percent(_) | StyleData::Currency(_)
+        );
         let mut style_sign = special_value_sign(value, self.sign_display);
+        let mut unit_operands = None;
 
         let exponent = if let IntlMathematicalValue::Finite(value) = value {
             if is_percent {
@@ -387,7 +397,10 @@ impl NumberFormat {
             }
             self.digit_options.format_fixed_decimal(value);
             value.apply_sign_display(self.sign_display);
-            if has_style_pattern {
+            if matches!(self.style_data, StyleData::Unit(_)) {
+                unit_operands = Some(PluralOperands::from(&*value));
+            }
+            if owns_sign {
                 style_sign = value.sign();
                 value.set_sign(Sign::None);
             }
@@ -398,7 +411,7 @@ impl NumberFormat {
 
         let number = self.formatter.format(
             value,
-            if has_style_pattern {
+            if owns_sign {
                 SignDisplay::Never
             } else {
                 self.sign_display
@@ -430,6 +443,9 @@ impl NumberFormat {
                     *currency,
                     *display,
                 ))
+            }
+            StyleData::Unit(data) => {
+                FormattedNumber::Unit(FormattedUnit::new(number, data, unit_operands))
             }
         }
     }
@@ -776,7 +792,16 @@ impl NumberFormat {
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
                 StyleData::Currency(response.payload)
             }
-            Style::Decimal | Style::Unit => StyleData::Plain,
+            Style::Unit => {
+                let UnitFormatOptions::Unit { unit, display } = &unit_options else {
+                    unreachable!("unit style requires unit format options")
+                };
+                StyleData::Unit(
+                    UnitData::try_new(context.intl_provider(), &locale, unit, *display)
+                        .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                )
+            }
+            Style::Decimal => StyleData::Plain,
         };
 
         let mut options = DecimalFormatterOptions::default();

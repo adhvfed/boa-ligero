@@ -14,7 +14,71 @@ const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
     icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
     icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
     icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
+    icu_experimental::dimension::provider::units::display_names::UnitsDisplayNamesV1::INFO,
+    icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
 ];
+
+/// Units accepted by ECMA-402's `IsSanctionedSimpleUnitIdentifier` operation.
+const SANCTIONED_SIMPLE_UNITS: &[&str] = &[
+    "acre",
+    "bit",
+    "byte",
+    "celsius",
+    "centimeter",
+    "day",
+    "degree",
+    "fahrenheit",
+    "fluid-ounce",
+    "foot",
+    "gallon",
+    "gigabit",
+    "gigabyte",
+    "gram",
+    "hectare",
+    "hour",
+    "inch",
+    "kilobit",
+    "kilobyte",
+    "kilogram",
+    "kilometer",
+    "liter",
+    "megabit",
+    "megabyte",
+    "meter",
+    "microsecond",
+    "mile",
+    "mile-scandinavian",
+    "milliliter",
+    "millimeter",
+    "millisecond",
+    "minute",
+    "month",
+    "nanosecond",
+    "ounce",
+    "percent",
+    "petabyte",
+    "pound",
+    "second",
+    "stone",
+    "terabit",
+    "terabyte",
+    "week",
+    "yard",
+    "year",
+];
+
+fn is_sanctioned_unit_attribute(attributes: &str) -> bool {
+    let Some((width, unit)) = attributes.split_once('-') else {
+        return false;
+    };
+    if !matches!(width, "short" | "narrow" | "long") {
+        return false;
+    }
+
+    let (numerator, denominator) = unit.split_once("-per-").unwrap_or((unit, ""));
+    SANCTIONED_SIMPLE_UNITS.binary_search(&numerator).is_ok()
+        && (denominator.is_empty() || SANCTIONED_SIMPLE_UNITS.binary_search(&denominator).is_ok())
+}
 
 /// List of services used by `Intl` components.
 ///
@@ -83,6 +147,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         LocaleFallbacker::try_new_unstable(provider)?,
     )
     .with_additional_collations([String::from("search*")])
+    .with_marker_attributes_filter("units", |attributes| {
+        is_sanctioned_unit_attribute(attributes.as_str())
+    })
     .with_recommended_segmenter_models();
 
     for (service, keys) in SERVICES {

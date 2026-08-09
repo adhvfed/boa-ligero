@@ -116,6 +116,8 @@ const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
     icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
     icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
     icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
+    icu_experimental::dimension::provider::units::display_names::UnitsDisplayNamesV1::INFO,
+    icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
 ];
 
 /// Boa's default buffer provider.

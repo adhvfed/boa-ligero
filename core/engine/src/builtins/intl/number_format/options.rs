@@ -221,6 +221,14 @@ pub(crate) enum UnitDisplay {
 }
 
 impl UnitDisplay {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            UnitDisplay::Short => "short",
+            UnitDisplay::Narrow => "narrow",
+            UnitDisplay::Long => "long",
+        }
+    }
+
     pub(crate) fn to_js_string(self) -> JsString {
         match self {
             UnitDisplay::Short => js_string!("short"),
@@ -325,6 +333,36 @@ pub(crate) struct Unit {
 }
 
 impl Unit {
+    pub(crate) fn numerator(&self) -> &str {
+        let Some(bytes) = self.numerator.as_latin1() else {
+            unreachable!("sanctioned unit identifiers are stored as Latin-1")
+        };
+        let Ok(identifier) = std::str::from_utf8(bytes) else {
+            unreachable!("sanctioned unit identifiers contain only ASCII")
+        };
+        identifier
+    }
+
+    pub(crate) fn denominator(&self) -> Option<&str> {
+        if self.denominator.is_empty() {
+            return None;
+        }
+        let Some(bytes) = self.denominator.as_latin1() else {
+            unreachable!("sanctioned unit identifiers are stored as Latin-1")
+        };
+        let Ok(identifier) = std::str::from_utf8(bytes) else {
+            unreachable!("sanctioned unit identifiers contain only ASCII")
+        };
+        Some(identifier)
+    }
+
+    pub(crate) fn identifier(&self) -> String {
+        let Some(denominator) = self.denominator() else {
+            return self.numerator().to_owned();
+        };
+        format!("{}-per-{denominator}", self.numerator())
+    }
+
     /// Gets the corresponding `JsString` of this unit.
     pub(crate) fn to_js_string(&self) -> JsString {
         if self.denominator.is_empty() {

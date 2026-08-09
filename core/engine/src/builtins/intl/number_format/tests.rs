@@ -232,6 +232,88 @@ fn percent_style_preserves_structured_parts() {
     ]);
 }
 
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn unit_style_uses_localized_patterns_and_plural_forms() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "meter", unitDisplay: "long" }).format(1)"#,
+            js_string!("1 meter"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "meter", unitDisplay: "long" }).format(2)"#,
+            js_string!("2 meters"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).format(-987)"#,
+            js_string!("-987 kilometers per hour"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("de-DE", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).format(987)"#,
+            js_string!("987 Kilometer pro Stunde"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ja-JP", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).format(-987)"#,
+            js_string!("時速 -987 キロメートル"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ko-KR", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).format(987)"#,
+            js_string!("시속 987킬로미터"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("zh-TW", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).format(987)"#,
+            js_string!("每小時 987 公里"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "percent" }).format(12)"#,
+            js_string!("12%"),
+        ),
+        TestAction::assert_eq(
+            r#"
+                const formatter = new Intl.NumberFormat("en-US", {
+                    style: "unit",
+                    unit: "meter",
+                    unitDisplay: "long"
+                });
+                JSON.stringify([
+                    formatter.format(NaN),
+                    formatter.format(Infinity),
+                    formatter.format(-Infinity),
+                ]);
+            "#,
+            js_string!(r#"["NaN meters","∞ meters","-∞ meters"]"#),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn unit_style_preserves_structured_parts() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "unit", unit: "kilometer-per-hour", unitDisplay: "long" }).formatToParts(-987))"#,
+            js_string!(
+                r#"[{"type":"minusSign","value":"-"},{"type":"integer","value":"987"},{"type":"literal","value":" "},{"type":"unit","value":"kilometers per hour"}]"#
+            ),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "unit", unit: "percent" }).formatToParts(-12))"#,
+            js_string!(
+                r#"[{"type":"minusSign","value":"-"},{"type":"integer","value":"12"},{"type":"unit","value":"%"}]"#
+            ),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn compound_units_fall_back_to_locale_composition() {
+    run_test_actions([TestAction::assert_eq(
+        r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "acre-per-bit", unitDisplay: "long" }).format(2)"#,
+        js_string!("2 acres per bit"),
+    )]);
+}
+
 #[test]
 fn special_number_parts_are_tagged() {
     let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);
