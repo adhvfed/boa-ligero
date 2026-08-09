@@ -550,6 +550,26 @@ pub(in crate::builtins::intl) fn validate_extension<M: DataMarker>(
     provider.dry_load(req).is_ok()
 }
 
+/// Validates a locale-independent data marker attribute.
+///
+/// Some Unicode extension values, such as numbering-system digit sets, are keyed only by marker
+/// attributes. Attaching the resolved language to those requests makes valid data appear absent.
+pub(in crate::builtins::intl) fn validate_extension_attribute<M: DataMarker>(
+    attributes: &DataMarkerAttributes,
+    provider: &impl DryDataProvider<M>,
+) -> bool {
+    let req = DataRequest {
+        id: DataIdentifierBorrowed::for_marker_attributes(attributes),
+        metadata: {
+            let mut metadata = DataRequestMetadata::default();
+            metadata.silent = true;
+            metadata
+        },
+    };
+
+    provider.dry_load(req).is_ok()
+}
+
 #[cfg(all(test, feature = "intl_bundled"))]
 mod tests {
     use icu_locale::{Locale, langid, locale};

@@ -6,7 +6,7 @@ use icu_decimal::{
     CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences, FormattedDecimal,
     FormattedSign,
     options::{DecimalFormatterOptions, GroupingStrategy},
-    preferences::NumberingSystem,
+    preferences::{CompactDecimalFormatterPreferences, NumberingSystem},
     provider::{DecimalDigitsV1, DecimalSymbolsV1},
 };
 
@@ -656,6 +656,13 @@ impl NumberFormat {
         let mut options = DecimalFormatterOptions::default();
         options.grouping_strategy = Some(use_grouping);
 
+        let preferences = intl_options.preferences;
+        let compact_preferences = {
+            let mut compact: CompactDecimalFormatterPreferences = (&locale).into();
+            compact.numbering_system = preferences.numbering_system;
+            compact
+        };
+
         let (formatter, numbering_system) = {
             struct RequestInspector<'a> {
                 inner: &'a dyn DynamicDataProvider<BufferMarker>,
@@ -685,7 +692,7 @@ impl NumberFormat {
                 (NotationKind::Standard, _) => Formatter::Standard(
                     DecimalFormatter::try_new_with_buffer_provider(
                         &inspector,
-                        (&locale).into(),
+                        preferences,
                         options,
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
@@ -693,7 +700,7 @@ impl NumberFormat {
                 (NotationKind::Scientific, _) => Formatter::Scientific(
                     DecimalFormatter::try_new_with_buffer_provider(
                         &inspector,
-                        (&locale).into(),
+                        preferences,
                         options,
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
@@ -701,7 +708,7 @@ impl NumberFormat {
                 (NotationKind::Engineering, _) => Formatter::Engineering(
                     DecimalFormatter::try_new_with_buffer_provider(
                         &inspector,
-                        (&locale).into(),
+                        preferences,
                         options,
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
@@ -709,14 +716,14 @@ impl NumberFormat {
                 (NotationKind::Compact, CompactDisplay::Long) => Formatter::Compact {
                     inner: CompactDecimalFormatter::try_new_long_with_buffer_provider(
                         &inspector,
-                        (&locale).into(),
+                        compact_preferences,
                         options.into(),
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
                     sign_formatter: Box::new(
                         DecimalFormatter::try_new_with_buffer_provider(
                             &inspector,
-                            (&locale).into(),
+                            preferences,
                             options,
                         )
                         .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
@@ -726,14 +733,14 @@ impl NumberFormat {
                 (NotationKind::Compact, CompactDisplay::Short) => Formatter::Compact {
                     inner: CompactDecimalFormatter::try_new_short_with_buffer_provider(
                         &inspector,
-                        (&locale).into(),
+                        compact_preferences,
                         options.into(),
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
                     sign_formatter: Box::new(
                         DecimalFormatter::try_new_with_buffer_provider(
                             &inspector,
-                            (&locale).into(),
+                            preferences,
                             options,
                         )
                         .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,

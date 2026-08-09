@@ -1,6 +1,7 @@
 use std::{cell::OnceCell, fmt::Debug};
 
 use icu_casemap::CaseMapper;
+use icu_decimal::provider::DecimalDigitsV1;
 use icu_locale::{LocaleCanonicalizer, LocaleExpander};
 use icu_normalizer::{ComposingNormalizer, DecomposingNormalizer};
 use icu_provider::prelude::*;
@@ -40,6 +41,51 @@ pub(crate) struct IntlProvider {
     locale_expander: OnceCell<LocaleExpander>,
     string_normalizers: OnceCell<StringNormalizers>,
     case_mapper: OnceCell<CaseMapper>,
+}
+
+fn locale_independent_request(req: DataRequest<'_>) -> DataRequest<'_> {
+    DataRequest {
+        id: DataIdentifierBorrowed::for_marker_attributes(req.id.marker_attributes),
+        metadata: req.metadata,
+    }
+}
+
+impl DynamicDataProvider<BufferMarker> for IntlProvider {
+    fn load_data(
+        &self,
+        marker: DataMarkerInfo,
+        req: DataRequest<'_>,
+    ) -> Result<DataResponse<BufferMarker>, DataError> {
+        match self.inner_provider.load_data(marker, req) {
+            Err(error)
+                if error.kind == DataErrorKind::IdentifierNotFound
+                    && marker.id == DecimalDigitsV1::INFO.id =>
+            {
+                self.inner_provider
+                    .load_data(marker, locale_independent_request(req))
+            }
+            result => result,
+        }
+    }
+}
+
+impl DynamicDryDataProvider<BufferMarker> for IntlProvider {
+    fn dry_load_data(
+        &self,
+        marker: DataMarkerInfo,
+        req: DataRequest<'_>,
+    ) -> Result<DataResponseMetadata, DataError> {
+        match self.inner_provider.dry_load_data(marker, req) {
+            Err(error)
+                if error.kind == DataErrorKind::IdentifierNotFound
+                    && marker.id == DecimalDigitsV1::INFO.id =>
+            {
+                self.inner_provider
+                    .dry_load_data(marker, locale_independent_request(req))
+            }
+            result => result,
+        }
+    }
 }
 
 impl<M> DataProvider<M> for IntlProvider
@@ -142,8 +188,8 @@ impl IntlProvider {
         Ok(self.case_mapper.get_or_init(|| cm))
     }
 
-    /// Gets the inner provider.
+    /// Gets this provider with its data marker erased.
     pub(crate) fn erased_provider(&self) -> &dyn DynamicDryDataProvider<BufferMarker> {
-        &self.inner_provider
+        self
     }
 }

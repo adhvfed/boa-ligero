@@ -9,6 +9,29 @@ use fixed_decimal::Decimal;
 use fixed_decimal::RoundingIncrement::*;
 use writeable::Writeable;
 
+#[cfg(feature = "intl_bundled")]
+use crate::{TestAction, run_test_actions};
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn numbering_system_preferences_reach_the_formatter() {
+    run_test_actions([TestAction::assert_eq(
+        r#"
+            const fromExtension = new Intl.NumberFormat("en-u-nu-arab").resolvedOptions();
+            const formatter = new Intl.NumberFormat("en-u-nu-latn", {
+                numberingSystem: "arab"
+            });
+            const fromOption = formatter.resolvedOptions();
+            fromExtension.locale === "en-u-nu-arab"
+                && fromExtension.numberingSystem === "arab"
+                && fromOption.locale === "en"
+                && fromOption.numberingSystem === "arab"
+                && formatter.format(123) === "١٢٣";
+        "#,
+        true,
+    )]);
+}
+
 #[test]
 fn number_parts_preserve_special_and_compact_boundaries() {
     let mut parts = PartsCollector::new(false);

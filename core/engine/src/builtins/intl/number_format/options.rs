@@ -7,7 +7,7 @@ use fixed_decimal::{
 
 use boa_macros::js_str;
 use icu_decimal::{
-    DecimalFormatterPreferences, preferences::NumberingSystem, provider::DecimalSymbolsV1,
+    DecimalFormatterPreferences, preferences::NumberingSystem, provider::DecimalDigitsV1,
 };
 use icu_locale::extensions::unicode::Value;
 use icu_provider::{
@@ -23,7 +23,7 @@ use crate::{
     builtins::{
         intl::{
             ServicePreferences,
-            locale::validate_extension,
+            locale::validate_extension_attribute,
             options::{default_number_option, get_number_option},
         },
         options::{OptionType, ParsableOptionType, get_option},
@@ -1266,10 +1266,10 @@ impl RoundingType {
 }
 
 impl ServicePreferences for DecimalFormatterPreferences {
-    fn validate(&mut self, id: &LanguageIdentifier, provider: &IntlProvider) {
+    fn validate(&mut self, _id: &LanguageIdentifier, provider: &IntlProvider) {
         self.numbering_system = self.numbering_system.take().filter(|nu| {
             let attr = DataMarkerAttributes::from_str_or_panic(nu.as_str());
-            validate_extension::<DecimalSymbolsV1>(id, attr, provider)
+            validate_extension_attribute::<DecimalDigitsV1>(attr, provider)
         });
     }
 

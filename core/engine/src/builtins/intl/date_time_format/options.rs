@@ -4,7 +4,7 @@ use crate::{
     Context, JsNativeError, JsObject, JsResult, JsValue,
     builtins::{
         intl::{
-            ServicePreferences, date_time_format::FormatType, locale::validate_extension,
+            ServicePreferences, date_time_format::FormatType, locale::validate_extension_attribute,
             options::get_number_option,
         },
         options::{OptionType, get_option},
@@ -24,7 +24,7 @@ use icu_datetime::{
     scaffold::CldrCalendar,
 };
 
-use icu_decimal::provider::DecimalSymbolsV1;
+use icu_decimal::provider::DecimalDigitsV1;
 use icu_locale::extensions::unicode::Value;
 use icu_provider::{
     DataMarker, DataMarkerAttributes, DryDataProvider,
@@ -734,7 +734,7 @@ impl ServicePreferences for DateTimeFormatterPreferences {
         // Handle LDML unicode key "nu", Numbering system
         self.numbering_system = self.numbering_system.take().filter(|nu| {
             let attr = DataMarkerAttributes::from_str_or_panic(nu.as_str());
-            validate_extension::<DecimalSymbolsV1>(id, attr, provider)
+            validate_extension_attribute::<DecimalDigitsV1>(attr, provider)
         });
 
         // Handle LDML unicode key "ca", Calendar algorithm
