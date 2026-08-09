@@ -26,6 +26,7 @@ use crate::{
     value::{AbstractRelation, IntegerOrInfinity, JsValue},
 };
 use cow_utils::CowUtils;
+use num_bigint::BigUint;
 use num_traits::float::FloatCore;
 
 mod globals;
@@ -956,8 +957,93 @@ fn f64_to_exponential(n: f64) -> JsString {
 fn f64_to_exponential_with_precision(n: f64, prec: usize) -> JsString {
     let mut res = format!("{n:.prec$e}");
     let idx = res.find('e').expect("'e' not found in exponential string");
+
+    // Rust's formatter resolves an exact tie by choosing an even final digit. ECMAScript instead
+    // chooses the larger decimal significand. Compare the binary64 input with the midpoint using
+    // integers so that this correction cannot be perturbed by another floating-point rounding.
+    if is_lower_exponential_tie(n.abs(), &res, prec) {
+        let digit_index = idx - 1;
+        let digit = res.as_bytes()[digit_index];
+        let incremented = match digit {
+            b'0' => "1",
+            b'2' => "3",
+            b'4' => "5",
+            b'6' => "7",
+            b'8' => "9",
+            _ => unreachable!("ties-to-even must produce an even final digit"),
+        };
+        res.replace_range(digit_index..=digit_index, incremented);
+    }
+
     if res.as_bytes()[idx + 1] != b'-' {
         res.insert(idx + 1, '+');
     }
     js_string!(res)
+}
+
+/// Returns `true` when `formatted` is the lower of two equally close exponential forms of `n`.
+///
+/// Both sides of the midpoint comparison are represented as rational `BigUint`s. This matters for
+/// values whose exact binary representation is near a decimal midpoint: converting either side
+/// back through `f64` would lose the distinction this function exists to detect.
+fn is_lower_exponential_tie(n: f64, formatted: &str, precision: usize) -> bool {
+    let formatted = formatted.strip_prefix('-').unwrap_or(formatted);
+    let (coefficient, exponent) = formatted
+        .split_once('e')
+        .expect("exponential formatting must contain an exponent");
+
+    let last_digit = coefficient
+        .as_bytes()
+        .last()
+        .copied()
+        .expect("exponential formatting must contain a coefficient");
+    if n == 0.0 || !matches!(last_digit, b'0' | b'2' | b'4' | b'6' | b'8') {
+        return false;
+    }
+
+    let coefficient = coefficient.cow_replace('.', "");
+    let coefficient = BigUint::parse_bytes(coefficient.as_bytes(), 10)
+        .expect("exponential formatting must contain decimal digits");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("exponential formatting must contain a decimal exponent");
+
+    // The midpoint above the formatted coefficient C is
+    //     (2C + 1) * 10^(exponent - precision) / 2.
+    let midpoint_significand = (&coefficient << 1usize) + 1u8;
+    let decimal_exponent = exponent - i32::try_from(precision).expect("precision fits in i32");
+    let (midpoint_numerator, midpoint_denominator) = if decimal_exponent >= 0 {
+        (
+            midpoint_significand * BigUint::from(10u8).pow(decimal_exponent.unsigned_abs()),
+            BigUint::from(2u8),
+        )
+    } else {
+        (
+            midpoint_significand,
+            BigUint::from(2u8) * BigUint::from(10u8).pow(decimal_exponent.unsigned_abs()),
+        )
+    };
+
+    // Decode the finite binary64 input exactly as significand * 2^binary_exponent.
+    let bits = n.to_bits();
+    let encoded_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (significand, binary_exponent) = if encoded_exponent == 0 {
+        (fraction, -1022 - 52)
+    } else {
+        (fraction | (1u64 << 52), encoded_exponent - 1023 - 52)
+    };
+    let (binary_numerator, binary_denominator) = if binary_exponent >= 0 {
+        (
+            BigUint::from(significand) << binary_exponent.unsigned_abs(),
+            BigUint::from(1u8),
+        )
+    } else {
+        (
+            BigUint::from(significand),
+            BigUint::from(1u8) << binary_exponent.unsigned_abs(),
+        )
+    };
+
+    binary_numerator * midpoint_denominator == midpoint_numerator * binary_denominator
 }
