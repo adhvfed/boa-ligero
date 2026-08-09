@@ -219,7 +219,7 @@ impl FunctionCompiler {
 
         {
             let mut compiler = compiler.position_guard(body);
-            compiler.compile_statement_list(body.statement_list(), false, false);
+            compiler.compile_statement_list_with_resources(body.statement_list(), false, false);
         }
 
         compiler.params = parameters.clone();

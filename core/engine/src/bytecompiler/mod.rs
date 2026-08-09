@@ -1846,6 +1846,107 @@ impl<'ctx> ByteCompiler<'ctx> {
         }
     }
 
+    /// Compiles a statement list and disposes any synchronous lexical resources
+    /// when control leaves the list's owning scope.
+    ///
+    /// The asynchronous lowering extends the same scope when a list also
+    /// contains `await using`, preserving one LIFO order across both hints.
+    pub(crate) fn compile_statement_list_with_resources(
+        &mut self,
+        list: &StatementList,
+        use_expr: bool,
+        block: bool,
+    ) {
+        let mut contains_using = false;
+        for item in list.statements() {
+            let StatementListItem::Declaration(declaration) = item else {
+                continue;
+            };
+            let Declaration::Lexical(declaration) = declaration.as_ref() else {
+                continue;
+            };
+            contains_using |= matches!(declaration, LexicalDeclaration::Using(_));
+        }
+
+        if !contains_using {
+            self.compile_statement_list(list, use_expr, block);
+            return;
+        }
+
+        self.compile_sync_resource_scope(use_expr, |compiler| {
+            compiler.compile_statement_list(list, use_expr, block);
+        });
+    }
+
+    /// Compiles an operation whose abrupt exits must dispose one synchronous
+    /// lexical resource scope.
+    pub(crate) fn compile_sync_resource_scope(
+        &mut self,
+        use_expr: bool,
+        compile: impl FnOnce(&mut Self),
+    ) {
+        self.bytecode.emit_create_disposable_resource_scope();
+
+        let has_error = self.register_allocator.alloc();
+        let error = self.register_allocator.alloc();
+        let jump_index = self.register_allocator.alloc();
+        self.bytecode.emit_store_false(has_error.variable());
+        self.bytecode.emit_store_undefined(error.variable());
+        self.bytecode.emit_store_zero(jump_index.variable());
+        self.push_try_with_finally_control_info(&has_error, &jump_index, use_expr);
+
+        let handler = self.push_handler();
+        compile(self);
+        let finally = self.jump();
+        self.patch_handler(handler);
+
+        let generator_exit = self.is_generator().then(|| {
+            let generator_exit = self.register_allocator.alloc();
+            self.bytecode.emit_store_false(generator_exit.variable());
+            let empty_exception_handler = self.push_handler();
+            self.bytecode.emit_exception(error.variable());
+            self.bytecode.emit_store_true(has_error.variable());
+            let has_exception = self.jump();
+            self.patch_handler(empty_exception_handler);
+            self.bytecode.emit_store_true(generator_exit.variable());
+            self.patch_jump(has_exception);
+            generator_exit
+        });
+
+        if generator_exit.is_none() {
+            self.bytecode.emit_exception(error.variable());
+            self.bytecode.emit_store_true(has_error.variable());
+        }
+
+        self.patch_jump(finally);
+        let finally_start = self.next_opcode_location();
+        self.jump_info
+            .last_mut()
+            .expect("resource scope must have jump control information")
+            .flags |= jump_control::JumpControlInfoFlags::IN_FINALLY;
+
+        let completion_value = self.register_allocator.alloc();
+        self.bytecode
+            .emit_set_register_from_accumulator(completion_value.variable());
+        self.bytecode
+            .emit_dispose_resources(has_error.variable(), error.variable());
+        self.bytecode
+            .emit_set_accumulator(completion_value.variable());
+        self.register_allocator.dealloc(completion_value);
+
+        if let Some(generator_exit) = generator_exit {
+            let normal_exit = self.jump_if_false(&generator_exit);
+            self.bytecode.emit_re_throw();
+            self.patch_jump(normal_exit);
+            self.register_allocator.dealloc(generator_exit);
+        }
+
+        self.pop_try_with_finally_control_info(finally_start);
+        self.register_allocator.dealloc(has_error);
+        self.register_allocator.dealloc(error);
+        self.register_allocator.dealloc(jump_index);
+    }
+
     /// Compile an [`Expression`].
     #[inline]
     pub(crate) fn compile_expr(&mut self, expr: &Expression, dst: &'_ Register) {
@@ -2484,9 +2585,7 @@ impl<'ctx> ByteCompiler<'ctx> {
                                 self.bytecode.emit_store_undefined(value.variable());
                             }
 
-                            // TODO(@abhinavs1920): Add resource to disposal stack
-                            // For now, we just bind the variable like a let declaration
-                            // Full implementation will add: AddDisposableResource opcode
+                            self.bytecode.emit_add_disposable_resource(value.variable());
 
                             self.emit_binding(BindingOpcode::InitLexical, ident, &value);
                             self.register_allocator.dealloc(value);
@@ -2500,7 +2599,7 @@ impl<'ctx> ByteCompiler<'ctx> {
                                 self.bytecode.emit_store_undefined(value.variable());
                             }
 
-                            // TODO: Same as above
+                            self.bytecode.emit_add_disposable_resource(value.variable());
 
                             self.compile_declaration_pattern(
                                 pattern,

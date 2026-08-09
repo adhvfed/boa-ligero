@@ -130,7 +130,11 @@ impl ByteCompiler<'_> {
 
             {
                 let mut compiler = compiler.position_guard(expr);
-                compiler.compile_statement_list(expr.body().statement_list(), false, false);
+                compiler.compile_statement_list_with_resources(
+                    expr.body().statement_list(),
+                    false,
+                    false,
+                );
             }
 
             compiler.bytecode.emit_store_undefined(value.variable());
@@ -615,7 +619,7 @@ impl ByteCompiler<'_> {
 
                     {
                         let mut compiler = compiler.position_guard(block.statements());
-                        compiler.compile_statement_list(
+                        compiler.compile_statement_list_with_resources(
                             block.statements().statement_list(),
                             false,
                             false,

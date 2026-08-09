@@ -5,7 +5,7 @@
 use super::ActiveRunnable;
 use crate::{
     JsValue,
-    builtins::iterable::IteratorRecord,
+    builtins::{iterable::IteratorRecord, resource_management::DisposableResourceStack},
     bytecompiler::Register,
     environments::EnvironmentStack,
     realm::Realm,
@@ -96,6 +96,9 @@ pub struct CallFrame {
     #[unsafe_ignore_trace]
     pub(crate) binding_stack: ThinVec<BindingReference>,
 
+    /// Lexically scoped resources owned by this invocation.
+    pub(crate) disposable_resources: DisposableResourceStack,
+
     /// How many iterations a loop has done.
     pub(crate) loop_iteration_count: u64,
 
@@ -180,6 +183,7 @@ impl CallFrame {
             rp: 0,
             iterators: ThinVec::new(),
             binding_stack: ThinVec::new(),
+            disposable_resources: DisposableResourceStack::default(),
             code_block,
             loop_iteration_count: 0,
             active_runnable,

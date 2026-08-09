@@ -47,7 +47,11 @@ fn using_declaration_does_not_panic() {
         ),
         // The binding is readable and the initializer's value reaches it.
         TestAction::assert_eq(
-            "(function () { const r = { x: 7 }; using e = r; return e.x; })()",
+            "(function () {
+                const r = { x: 7, [Symbol.dispose]() {} };
+                using e = r;
+                return e.x;
+            })()",
             7,
         ),
         // `await using` in an async function body.
@@ -55,6 +59,75 @@ fn using_declaration_does_not_panic() {
             "(async function () { await using f = null; return 4; })() instanceof Promise",
             true,
         ),
+    ]);
+}
+
+#[test]
+fn using_disposes_on_normal_and_abrupt_scope_exit() {
+    run_test_actions([
+        TestAction::run(
+            "var disposalLog = [];
+            function value(name, error) {
+                return { [Symbol.dispose]() {
+                    disposalLog.push(name);
+                    if (error) throw error;
+                } };
+            }",
+        ),
+        TestAction::assert_eq(
+            "(function () {
+                using first = value('first');
+                using second = value('second');
+                disposalLog.push('body');
+                return 42;
+            })()",
+            42,
+        ),
+        TestAction::assert_eq("disposalLog.join(',')", js_str!("body,second,first")),
+        TestAction::run(
+            "var bodyError = {};
+            var disposalError = {};
+            var completion;
+            try {
+                { using resource = value('throwing', disposalError); throw bodyError; }
+            } catch (error) { completion = error; }",
+        ),
+        TestAction::assert("completion instanceof SuppressedError"),
+        TestAction::assert("completion.error === disposalError"),
+        TestAction::assert("completion.suppressed === bodyError"),
+    ]);
+}
+
+#[test]
+fn using_disposes_during_generator_return_and_initializer_failure() {
+    run_test_actions([
+        TestAction::run(
+            "var disposalLog = [];
+            var iterator = (function* () {
+                using resource = {
+                    [Symbol.dispose]() { disposalLog.push('generator'); }
+                };
+                yield 1;
+            })();
+            iterator.next();
+            iterator.return();",
+        ),
+        TestAction::assert_eq("disposalLog.join(',')", js_str!("generator")),
+        TestAction::run(
+            "var initializerError = {};
+            try {
+                (function () {
+                    using first = {
+                        [Symbol.dispose]() { disposalLog.push('initializer'); }
+                    };
+                    using second = {
+                        get [Symbol.dispose]() { throw initializerError; }
+                    };
+                })();
+            } catch (error) { var initializerCompletion = error; }",
+        ),
+        TestAction::assert("initializerCompletion === initializerError"),
+        TestAction::assert_eq("disposalLog.join(',')", js_str!("generator,initializer")),
     ]);
 }
 

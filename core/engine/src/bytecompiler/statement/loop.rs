@@ -21,6 +21,22 @@ impl ByteCompiler<'_> {
         label: Option<Sym>,
         use_expr: bool,
     ) {
+        let has_using_initializer = matches!(
+            for_loop.init(),
+            Some(ForLoopInitializer::Lexical(declaration))
+                if matches!(declaration.declaration(), boa_ast::declaration::LexicalDeclaration::Using(_))
+        );
+
+        if has_using_initializer {
+            self.compile_sync_resource_scope(use_expr, |compiler| {
+                compiler.compile_for_loop_body(for_loop, label, use_expr);
+            });
+        } else {
+            self.compile_for_loop_body(for_loop, label, use_expr);
+        }
+    }
+
+    fn compile_for_loop_body(&mut self, for_loop: &ForLoop, label: Option<Sym>, use_expr: bool) {
         let mut let_binding_indices = None;
         let mut outer_scope_local = None;
         let mut outer_scope = None;

@@ -907,7 +907,8 @@ impl CodeBlock {
             | Instruction::Neg { value }
             | Instruction::IsObject { value }
             | Instruction::BindThisValue { value }
-            | Instruction::BitNot { value } => {
+            | Instruction::BitNot { value }
+            | Instruction::AddDisposableResource { value } => {
                 format!("value:{value}")
             }
             Instruction::ImportCall {
@@ -936,6 +937,10 @@ impl CodeBlock {
             Instruction::MaybeException {
                 has_exception,
                 exception,
+            }
+            | Instruction::DisposeResources {
+                has_error: has_exception,
+                error: exception,
             } => {
                 format!("has_exception:{has_exception}, exception:{exception}")
             }
@@ -1021,11 +1026,9 @@ impl CodeBlock {
             | Instruction::SuperCallSpread
             | Instruction::PopPrivateEnvironment
             | Instruction::Generator
-            | Instruction::AsyncGenerator => String::new(),
-            Instruction::Reserved1
-            | Instruction::Reserved2
-            | Instruction::Reserved3
-            | Instruction::Reserved4
+            | Instruction::AsyncGenerator
+            | Instruction::CreateDisposableResourceScope => String::new(),
+            Instruction::Reserved4
             | Instruction::Reserved5
             | Instruction::Reserved6
             | Instruction::Reserved7

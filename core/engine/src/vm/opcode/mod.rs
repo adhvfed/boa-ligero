@@ -44,6 +44,7 @@ mod nop;
 mod object;
 mod pop;
 mod push;
+mod resource_management;
 mod rest_parameter;
 mod set;
 mod switch;
@@ -93,6 +94,8 @@ pub(crate) use object::*;
 pub(crate) use pop::*;
 #[doc(inline)]
 pub(crate) use push::*;
+#[doc(inline)]
+pub(crate) use resource_management::*;
 #[doc(inline)]
 pub(crate) use rest_parameter::*;
 #[doc(inline)]
@@ -2252,12 +2255,21 @@ generate_opcodes! {
     ///   - Output: dst
     CreateUnmappedArgumentsObject { dst: RegisterOperand },
 
-    /// Reserved [`Opcode`].
-    Reserved1 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved2 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved3 => Reserved,
+    /// Starts a nested lexical resource scope.
+    CreateDisposableResourceScope,
+
+    /// Adds a synchronous disposable resource to the innermost scope.
+    ///
+    /// - Registers:
+    ///   - Input: value
+    AddDisposableResource { value: RegisterOperand },
+
+    /// Disposes the innermost resource scope and combines failures with an
+    /// existing abrupt completion.
+    ///
+    /// - Registers:
+    ///   - Input: has_error, error
+    DisposeResources { has_error: RegisterOperand, error: RegisterOperand },
     /// Reserved [`Opcode`].
     Reserved4 => Reserved,
     /// Reserved [`Opcode`].

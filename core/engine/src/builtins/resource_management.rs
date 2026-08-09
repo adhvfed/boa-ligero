@@ -31,6 +31,9 @@ impl DisposableResource {
         if value.is_null_or_undefined() {
             return Ok(None);
         }
+        if !value.is_object() {
+            return Err(crate::js_error!(TypeError: "disposable resource must be an object"));
+        }
 
         let method = value.get_method(JsSymbol::dispose(), context)?.ok_or_else(
             || crate::js_error!(TypeError: "value does not have a callable Symbol.dispose"),
@@ -57,6 +60,9 @@ impl DisposableResource {
                 await_result: true,
                 call: DisposableCall::Use,
             });
+        }
+        if !value.is_object() {
+            return Err(crate::js_error!(TypeError: "disposable resource must be an object"));
         }
 
         let (method, await_result) =
@@ -121,6 +127,36 @@ impl DisposableResource {
         } else {
             Ok(JsValue::undefined())
         }
+    }
+}
+
+/// Frame-local storage for nested lexical resource scopes.
+#[derive(Debug, Default, Clone, Trace, Finalize)]
+pub(crate) struct DisposableResourceStack {
+    resources: Vec<DisposableResource>,
+    #[unsafe_ignore_trace]
+    scopes: Vec<usize>,
+}
+
+impl DisposableResourceStack {
+    /// Starts a nested resource scope.
+    pub(crate) fn begin_scope(&mut self) {
+        self.scopes.push(self.resources.len());
+    }
+
+    /// Adds a resource to the innermost scope.
+    pub(crate) fn push(&mut self, resource: DisposableResource) {
+        assert!(!self.scopes.is_empty(), "resource scope must be active");
+        self.resources.push(resource);
+    }
+
+    /// Removes and returns the innermost scope in disposal order.
+    pub(crate) fn take_scope(&mut self) -> std::iter::Rev<std::vec::IntoIter<DisposableResource>> {
+        let start = self
+            .scopes
+            .pop()
+            .expect("disposal bytecode must balance resource scopes");
+        self.resources.split_off(start).into_iter().rev()
     }
 }
 
