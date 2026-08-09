@@ -409,11 +409,15 @@ enum Access<'a> {
 }
 
 impl Access<'_> {
-    const fn from_assign_target(target: &AssignTarget) -> Result<Access<'_>, &Pattern> {
+    fn from_assign_target(target: &AssignTarget) -> Result<Access<'_>, &Pattern> {
         match target {
             AssignTarget::Identifier(ident) => Ok(Access::Variable { name: *ident }),
             AssignTarget::Access(access) => Ok(Access::Property { access }),
             AssignTarget::Pattern(pat) => Err(pat),
+            #[cfg(feature = "annex-b")]
+            AssignTarget::Call(_) => {
+                unreachable!("Annex B call targets must be compiled before access resolution")
+            }
         }
     }
 
@@ -427,10 +431,14 @@ impl Access<'_> {
         }
     }
 
-    const fn from_update_target(target: &UpdateTarget) -> Access<'_> {
+    fn from_update_target(target: &UpdateTarget) -> Access<'_> {
         match target {
             UpdateTarget::Identifier(name) => Access::Variable { name: *name },
             UpdateTarget::PropertyAccess(access) => Access::Property { access },
+            #[cfg(feature = "annex-b")]
+            UpdateTarget::Call(_) => {
+                unreachable!("Annex B call targets must be compiled before access resolution")
+            }
         }
     }
 }
@@ -2011,6 +2019,19 @@ impl<'ctx> ByteCompiler<'ctx> {
                 self.register_allocator.dealloc(tmp);
             }
         }
+    }
+
+    /// Compile the Annex B runtime error for a call expression used as an assignment target.
+    ///
+    /// The call itself is evaluated, but its result is neither coerced nor used. The abrupt
+    /// completion also prevents evaluation of an assignment's right-hand side.
+    #[cfg(feature = "annex-b")]
+    fn compile_annex_b_invalid_call_target(&mut self, call: &Call) {
+        self.call(Callable::Call(call), CallResultDest::Discard);
+        let message = self.get_or_insert_literal(Literal::String(js_string!(
+            "invalid assignment left-hand side"
+        )));
+        self.bytecode.emit_throw_new_reference_error(message.into());
     }
 
     /// Compile an expression and leave the result on the stack.

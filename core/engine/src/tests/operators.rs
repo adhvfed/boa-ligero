@@ -168,6 +168,56 @@ fn invalid_unary_access() {
     ]);
 }
 
+#[cfg(feature = "annex-b")]
+#[test]
+fn annex_b_call_assignment_targets_preserve_runtime_order() {
+    run_test_actions([
+        TestAction::assert_eq("function async() { return 7; } async()", 7),
+        TestAction::assert(
+            "typeof (async(a, { b }, ...rest) => a + b + rest.length) === 'function'",
+        ),
+        TestAction::assert(indoc! {r#"
+            (() => {
+                const log = [];
+                function target() {
+                    log.push('call');
+                    return { [Symbol.toPrimitive]() { log.push('coerce'); return 1; } };
+                }
+                function rhs() { log.push('rhs'); return 1; }
+                try { target() += rhs(); } catch (error) {
+                    return error instanceof ReferenceError && log.join(',') === 'call';
+                }
+                return false;
+            })()
+        "#}),
+        TestAction::assert(indoc! {r#"
+            (() => {
+                const log = [];
+                function target() { log.push('call'); }
+                const iterable = {
+                    [Symbol.iterator]() {
+                        return {
+                            next() { return { value: 1, done: false }; },
+                            return() { log.push('close'); return { done: true }; }
+                        };
+                    }
+                };
+                try { for (target() of iterable) {} } catch (error) {
+                    return error instanceof ReferenceError && log.join(',') === 'call,close';
+                }
+                return false;
+            })()
+        "#}),
+        TestAction::assert(indoc! {r#"
+            (() => {
+                try { eval("'use strict'; function target() {} target() = 1;"); }
+                catch (error) { return error instanceof SyntaxError; }
+                return false;
+            })()
+        "#}),
+    ]);
+}
+
 #[test]
 fn unary_operations_on_this() {
     // https://tc39.es/ecma262/#sec-assignment-operators-static-semantics-early-errors

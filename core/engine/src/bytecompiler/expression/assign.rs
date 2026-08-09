@@ -15,6 +15,12 @@ impl ByteCompiler<'_> {
     pub(crate) fn compile_assign(&mut self, assign: &Assign, dst: &Register) {
         let mut compiler = self.position_guard(assign);
 
+        #[cfg(feature = "annex-b")]
+        if let boa_ast::expression::operator::assign::AssignTarget::Call(call) = assign.lhs() {
+            compiler.compile_annex_b_invalid_call_target(call);
+            return;
+        }
+
         if assign.op() == AssignOp::Assign {
             match Access::from_assign_target(assign.lhs()) {
                 Ok(access) => {

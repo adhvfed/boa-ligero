@@ -555,7 +555,7 @@ where
 }
 
 /// Convert an expression to a formal parameter and append it to the given parameter list.
-fn expression_to_formal_parameters(
+pub(super) fn expression_to_formal_parameters(
     node: &ast::Expression,
     parameters: &mut Vec<FormalParameter>,
     strict: bool,
@@ -606,6 +606,13 @@ fn expression_to_formal_parameters(
                 }
             },
             AssignTarget::Access(_) => {
+                return Err(Error::general(
+                    "invalid initialization expression in formal parameter list",
+                    span.start(),
+                ));
+            }
+            #[cfg(feature = "annex-b")]
+            AssignTarget::Call(_) => {
                 return Err(Error::general(
                     "invalid initialization expression in formal parameter list",
                     span.start(),

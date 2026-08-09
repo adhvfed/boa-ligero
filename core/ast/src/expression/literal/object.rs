@@ -165,6 +165,8 @@ impl ObjectLiteral {
                                     default_init: Some(assign.rhs().clone()),
                                 });
                             }
+                            #[cfg(feature = "annex-b")]
+                            AssignTarget::Call(_) => return None,
                         }
                     }
                     (_, Expression::PropertyAccess(access)) => {

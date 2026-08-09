@@ -69,10 +69,11 @@ where
         let token = cursor.peek(0, interner).or_abrupt()?;
 
         let lhs = if token.kind() == &TokenKind::Punctuator(Punctuator::OpenParen) {
-            let (args, args_span) =
+            let (args, args_span, trailing_comma) =
                 Arguments::new(self.allow_yield, self.allow_await).parse(cursor, interner)?;
 
-            Call::new(self.first_member_expr, args, args_span).into()
+            Call::new_with_trailing_comma(self.first_member_expr, args, trailing_comma, args_span)
+                .into()
         } else {
             let next_token = cursor.next(interner)?.expect("token vanished");
             return Err(Error::expected(
@@ -123,9 +124,11 @@ where
             let lhs_span_start = lhs.span().start();
             match token.kind() {
                 TokenKind::Punctuator(Punctuator::OpenParen) => {
-                    let (args, args_span) = Arguments::new(self.allow_yield, self.allow_await)
-                        .parse(cursor, interner)?;
-                    lhs = Call::new(lhs, args, args_span).into();
+                    let (args, args_span, trailing_comma) =
+                        Arguments::new(self.allow_yield, self.allow_await)
+                            .parse(cursor, interner)?;
+                    lhs =
+                        Call::new_with_trailing_comma(lhs, args, trailing_comma, args_span).into();
                 }
                 TokenKind::Punctuator(Punctuator::Dot) => {
                     cursor.advance(interner);

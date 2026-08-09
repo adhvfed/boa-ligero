@@ -8,6 +8,8 @@ mod for_loop;
 mod for_of_loop;
 mod while_loop;
 
+#[cfg(feature = "annex-b")]
+use crate::expression::Call;
 use crate::{
     declaration::{Binding, Variable},
     expression::{Identifier, access::PropertyAccess},
@@ -54,6 +56,9 @@ pub enum IterableLoopInitializer {
     AwaitUsing(Binding),
     /// A pattern with already declared variables.
     Pattern(Pattern),
+    /// A call expression accepted as a non-strict Annex B assignment target.
+    #[cfg(feature = "annex-b")]
+    Call(Call),
 }
 
 impl ToInternedString for IterableLoopInitializer {
@@ -62,6 +67,8 @@ impl ToInternedString for IterableLoopInitializer {
             Self::Identifier(ident) => return ident.to_interned_string(interner),
             Self::Pattern(pattern) => return pattern.to_interned_string(interner),
             Self::Access(access) => return access.to_interned_string(interner),
+            #[cfg(feature = "annex-b")]
+            Self::Call(call) => return call.to_interned_string(interner),
             Self::Var(binding) => (binding.to_interned_string(interner), "var"),
             Self::Let(binding) => (binding.to_interned_string(interner), "let"),
             Self::Const(binding) => (binding.to_interned_string(interner), "const"),
@@ -86,6 +93,8 @@ impl VisitWith for IterableLoopInitializer {
                 visitor.visit_binding(b)
             }
             Self::Pattern(p) => visitor.visit_pattern(p),
+            #[cfg(feature = "annex-b")]
+            Self::Call(call) => visitor.visit_call(call),
         }
     }
 
@@ -101,6 +110,8 @@ impl VisitWith for IterableLoopInitializer {
                 visitor.visit_binding_mut(b)
             }
             Self::Pattern(p) => visitor.visit_pattern_mut(p),
+            #[cfg(feature = "annex-b")]
+            Self::Call(call) => visitor.visit_call_mut(call),
         }
     }
 }

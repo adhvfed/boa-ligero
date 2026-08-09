@@ -12,6 +12,13 @@ use boa_ast::{
 impl ByteCompiler<'_> {
     pub(crate) fn compile_update(&mut self, update: &Update, dst: &Register, discard: bool) {
         let mut compiler = self.position_guard(update);
+
+        #[cfg(feature = "annex-b")]
+        if let boa_ast::expression::operator::update::UpdateTarget::Call(call) = update.target() {
+            compiler.compile_annex_b_invalid_call_target(call);
+            return;
+        }
+
         let increment = matches!(
             update.op(),
             UpdateOp::IncrementPost | UpdateOp::IncrementPre

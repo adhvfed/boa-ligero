@@ -9,6 +9,8 @@
 //! [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators#increment_and_decrement
 mod op;
 
+#[cfg(feature = "annex-b")]
+use crate::expression::Call;
 use crate::{
     Expression, Span, Spanned,
     expression::{Identifier, access::PropertyAccess},
@@ -99,6 +101,8 @@ impl VisitWith for Update {
         match self.target.as_ref() {
             UpdateTarget::Identifier(ident) => visitor.visit_identifier(ident),
             UpdateTarget::PropertyAccess(access) => visitor.visit_property_access(access),
+            #[cfg(feature = "annex-b")]
+            UpdateTarget::Call(call) => visitor.visit_call(call),
         }
     }
 
@@ -109,6 +113,8 @@ impl VisitWith for Update {
         match &mut *self.target {
             UpdateTarget::Identifier(ident) => visitor.visit_identifier_mut(ident),
             UpdateTarget::PropertyAccess(access) => visitor.visit_property_access_mut(access),
+            #[cfg(feature = "annex-b")]
+            UpdateTarget::Call(call) => visitor.visit_call_mut(call),
         }
     }
 }
@@ -130,6 +136,12 @@ pub enum UpdateTarget {
 
     /// An [`PropertyAccess`] expression.
     PropertyAccess(PropertyAccess),
+
+    /// A call expression accepted as a non-strict Annex B update target.
+    ///
+    /// Evaluating this target calls the function and then throws a `ReferenceError`.
+    #[cfg(feature = "annex-b")]
+    Call(Call),
 }
 
 impl ToInternedString for UpdateTarget {
@@ -138,6 +150,8 @@ impl ToInternedString for UpdateTarget {
         match self {
             Self::Identifier(identifier) => identifier.to_interned_string(interner),
             Self::PropertyAccess(access) => access.to_interned_string(interner),
+            #[cfg(feature = "annex-b")]
+            Self::Call(call) => call.to_interned_string(interner),
         }
     }
 }

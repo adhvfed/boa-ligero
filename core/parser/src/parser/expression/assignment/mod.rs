@@ -91,7 +91,9 @@ where
         crate::parser::maybe_grow_stack(move || {
             cursor.set_goal(InputElement::RegExp);
 
-            match cursor.peek(0, interner).or_abrupt()?.kind() {
+            let first_token = cursor.peek(0, interner).or_abrupt()?.clone();
+            let mut async_parenthesized_candidate = None;
+            match first_token.kind() {
                 // [+Yield]YieldExpression[?In, ?Await]
                 TokenKind::Keyword((Keyword::Yield, _)) if self.allow_yield.0 => {
                     return YieldExpression::new(self.allow_in, self.allow_await)
@@ -130,24 +132,27 @@ where
                     };
 
                     let peek_1 = cursor.peek(1, interner).or_abrupt()?.kind().clone();
-                    if !cursor
+                    let no_line_terminator = !cursor
                         .peek_is_line_terminator(skip_n, interner)
-                        .or_abrupt()?
-                        && (matches!(peek_1, TokenKind::Punctuator(Punctuator::OpenParen))
-                            || (matches!(
-                                peek_1,
-                                TokenKind::IdentifierName(_)
-                                    | TokenKind::Keyword((
-                                        Keyword::Yield
-                                            | Keyword::Await
-                                            | Keyword::Of
-                                            | Keyword::Using,
-                                        _
-                                    ))
-                            ) && matches!(
-                                cursor.peek(2, interner).or_abrupt()?.kind(),
-                                TokenKind::Punctuator(Punctuator::Arrow)
-                            )))
+                        .or_abrupt()?;
+                    if no_line_terminator
+                        && matches!(peek_1, TokenKind::Punctuator(Punctuator::OpenParen))
+                    {
+                        async_parenthesized_candidate =
+                            Some((first_token.linear_span(), first_token.span()));
+                    } else if no_line_terminator
+                        && matches!(
+                            peek_1,
+                            TokenKind::IdentifierName(_)
+                                | TokenKind::Keyword((
+                                    Keyword::Yield | Keyword::Await | Keyword::Of | Keyword::Using,
+                                    _
+                                ))
+                        )
+                        && matches!(
+                            cursor.peek(2, interner).or_abrupt()?.kind(),
+                            TokenKind::Punctuator(Punctuator::Arrow)
+                        )
                     {
                         return Ok(AsyncArrowFunction::new(self.allow_in, self.allow_yield)
                             .parse(cursor, interner)?
@@ -241,6 +246,18 @@ where
                 }
                 FormalParameterListOrExpression::Expression(expression) => expression,
             };
+
+            if let Some((async_linear_span, async_span)) = async_parenthesized_candidate
+                && cursor
+                    .peek(0, interner)?
+                    .is_some_and(|token| token.kind() == &TokenKind::Punctuator(Punctuator::Arrow))
+                && let Expression::Call(call) = &lhs
+                && matches!(call.function(), Expression::Identifier(ident) if ident.sym() == boa_interner::Sym::ASYNC)
+            {
+                return AsyncArrowFunction::new(self.allow_in, self.allow_yield)
+                    .parse_from_call(call, async_linear_span, async_span, cursor, interner)
+                    .map(Into::into);
+            }
 
             // Review if we are trying to assign to an invalid left hand side expression.
             if let Some(tok) = cursor.peek(0, interner)?.cloned() {

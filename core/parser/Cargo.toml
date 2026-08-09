@@ -28,7 +28,7 @@ indoc.workspace = true
 strum.workspace = true
 
 [features]
-annex-b = []
+annex-b = ["boa_ast/annex-b"]
 
 [lints]
 workspace = true

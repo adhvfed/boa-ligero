@@ -25,6 +25,7 @@ use super::Expression;
 pub struct Call {
     function: Box<Expression>,
     args: Box<[Expression]>,
+    trailing_comma: bool,
     span: Span,
 }
 
@@ -36,6 +37,24 @@ impl Call {
         Self {
             function: Box::new(function),
             args,
+            trailing_comma: false,
+            span,
+        }
+    }
+
+    /// Creates a call expression while preserving whether its argument list has a trailing comma.
+    #[inline]
+    #[must_use]
+    pub fn new_with_trailing_comma(
+        function: Expression,
+        args: Box<[Expression]>,
+        trailing_comma: bool,
+        span: Span,
+    ) -> Self {
+        Self {
+            function: Box::new(function),
+            args,
+            trailing_comma,
             span,
         }
     }
@@ -53,6 +72,13 @@ impl Call {
     pub const fn args(&self) -> &[Expression] {
         &self.args
     }
+
+    /// Returns whether the argument list ends in a trailing comma.
+    #[inline]
+    #[must_use]
+    pub const fn has_trailing_comma(&self) -> bool {
+        self.trailing_comma
+    }
 }
 
 impl Spanned for Call {
@@ -66,9 +92,10 @@ impl ToInternedString for Call {
     #[inline]
     fn to_interned_string(&self, interner: &Interner) -> String {
         format!(
-            "{}({})",
+            "{}({}{})",
             self.function.to_interned_string(interner),
-            join_nodes(interner, &self.args)
+            join_nodes(interner, &self.args),
+            if self.trailing_comma { "," } else { "" }
         )
     }
 }

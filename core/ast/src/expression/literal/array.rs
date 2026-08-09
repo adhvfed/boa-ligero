@@ -134,6 +134,8 @@ impl ArrayLiteral {
                                 });
                             }
                         },
+                        #[cfg(feature = "annex-b")]
+                        AssignTarget::Call(_) => return None,
                     }
                 }
                 Expression::ArrayLiteral(array) => {

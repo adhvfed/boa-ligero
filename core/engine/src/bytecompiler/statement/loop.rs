@@ -239,6 +239,10 @@ impl ByteCompiler<'_> {
                 IterableLoopInitializer::Access(access) => {
                     self.access_set(Access::Property { access }, |_| &value);
                 }
+                #[cfg(feature = "annex-b")]
+                IterableLoopInitializer::Call(call) => {
+                    self.compile_annex_b_invalid_call_target(call);
+                }
                 IterableLoopInitializer::Var(declaration) => match declaration.binding() {
                     Binding::Identifier(ident) => {
                         let ident = ident.to_js_string(self.interner());
@@ -415,6 +419,10 @@ impl ByteCompiler<'_> {
                 }
                 IterableLoopInitializer::Access(access) => {
                     self.access_set(Access::Property { access }, |_| &value);
+                }
+                #[cfg(feature = "annex-b")]
+                IterableLoopInitializer::Call(call) => {
+                    self.compile_annex_b_invalid_call_target(call);
                 }
                 IterableLoopInitializer::Var(declaration) => {
                     assert!(declaration.init().is_none());

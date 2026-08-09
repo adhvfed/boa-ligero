@@ -138,14 +138,14 @@ where
                     }
                 } else {
                     let lhs_inner = self.parse(cursor, interner)?.try_into_expression()?;
-                    let (args, args_span) = match cursor.peek(0, interner)? {
+                    let (args, args_span, _) = match cursor.peek(0, interner)? {
                         Some(next)
                             if next.kind() == &TokenKind::Punctuator(Punctuator::OpenParen) =>
                         {
                             Arguments::new(self.allow_yield, self.allow_await)
                                 .parse(cursor, interner)?
                         }
-                        _ => (Box::default(), lhs_inner.span()),
+                        _ => (Box::default(), lhs_inner.span(), false),
                     };
                     let call_node = Call::new(
                         lhs_inner,
