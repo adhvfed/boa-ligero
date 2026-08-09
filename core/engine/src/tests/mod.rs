@@ -28,22 +28,23 @@ fn empty_let_decl_undefined() {
     run_test_actions([TestAction::assert_eq("let a; a", JsValue::undefined())]);
 }
 
-/// `using` declarations are currently lowered as plain lexical bindings (the disposal stack is
-/// still a TODO in the bytecompiler). The declaration-instantiation passes did not create those
-/// bindings at all, so executing a `using` declaration outside a plain block made
-/// `PutLexicalValue` index an empty environment and panicked the whole engine with
-/// `index out of bounds: the len is 0 but the index is 0`.
+/// Resource declarations must create usable lexical bindings in every permitted context while
+/// preserving the Script-level early error.
 #[test]
 fn using_declaration_does_not_panic() {
     run_test_actions([
         // Function body.
         TestAction::assert_eq("(function () { using a = null; return 1; })()", 1),
-        // Script top level.
-        TestAction::assert_eq("using b = null; b", JsValue::null()),
         // Plain block (already worked, kept as a guard).
         TestAction::assert_eq("{ using c = null; } 2", 2),
-        // Direct eval.
-        TestAction::assert_eq("eval('using d = null; 3')", 3),
+        // Direct eval uses the Script goal, where a top-level declaration is forbidden.
+        TestAction::assert(
+            "(() => {
+                try { eval('using d = null; 3'); }
+                catch (error) { return error instanceof SyntaxError; }
+                return false;
+            })()",
+        ),
         // The binding is readable and the initializer's value reaches it.
         TestAction::assert_eq(
             "(function () { const r = { x: 7 }; using e = r; return e.x; })()",
