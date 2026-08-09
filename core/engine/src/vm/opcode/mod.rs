@@ -1870,7 +1870,7 @@ generate_opcodes! {
     ///   - index: `IndexOperand`
     /// - Registers:
     ///   - Output: dst
-    ThisForObjectEnvironmentName { dst: RegisterOperand, index: IndexOperand },
+    ThisForObjectEnvironmentName { dst: RegisterOperand },
 
     /// Execute the `super()` method.
     ///

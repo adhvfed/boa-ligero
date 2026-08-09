@@ -2968,25 +2968,31 @@ impl<'ctx> ByteCompiler<'ctx> {
                         let name = self.resolve_identifier_expect(*ident);
                         let binding = self.lexical_scope.get_identifier_reference(name);
                         let index = self.get_binding(&binding);
-                        let index = match index {
-                            BindingKind::Global(index) | BindingKind::Stack(index) => index,
-                            BindingKind::Local(_) => {
-                                unreachable!("with binding cannot be local")
-                            }
-                        };
-                        let value = self.register_allocator.alloc();
+                        assert!(
+                            !matches!(index, BindingKind::Local(_)),
+                            "with binding cannot be local"
+                        );
+                        let function = self.register_allocator.alloc();
+                        self.emit_binding_access(
+                            BindingAccessOpcode::GetNameAndLocator,
+                            &index,
+                            &function,
+                        );
+                        let this = self.register_allocator.alloc();
                         self.bytecode
-                            .emit_this_for_object_environment_name(value.variable(), index.into());
-                        self.push_from_register(&value);
-                        self.register_allocator.dealloc(value);
+                            .emit_this_for_object_environment_name(this.variable());
+                        self.push_from_register(&this);
+                        self.push_from_register(&function);
+                        self.register_allocator.dealloc(this);
+                        self.register_allocator.dealloc(function);
                     } else {
                         self.push_from_register(&CallFrame::undefined_register());
+                        self.compile_expr_to_stack(expr);
                     }
                 } else {
                     self.push_from_register(&CallFrame::undefined_register());
+                    self.compile_expr_to_stack(expr);
                 }
-
-                self.compile_expr_to_stack(expr);
             }
             expr => {
                 let value = self.register_allocator.alloc();

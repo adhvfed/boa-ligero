@@ -519,7 +519,8 @@ impl CodeBlock {
             | Instruction::CreateMappedArgumentsObject { dst }
             | Instruction::CreateUnmappedArgumentsObject { dst }
             | Instruction::RestParameterInit { dst }
-            | Instruction::StoreNewArray { dst } => format!("dst:{dst}"),
+            | Instruction::StoreNewArray { dst }
+            | Instruction::ThisForObjectEnvironmentName { dst } => format!("dst:{dst}"),
             Instruction::Add { lhs, rhs, dst }
             | Instruction::Sub { lhs, rhs, dst }
             | Instruction::Div { lhs, rhs, dst }
@@ -584,7 +585,6 @@ impl CodeBlock {
                 format!("value:{value}, dst:{dst}")
             }
             Instruction::StoreLiteral { index, dst }
-            | Instruction::ThisForObjectEnvironmentName { index, dst }
             | Instruction::GetFunction { index, dst }
             | Instruction::GetArgument { index, dst } => {
                 format!("index:{index}, dst:{dst}")

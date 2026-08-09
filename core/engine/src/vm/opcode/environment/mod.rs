@@ -1,10 +1,12 @@
 use super::{IndexOperand, RegisterOperand};
 use crate::{
     Context, JsExpect, JsResult, JsValue,
+    environments::Environment,
     error::JsNativeError,
     object::internal_methods::InternalMethodPropertyContext,
-    vm::{CallFrameFlags, opcode::Operation},
+    vm::{BindingReference, CallFrameFlags, opcode::Operation},
 };
+use boa_ast::scope::BindingLocatorScope;
 
 /// `GetFunctionObject` implements the Opcode Operation for `Opcode::GetFunctionObject`
 ///
@@ -94,14 +96,22 @@ pub(crate) struct ThisForObjectEnvironmentName;
 
 impl ThisForObjectEnvironmentName {
     #[inline(always)]
-    pub(super) fn operation(
-        (dst, index): (RegisterOperand, IndexOperand),
-        context: &mut Context,
-    ) -> JsResult<()> {
-        let binding_locator = context.vm.frame().code_block.bindings[usize::from(index)].clone();
-        let this = context
-            .this_from_object_environment_binding(&binding_locator)?
-            .map_or(JsValue::undefined(), Into::into);
+    pub(super) fn operation(dst: RegisterOperand, context: &mut Context) -> JsResult<()> {
+        let binding = context
+            .vm
+            .frame_mut()
+            .binding_stack
+            .pop()
+            .js_expect("binding locator must be captured before resolving its this value")?;
+        let this = match binding {
+            BindingReference::Locator(locator)
+                if let BindingLocatorScope::Stack(index) = locator.scope()
+                    && let Environment::Object(object) = context.environment_expect(index) =>
+            {
+                object.clone().into()
+            }
+            BindingReference::Locator(_) | BindingReference::Global { .. } => JsValue::undefined(),
+        };
         context.vm.set_register(dst.into(), this);
         Ok(())
     }

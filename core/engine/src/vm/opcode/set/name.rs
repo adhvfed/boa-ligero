@@ -303,6 +303,15 @@ impl Operation for SetNameByLocator {
 
 /// Checks that the binding pointed by `locator` exists and is initialized.
 fn verify_initialized(locator: &BindingLocator, context: &mut Context) -> JsResult<()> {
+    // Object Environment Records perform their observable `HasProperty` check in
+    // `Context::set_binding`. Repeating it here would invoke Proxy `has` traps twice for a
+    // single `SetMutableBinding` operation.
+    if let BindingLocatorScope::Stack(index) = locator.scope()
+        && matches!(context.environment_expect(index), Environment::Object(_))
+    {
+        return Ok(());
+    }
+
     if !context.is_initialized_binding(locator)? {
         let key = locator.name();
         let strict = context.vm.frame().code_block.strict();

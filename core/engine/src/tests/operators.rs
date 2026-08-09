@@ -486,8 +486,16 @@ fn assignment_to_non_assignable_ctd() {
         .map(|src| {
             TestAction::assert_native_error(
                 src,
-                JsNativeErrorKind::Syntax,
-                "Invalid left-hand side in assignment at line 1, col 12",
+                if cfg!(feature = "annex-b") {
+                    JsNativeErrorKind::Reference
+                } else {
+                    JsNativeErrorKind::Syntax
+                },
+                if cfg!(feature = "annex-b") {
+                    "invalid assignment left-hand side"
+                } else {
+                    "Invalid left-hand side in assignment at line 1, col 12"
+                },
             )
         }),
     );
@@ -514,8 +522,16 @@ fn multicharacter_assignment_to_non_assignable_ctd() {
             .map(|src| {
                 TestAction::assert_native_error(
                     src,
-                    JsNativeErrorKind::Syntax,
-                    "Invalid left-hand side in assignment at line 1, col 12",
+                    if cfg!(feature = "annex-b") {
+                        JsNativeErrorKind::Reference
+                    } else {
+                        JsNativeErrorKind::Syntax
+                    },
+                    if cfg!(feature = "annex-b") {
+                        "invalid assignment left-hand side"
+                    } else {
+                        "Invalid left-hand side in assignment at line 1, col 12"
+                    },
                 )
             }),
     );
@@ -547,10 +563,22 @@ fn multicharacter_bitwise_assignment_to_non_assignable_ctd() {
         ]
         .into_iter()
         .map(|src| {
+            let annex_b_runtime_error = cfg!(feature = "annex-b")
+                && !src.contains("&&=")
+                && !src.contains("||=")
+                && !src.contains("??=");
             TestAction::assert_native_error(
                 src,
-                JsNativeErrorKind::Syntax,
-                "Invalid left-hand side in assignment at line 1, col 12",
+                if annex_b_runtime_error {
+                    JsNativeErrorKind::Reference
+                } else {
+                    JsNativeErrorKind::Syntax
+                },
+                if annex_b_runtime_error {
+                    "invalid assignment left-hand side"
+                } else {
+                    "Invalid left-hand side in assignment at line 1, col 12"
+                },
             )
         }),
     );

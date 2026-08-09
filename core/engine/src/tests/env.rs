@@ -78,6 +78,79 @@ fn global_name_fast_path_preserves_dynamic_resolution() {
 }
 
 #[test]
+fn with_proxy_environment_rechecks_property_for_get_and_set() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            var withLog = [];
+            var withProxy = new Proxy({ value: 1 }, {
+                has(target, key) {
+                    withLog.push(`has:${String(key)}`);
+                    return Reflect.has(target, key);
+                },
+                get(target, key, receiver) {
+                    withLog.push(`get:${String(key)}`);
+                    return Reflect.get(target, key, receiver);
+                },
+                set(target, key, value, receiver) {
+                    withLog.push(`set:${String(key)}`);
+                    return Reflect.set(target, key, value, receiver);
+                },
+                getOwnPropertyDescriptor(target, key) {
+                    withLog.push(`getOwnPropertyDescriptor:${String(key)}`);
+                    return Reflect.getOwnPropertyDescriptor(target, key);
+                },
+                defineProperty(target, key, descriptor) {
+                    withLog.push(`defineProperty:${String(key)}`);
+                    return Reflect.defineProperty(target, key, descriptor);
+                }
+            });
+            with (withProxy) { value += 1; }
+        "#}),
+        TestAction::assert_eq(
+            "withLog.join(',')",
+            js_str!(
+                "has:value,get:Symbol(Symbol.unscopables),has:value,get:value,has:value,\
+                 set:value,getOwnPropertyDescriptor:value,defineProperty:value"
+            ),
+        ),
+        TestAction::assert(indoc! {r#"
+            (() => {
+                var environment = {
+                    binding: 1,
+                    get [Symbol.unscopables]() {
+                        delete this.binding;
+                        return null;
+                    }
+                };
+                with (environment) {
+                    return (function () {
+                        'use strict';
+                        try { binding; } catch (error) { return error instanceof ReferenceError; }
+                        return false;
+                    })();
+                }
+            })()
+        "#}),
+        TestAction::assert(indoc! {r#"
+            (() => {
+                var calls = 0;
+                var environment = {
+                    binding: 1,
+                    get [Symbol.unscopables]() {
+                        calls++;
+                        delete this.binding;
+                        return null;
+                    }
+                };
+                var result = 2;
+                with (environment) { result = binding; }
+                return calls === 1 && result === undefined;
+            })()
+        "#}),
+    ]);
+}
+
+#[test]
 // https://github.com/boa-dev/boa/issues/2719
 fn with_env_not_panic() {
     run_test_actions([TestAction::assert_native_error(
