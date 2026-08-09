@@ -675,7 +675,7 @@ pub(crate) fn create_date_time_format(
     // 18. If IsTimeZoneOffsetString(timeZone) is true, then
     let time_zone_string = time_zone.to_std_string_escaped();
     // Note: Should a timezone enum be part of temporal_rs, icu_time, or an ECMA402 wrapper lib
-    let time_zone = if let Ok(utc_offset) = UtcOffset::try_from_str(&time_zone_string) {
+    let time_zone = if let Some(utc_offset) = parse_offset_time_zone_identifier(&time_zone_string) {
         //  a. Let parseResult be ParseText(StringToCodePoints(timeZone), UTCOffset).
         //  b. Assert: parseResult is a Parse Node.
         //  c. If parseResult contains more than one MinuteSecond Parse Node, throw a RangeError exception.
@@ -824,6 +824,41 @@ pub(crate) fn create_date_time_format(
         formatter,
         bound_format: None,
     })
+}
+
+/// Parses an ECMA-402 offset time-zone identifier.
+///
+/// ICU4X's `UtcOffset` parser accepts the ISO Unicode minus sign and limits offsets to 18 hours.
+/// ECMA-402 instead requires an ASCII sign and permits offsets through 23:59, so this grammar is
+/// deliberately owned at the JavaScript/ICU boundary.
+fn parse_offset_time_zone_identifier(identifier: &str) -> Option<UtcOffset> {
+    fn two_digits(tens: u8, ones: u8) -> Option<i32> {
+        if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+            return None;
+        }
+        Some(i32::from(tens - b'0') * 10 + i32::from(ones - b'0'))
+    }
+
+    let bytes = identifier.as_bytes();
+    let (sign, rest) = match bytes {
+        [b'+', rest @ ..] => (1, rest),
+        [b'-', rest @ ..] => (-1, rest),
+        _ => return None,
+    };
+
+    let (hours, minutes) = match rest {
+        [h1, h2] => (two_digits(*h1, *h2)?, 0),
+        [h1, h2, m1, m2] | [h1, h2, b':', m1, m2] => (two_digits(*h1, *h2)?, two_digits(*m1, *m2)?),
+        _ => return None,
+    };
+
+    if hours >= 24 || minutes >= 60 {
+        return None;
+    }
+
+    Some(UtcOffset::from_seconds_unchecked(
+        sign * (hours * 60 + minutes) * 60,
+    ))
 }
 
 /// Formats a timestamp (epoch milliseconds) using the given [`DateTimeFormat`] internals.

@@ -2,6 +2,8 @@ use indoc::indoc;
 
 use crate::{TestAction, run_test_actions};
 
+use super::{UtcOffset, parse_offset_time_zone_identifier};
+
 // Intl.DateTimeFormat tests
 
 #[cfg(feature = "intl_bundled")]
@@ -140,4 +142,37 @@ fn resolved_options_preserve_components_and_object_identity() {
         TestAction::assert_eq("first.hourCycle === 'h24'", true),
         TestAction::assert_eq("first.hour12 === false", true),
     ]);
+}
+
+#[test]
+fn ecma402_offset_time_zone_grammar() {
+    for (identifier, seconds) in [
+        ("+00", 0),
+        ("-00:00", 0),
+        ("+23", 23 * 60 * 60),
+        ("-2359", -(23 * 60 * 60 + 59 * 60)),
+        ("+01:03", 63 * 60),
+    ] {
+        assert_eq!(
+            parse_offset_time_zone_identifier(identifier).map(UtcOffset::to_seconds),
+            Some(seconds),
+            "{identifier}"
+        );
+    }
+
+    for identifier in [
+        "+3",
+        "+24",
+        "+23:0",
+        "+2400",
+        "+15:60",
+        "+15:59:00",
+        "−05",
+        "Z",
+    ] {
+        assert!(
+            parse_offset_time_zone_identifier(identifier).is_none(),
+            "{identifier}"
+        );
+    }
 }
