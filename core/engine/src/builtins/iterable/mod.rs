@@ -1,13 +1,16 @@
 //! Boa's implementation of ECMAScript's `IteratorRecord` and iterator prototype objects.
 
 use crate::{
-    Context, JsResult, JsValue,
-    builtins::{BuiltInBuilder, IntrinsicObject},
+    Context, JsExpect, JsResult, JsValue,
+    builtins::{
+        BuiltInBuilder, IntrinsicObject, Promise,
+        promise::{PromiseCapability, if_abrupt_reject_promise},
+    },
     context::intrinsics::Intrinsics,
     error::JsNativeError,
     js_string,
     native_function::{CoroutineBranch, CoroutineState},
-    object::JsObject,
+    object::{FunctionObjectBuilder, JsObject},
     realm::Realm,
     symbol::JsSymbol,
     vm::CompletionRecord,
@@ -193,11 +196,72 @@ impl IntrinsicObject for AsyncIterator {
     fn init(realm: &Realm) {
         BuiltInBuilder::with_intrinsic::<Self>(realm)
             .static_method(|v, _, _| Ok(v.clone()), JsSymbol::async_iterator(), 0)
+            .static_method(Self::async_dispose, JsSymbol::async_dispose(), 0)
             .build();
     }
 
     fn get(intrinsics: &Intrinsics) -> JsObject {
         intrinsics.objects().iterator_prototypes().async_iterator()
+    }
+}
+
+impl AsyncIterator {
+    /// `%AsyncIteratorPrototype% [ @@asyncDispose ] ( )`
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-%asynciteratorprototype%-%symbol.asyncdispose%
+    fn async_dispose(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+        let promise_constructor = context.intrinsics().constructors().promise().constructor();
+        let promise_capability = PromiseCapability::new(&promise_constructor, context)
+            .js_expect("the intrinsic Promise constructor must create a promise capability")?;
+
+        let return_method = if_abrupt_reject_promise!(
+            this.get_method(js_string!("return"), context),
+            promise_capability,
+            context
+        );
+
+        let Some(return_method) = return_method else {
+            promise_capability
+                .resolve()
+                .call(&JsValue::undefined(), &[JsValue::undefined()], context)
+                .js_expect("the intrinsic promise resolve function cannot fail")?;
+            return Ok(promise_capability.promise().clone().into());
+        };
+
+        let result = if_abrupt_reject_promise!(
+            return_method.call(this, &[JsValue::undefined()], context),
+            promise_capability,
+            context
+        );
+        let result_wrapper = if_abrupt_reject_promise!(
+            Promise::promise_resolve(&promise_constructor, result, context),
+            promise_capability,
+            context
+        );
+        let result_wrapper = result_wrapper
+            .downcast::<Promise>()
+            .expect("the intrinsic Promise constructor must create a Promise object");
+
+        let on_fulfilled = FunctionObjectBuilder::new(
+            context.realm(),
+            crate::NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+        )
+        .name(js_string!())
+        .length(1)
+        .build();
+
+        Promise::perform_promise_then(
+            &result_wrapper,
+            Some(on_fulfilled),
+            None,
+            Some(promise_capability.clone()),
+            context,
+        );
+
+        Ok(promise_capability.promise().clone().into())
     }
 }
 

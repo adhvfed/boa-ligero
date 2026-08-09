@@ -416,6 +416,56 @@ fn iterator_prototype_dispose() {
 }
 
 #[test]
+fn async_iterator_prototype_dispose() {
+    run_test_actions([
+        TestAction::run(
+            "async function* generator() {}
+            const AsyncIteratorPrototype = Object.getPrototypeOf(
+                Object.getPrototypeOf(generator.prototype)
+            );
+            const receiver = {
+                return(value) {
+                    this.returnArgument = value;
+                    return 42;
+                }
+            };
+            var disposalResult = 1;
+            var disposalRejected = false;
+            const disposalPromise = AsyncIteratorPrototype[Symbol.asyncDispose].call(receiver);
+            disposalPromise.then(
+                value => { disposalResult = value; },
+                () => { disposalRejected = true; }
+            );",
+        ),
+        TestAction::assert("disposalPromise instanceof Promise"),
+        TestAction::assert("receiver.hasOwnProperty('returnArgument')"),
+        TestAction::assert_eq("receiver.returnArgument", JsValue::undefined()),
+        TestAction::inspect_context(|context| context.run_jobs().unwrap()),
+        TestAction::assert_eq("disposalResult", JsValue::undefined()),
+        TestAction::assert("!disposalRejected"),
+        TestAction::run(
+            "const expectedDisposalError = {};
+            var asyncDisposalThrew = false;
+            var asyncDisposalRejectedWithExpected = false;
+            let rejectedDisposal;
+            try {
+                rejectedDisposal = AsyncIteratorPrototype[Symbol.asyncDispose].call({
+                    get return() { throw expectedDisposalError; }
+                });
+            } catch {
+                asyncDisposalThrew = true;
+            }
+            rejectedDisposal.catch(error => {
+                asyncDisposalRejectedWithExpected = error === expectedDisposalError;
+            });",
+        ),
+        TestAction::assert("!asyncDisposalThrew"),
+        TestAction::inspect_context(|context| context.run_jobs().unwrap()),
+        TestAction::assert("asyncDisposalRejectedWithExpected"),
+    ]);
+}
+
+#[test]
 fn iterator_concat_basic() {
     run_test_actions([TestAction::assert_eq(
         "Iterator.concat([1,2],[3,4]).toArray().join(',')",
