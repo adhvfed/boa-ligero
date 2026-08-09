@@ -139,6 +139,7 @@ pub struct StandardConstructors {
     regexp: StandardConstructor,
     symbol: StandardConstructor,
     disposable_stack: StandardConstructor,
+    async_disposable_stack: StandardConstructor,
     error: StandardConstructor,
     type_error: StandardConstructor,
     reference_error: StandardConstructor,
@@ -237,6 +238,7 @@ impl Default for StandardConstructors {
             regexp: StandardConstructor::default(),
             symbol: StandardConstructor::default(),
             disposable_stack: StandardConstructor::default(),
+            async_disposable_stack: StandardConstructor::default(),
             error: StandardConstructor::default(),
             type_error: StandardConstructor::default(),
             reference_error: StandardConstructor::default(),
@@ -487,6 +489,13 @@ impl StandardConstructors {
     #[must_use]
     pub const fn disposable_stack(&self) -> &StandardConstructor {
         &self.disposable_stack
+    }
+
+    /// Returns the `AsyncDisposableStack` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn async_disposable_stack(&self) -> &StandardConstructor {
+        &self.async_disposable_stack
     }
 
     /// Returns the `Error` constructor.

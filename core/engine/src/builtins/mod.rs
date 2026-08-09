@@ -2,6 +2,7 @@
 
 pub mod array;
 pub mod array_buffer;
+pub mod async_disposable_stack;
 pub mod async_function;
 pub mod async_generator;
 pub mod async_generator_function;
@@ -59,6 +60,7 @@ pub mod temporal;
 
 pub(crate) use self::{
     array::Array,
+    async_disposable_stack::AsyncDisposableStack,
     async_function::AsyncFunction,
     bigint::BigInt,
     boolean::Boolean,
@@ -316,6 +318,7 @@ impl Realm {
         AggregateError::init(self);
         SuppressedError::init(self);
         DisposableStack::init(self);
+        AsyncDisposableStack::init(self);
         Reflect::init(self);
         Generator::init(self);
         GeneratorFunction::init(self);
@@ -451,6 +454,7 @@ pub(crate) fn set_default_global_bindings(context: &mut Context) -> JsResult<()>
     global_binding::<AggregateError>(context)?;
     global_binding::<SuppressedError>(context)?;
     global_binding::<DisposableStack>(context)?;
+    global_binding::<AsyncDisposableStack>(context)?;
     global_binding::<Reflect>(context)?;
     global_binding::<Promise>(context)?;
     global_binding::<EncodeUri>(context)?;
