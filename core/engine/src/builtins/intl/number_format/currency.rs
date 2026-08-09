@@ -44,12 +44,13 @@ fn accounting_placeholders(
 ) -> ([AccountingPlaceholder; 3], usize) {
     use AccountingPlaceholder::{Currency, MinusSign, Number};
     use CurrencyAccountingPlaceholderOrder::{
-        CurrencyMinusNumber, CurrencyNumberMinus, MinusCurrencyNumber, MinusNumberCurrency,
-        NumberCurrency, NumberCurrencyMinus, NumberMinusCurrency,
+        CurrencyMinusNumber, CurrencyNumber, CurrencyNumberMinus, MinusCurrencyNumber,
+        MinusNumberCurrency, NumberCurrency, NumberCurrencyMinus, NumberMinusCurrency,
     };
 
     match order {
         NumberCurrency => ([Number, Currency, Number], 2),
+        CurrencyNumber => ([Currency, Number, Number], 2),
         MinusCurrencyNumber => ([MinusSign, Currency, Number], 3),
         MinusNumberCurrency => ([MinusSign, Number, Currency], 3),
         CurrencyMinusNumber => ([Currency, MinusSign, Number], 3),
