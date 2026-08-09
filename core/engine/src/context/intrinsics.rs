@@ -138,6 +138,7 @@ pub struct StandardConstructors {
     string: StandardConstructor,
     regexp: StandardConstructor,
     symbol: StandardConstructor,
+    disposable_stack: StandardConstructor,
     error: StandardConstructor,
     type_error: StandardConstructor,
     reference_error: StandardConstructor,
@@ -235,6 +236,7 @@ impl Default for StandardConstructors {
             )),
             regexp: StandardConstructor::default(),
             symbol: StandardConstructor::default(),
+            disposable_stack: StandardConstructor::default(),
             error: StandardConstructor::default(),
             type_error: StandardConstructor::default(),
             reference_error: StandardConstructor::default(),
@@ -473,6 +475,18 @@ impl StandardConstructors {
     #[must_use]
     pub const fn symbol(&self) -> &StandardConstructor {
         &self.symbol
+    }
+
+    /// Returns the `DisposableStack` constructor.
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-disposablestack-constructor
+    #[inline]
+    #[must_use]
+    pub const fn disposable_stack(&self) -> &StandardConstructor {
+        &self.disposable_stack
     }
 
     /// Returns the `Error` constructor.

@@ -10,6 +10,7 @@ pub mod bigint;
 pub mod boolean;
 pub mod dataview;
 pub mod date;
+pub mod disposable_stack;
 pub mod error;
 pub mod eval;
 pub mod finalization_registry;
@@ -63,6 +64,7 @@ pub(crate) use self::{
     boolean::Boolean,
     dataview::DataView,
     date::Date,
+    disposable_stack::DisposableStack,
     error::{
         AggregateError, EvalError, RangeError, ReferenceError, SuppressedError, SyntaxError,
         TypeError, UriError,
@@ -313,6 +315,7 @@ impl Realm {
         UriError::init(self);
         AggregateError::init(self);
         SuppressedError::init(self);
+        DisposableStack::init(self);
         Reflect::init(self);
         Generator::init(self);
         GeneratorFunction::init(self);
@@ -447,6 +450,7 @@ pub(crate) fn set_default_global_bindings(context: &mut Context) -> JsResult<()>
     global_binding::<UriError>(context)?;
     global_binding::<AggregateError>(context)?;
     global_binding::<SuppressedError>(context)?;
+    global_binding::<DisposableStack>(context)?;
     global_binding::<Reflect>(context)?;
     global_binding::<Promise>(context)?;
     global_binding::<EncodeUri>(context)?;
