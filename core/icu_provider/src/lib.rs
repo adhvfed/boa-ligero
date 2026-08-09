@@ -112,8 +112,10 @@ macro_rules! provider_from_icu_crate {
     };
 }
 
-const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] =
-    &[icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO];
+const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
+    icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
+    icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
+];
 
 /// Boa's default buffer provider.
 static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBufferProvider>>> =

@@ -116,6 +116,80 @@ fn currency_fraction_defaults_come_from_cldr() {
     ]);
 }
 
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn percent_style_scales_values_and_uses_locale_patterns() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent" }).format(0.2)"#,
+            js_string!("20%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("tr", { style: "percent" }).format(0.2)"#,
+            js_string!("%20"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("de-DE", { style: "percent" }).format(0.2)"#,
+            js_string!("20\u{a0}%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent", signDisplay: "always" }).format(0.2)"#,
+            js_string!("+20%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent", signDisplay: "negative" }).format(-0)"#,
+            js_string!("0%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent", notation: "scientific" }).format(0.0123)"#,
+            js_string!("1E0%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-u-nu-arab", { style: "percent" }).format(0.2)"#,
+            js_string!("٢٠%"),
+        ),
+        TestAction::assert_eq(
+            r#"
+                const formatter = new Intl.NumberFormat("en-US", {
+                    style: "percent",
+                    signDisplay: "always"
+                });
+                JSON.stringify([
+                    formatter.format(NaN),
+                    formatter.format(Infinity),
+                    formatter.format(-Infinity),
+                ]);
+            "#,
+            js_string!(r#"["+NaN%","+∞%","-∞%"]"#),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn percent_style_preserves_structured_parts() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "percent" }).formatToParts(-123))"#,
+            js_string!(
+                r#"[{"type":"minusSign","value":"-"},{"type":"integer","value":"12"},{"type":"group","value":","},{"type":"integer","value":"300"},{"type":"percentSign","value":"%"}]"#
+            ),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("de-DE", { style: "percent" }).formatToParts(0.2))"#,
+            js_string!(
+                r#"[{"type":"integer","value":"20"},{"type":"literal","value":" "},{"type":"percentSign","value":"%"}]"#
+            ),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "percent", signDisplay: "always" }).formatToParts(NaN))"#,
+            js_string!(
+                r#"[{"type":"plusSign","value":"+"},{"type":"nan","value":"NaN"},{"type":"percentSign","value":"%"}]"#
+            ),
+        ),
+    ]);
+}
+
 #[test]
 fn special_number_parts_are_tagged() {
     let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);

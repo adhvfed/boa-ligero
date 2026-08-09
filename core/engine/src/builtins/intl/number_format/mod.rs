@@ -10,10 +10,13 @@ use icu_decimal::{
     provider::{DecimalDigitsV1, DecimalSymbolsV1},
 };
 
-use icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1;
+use icu_experimental::dimension::provider::{
+    currency::fractions::CurrencyFractionsV1, percent::PercentEssentialsV1,
+};
 use icu_locale::{Locale, extensions::unicode::Value};
 use icu_provider::{
-    DataMarker, DataMarkerAttributes, DataProvider, DynamicDataProvider, buf::BufferMarker,
+    DataMarker, DataMarkerAttributes, DataPayload, DataProvider, DynamicDataProvider,
+    buf::BufferMarker,
 };
 use num_bigint::BigInt;
 use num_traits::Num;
@@ -49,11 +52,13 @@ mod options;
 pub(crate) use options::*;
 mod scientific;
 use scientific::FormattedScientific;
+mod percent;
+use percent::FormattedPercent;
 
 #[cfg(test)]
 mod tests;
 
-enum FormattedNumber<'a, T> {
+enum FormattedNumeric<'a, T> {
     Decimal(FormattedDecimal<'a>),
     Scientific(FormattedScientific<'a>),
     Compact(T),
@@ -86,49 +91,77 @@ impl Writeable for SpecialValue {
     }
 }
 
-impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
+impl<T: Writeable> Writeable for FormattedNumeric<'_, T> {
     fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
         match self {
-            FormattedNumber::Decimal(d) => d.write_to(sink),
-            FormattedNumber::Scientific(s) => s.write_to(sink),
-            FormattedNumber::Compact(c) => c.write_to(sink),
-            FormattedNumber::Special(s) => s.write_to(sink),
+            Self::Decimal(d) => d.write_to(sink),
+            Self::Scientific(s) => s.write_to(sink),
+            Self::Compact(c) => c.write_to(sink),
+            Self::Special(s) => s.write_to(sink),
         }
     }
 
     fn write_to_parts<S: writeable::PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
         match self {
-            FormattedNumber::Decimal(d) => d.write_to_parts(sink),
-            FormattedNumber::Scientific(s) => s.write_to_parts(sink),
-            FormattedNumber::Compact(c) => c.write_to_parts(sink),
-            FormattedNumber::Special(s) => s.write_to_parts(sink),
+            Self::Decimal(d) => d.write_to_parts(sink),
+            Self::Scientific(s) => s.write_to_parts(sink),
+            Self::Compact(c) => c.write_to_parts(sink),
+            Self::Special(s) => s.write_to_parts(sink),
         }
     }
 
     fn writeable_length_hint(&self) -> writeable::LengthHint {
         match self {
-            FormattedNumber::Decimal(d) => d.writeable_length_hint(),
-            FormattedNumber::Scientific(s) => s.writeable_length_hint(),
-            FormattedNumber::Compact(c) => c.writeable_length_hint(),
-            FormattedNumber::Special(s) => s.writeable_length_hint(),
+            Self::Decimal(d) => d.writeable_length_hint(),
+            Self::Scientific(s) => s.writeable_length_hint(),
+            Self::Compact(c) => c.writeable_length_hint(),
+            Self::Special(s) => s.writeable_length_hint(),
         }
     }
 
     fn writeable_borrow(&self) -> Option<&str> {
         match self {
-            FormattedNumber::Decimal(d) => d.writeable_borrow(),
-            FormattedNumber::Scientific(s) => s.writeable_borrow(),
-            FormattedNumber::Compact(c) => c.writeable_borrow(),
-            FormattedNumber::Special(s) => s.writeable_borrow(),
+            Self::Decimal(d) => d.writeable_borrow(),
+            Self::Scientific(s) => s.writeable_borrow(),
+            Self::Compact(c) => c.writeable_borrow(),
+            Self::Special(s) => s.writeable_borrow(),
         }
     }
 
     fn write_to_string(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            FormattedNumber::Decimal(d) => d.write_to_string(),
-            FormattedNumber::Scientific(s) => s.write_to_string(),
-            FormattedNumber::Compact(c) => c.write_to_string(),
-            FormattedNumber::Special(s) => s.write_to_string(),
+            Self::Decimal(d) => d.write_to_string(),
+            Self::Scientific(s) => s.write_to_string(),
+            Self::Compact(c) => c.write_to_string(),
+            Self::Special(s) => s.write_to_string(),
+        }
+    }
+}
+
+enum FormattedNumber<'a, T> {
+    Plain(FormattedNumeric<'a, T>),
+    Percent(FormattedPercent<'a, FormattedNumeric<'a, T>>),
+}
+
+impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
+    fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
+        match self {
+            Self::Plain(number) => number.write_to(sink),
+            Self::Percent(number) => number.write_to(sink),
+        }
+    }
+
+    fn write_to_parts<S: writeable::PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
+        match self {
+            Self::Plain(number) => number.write_to_parts(sink),
+            Self::Percent(number) => number.write_to_parts(sink),
+        }
+    }
+
+    fn writeable_length_hint(&self) -> writeable::LengthHint {
+        match self {
+            Self::Plain(number) => number.writeable_length_hint(),
+            Self::Percent(number) => number.writeable_length_hint(),
         }
     }
 }
@@ -155,6 +188,23 @@ impl IntlMathematicalValue {
     }
 }
 
+fn special_value_sign(value: &IntlMathematicalValue, sign_display: SignDisplay) -> Sign {
+    match value {
+        IntlMathematicalValue::Infinity { negative: true }
+            if sign_display != SignDisplay::Never =>
+        {
+            Sign::Negative
+        }
+        IntlMathematicalValue::Infinity { negative: false }
+            if matches!(sign_display, SignDisplay::Always | SignDisplay::ExceptZero) =>
+        {
+            Sign::Positive
+        }
+        IntlMathematicalValue::NaN if sign_display == SignDisplay::Always => Sign::Positive,
+        _ => Sign::None,
+    }
+}
+
 #[derive(Debug)]
 enum Formatter {
     Standard(DecimalFormatter),
@@ -176,40 +226,35 @@ impl Formatter {
         value: &'l IntlMathematicalValue,
         sign_display: SignDisplay,
         exponent: i16,
-    ) -> FormattedNumber<'l, impl Writeable> {
+    ) -> FormattedNumeric<'l, impl Writeable> {
         match value {
             IntlMathematicalValue::Finite(decimal) => match self {
-                Formatter::Standard(fmt) => FormattedNumber::Decimal(fmt.format(decimal)),
+                Formatter::Standard(fmt) => FormattedNumeric::Decimal(fmt.format(decimal)),
                 Formatter::Scientific {
                     significand,
                     exponent: exponent_formatter,
                     ..
-                } => FormattedNumber::Scientific(FormattedScientific::new(
+                } => FormattedNumeric::Scientific(FormattedScientific::new(
                     significand.format(decimal),
                     exponent,
                     exponent_formatter,
                 )),
-                Formatter::Compact { inner, .. } => FormattedNumber::Compact(inner.format(decimal)),
+                Formatter::Compact { inner, .. } => {
+                    FormattedNumeric::Compact(inner.format(decimal))
+                }
             },
-            IntlMathematicalValue::Infinity { negative } => {
-                let sign = match (negative, sign_display) {
-                    (_, SignDisplay::Never) => Sign::None,
-                    (true, _) => Sign::Negative,
-                    (false, SignDisplay::Always | SignDisplay::ExceptZero) => Sign::Positive,
-                    (false, _) => Sign::None,
-                };
-                FormattedNumber::Special(
+            IntlMathematicalValue::Infinity { .. } => {
+                let sign = special_value_sign(value, sign_display);
+                FormattedNumeric::Special(
                     self.sign_formatter()
                         .format_sign(sign, SpecialValue::Infinity),
                 )
             }
             IntlMathematicalValue::NaN => {
-                let sign = if sign_display == SignDisplay::Always {
-                    Sign::Positive
-                } else {
-                    Sign::None
-                };
-                FormattedNumber::Special(self.sign_formatter().format_sign(sign, SpecialValue::NaN))
+                let sign = special_value_sign(value, sign_display);
+                FormattedNumeric::Special(
+                    self.sign_formatter().format_sign(sign, SpecialValue::NaN),
+                )
             }
         }
     }
@@ -236,6 +281,7 @@ impl Formatter {
 pub(crate) struct NumberFormat {
     locale: Locale,
     formatter: Formatter,
+    percent_essentials: Option<DataPayload<PercentEssentialsV1>>,
     numbering_system: NumberingSystem,
     unit_options: UnitFormatOptions,
     digit_options: DigitFormatOptions,
@@ -304,9 +350,15 @@ impl NumberFormat {
         &'l self,
         value: &'l mut IntlMathematicalValue,
     ) -> impl Writeable + 'l {
-        // TODO: Missing support from ICU4X for Percent/Currency/Unit formatting.
+        // TODO: Missing support from ICU4X for Currency/Unit formatting.
+
+        let is_percent = self.percent_essentials.is_some();
+        let mut percent_sign = special_value_sign(value, self.sign_display);
 
         let exponent = if let IntlMathematicalValue::Finite(value) = value {
+            if is_percent {
+                value.multiply_pow10(2);
+            }
             let exponent = if matches!(
                 self.formatter.notation(),
                 NotationKind::Scientific | NotationKind::Engineering
@@ -320,12 +372,34 @@ impl NumberFormat {
             }
             self.digit_options.format_fixed_decimal(value);
             value.apply_sign_display(self.sign_display);
+            if is_percent {
+                percent_sign = value.sign();
+                value.set_sign(Sign::None);
+            }
             exponent
         } else {
             0
         };
 
-        self.formatter.format(value, self.sign_display, exponent)
+        let number = self.formatter.format(
+            value,
+            if is_percent {
+                SignDisplay::Never
+            } else {
+                self.sign_display
+            },
+            exponent,
+        );
+
+        if let Some(essentials) = &self.percent_essentials {
+            FormattedNumber::Percent(FormattedPercent::new(
+                number,
+                essentials.get(),
+                percent_sign,
+            ))
+        } else {
+            FormattedNumber::Plain(number)
+        }
     }
 }
 
@@ -650,6 +724,20 @@ impl NumberFormat {
         let sign_display =
             get_option(&options, js_string!("signDisplay"), context)?.unwrap_or(SignDisplay::Auto);
 
+        let percent_essentials = if unit_options.style() == Style::Percent {
+            let data_locale = icu_provider::DataLocale::from(&locale);
+            let response: icu_provider::DataResponse<PercentEssentialsV1> = context
+                .intl_provider()
+                .load(icu_provider::DataRequest {
+                    id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
+                    ..icu_provider::DataRequest::default()
+                })
+                .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
+            Some(response.payload)
+        } else {
+            None
+        };
+
         let mut options = DecimalFormatterOptions::default();
         options.grouping_strategy = Some(use_grouping);
 
@@ -764,6 +852,7 @@ impl NumberFormat {
             locale,
             numbering_system,
             formatter,
+            percent_essentials,
             unit_options,
             digit_options,
             use_grouping,

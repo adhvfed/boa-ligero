@@ -10,8 +10,10 @@ use icu_provider_source::{CoverageLevel, SourceDataProvider};
 /// Path to the directory where the exported data lives.
 const EXPORT_PATH: &str = "core/icu_provider/data";
 
-const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] =
-    &[icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO];
+const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
+    icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
+    icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
+];
 
 /// List of services used by `Intl` components.
 ///
