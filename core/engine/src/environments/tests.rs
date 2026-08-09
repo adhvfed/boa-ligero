@@ -77,3 +77,33 @@ fn set_outer_let_in_block_scope() {
             bar == "foo";
         "#})]);
 }
+
+#[test]
+fn strict_global_update_does_not_recreate_a_deleted_binding() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            var updateCount = 0;
+            Object.defineProperty(this, "deletedDuringUpdate", {
+                configurable: true,
+                get() {
+                    delete this.deletedDuringUpdate;
+                    return 2;
+                }
+            });
+        "#}),
+        TestAction::assert_native_error(
+            indoc! {r#"
+                (function() {
+                    "use strict";
+                    updateCount++;
+                    deletedDuringUpdate ^= 3;
+                    updateCount++;
+                })()
+            "#},
+            JsNativeErrorKind::Reference,
+            "cannot assign to uninitialized global property `deletedDuringUpdate`",
+        ),
+        TestAction::assert_eq("updateCount", 1),
+        TestAction::assert("!('deletedDuringUpdate' in this)"),
+    ]);
+}

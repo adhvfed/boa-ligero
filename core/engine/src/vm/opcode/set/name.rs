@@ -214,7 +214,22 @@ impl SetNameGlobal {
         // Run the ordinary `[[Set]]` so the cache can be seeded for a
         // subsequent fast path.
         let strict = context.vm.frame().code_block().strict();
-        let key: PropertyKey = ic.name.clone().into();
+        let name = ic.name.clone();
+        let key: PropertyKey = name.clone().into();
+
+        // Object Environment Records re-check that the binding still exists at PutValue time.
+        // This is observable when evaluating the assigned value (including the getter used by a
+        // compound assignment) deletes a configurable global property. A strict write must throw
+        // instead of silently recreating that property.
+        if strict && !object.has_property(key.clone(), context)? {
+            return Err(JsNativeError::reference()
+                .with_message(format!(
+                    "cannot assign to uninitialized global property `{}`",
+                    name.to_std_string_escaped()
+                ))
+                .into());
+        }
+
         let receiver = object.clone().into();
 
         let context_inner = &mut InternalMethodPropertyContext::new(context);
