@@ -12,7 +12,7 @@ use crate::builtins::function::OrdinaryFunction;
 use crate::object::internal_methods::InternalMethodCallContext;
 use crate::object::shape::slot::SlotAttributes;
 use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
-use crate::{Context, JsValue};
+use crate::{Context, JsObject, JsValue};
 
 use super::{
     JIT_BREAK_BIT, JIT_GUARD_FAIL_BIT, JitBackend, JitCacheKey, JitCompileBlockerKind,
@@ -27,11 +27,10 @@ use cranelift_module::{Linkage, Module};
 
 /// Compile an ordinary numeric code block to native code.
 ///
-/// The current native subset is deliberately conservative: all register
-/// values are either `i32` or `f64` for a whole specialization, object/boxed
-/// operations are rejected, and the VM stack is materialized only at
-/// helper/exit boundaries. Returning `None` is a normal eligibility result;
-/// the caller uses the legacy shim compiler.
+/// The current native subset is deliberately conservative: primitive values
+/// use an `i32` or `f64` specialization, while a small set of boxed reads and
+/// calls stays in traced VM storage across helper boundaries. Returning `None`
+/// is a normal eligibility result; the caller uses the legacy shim compiler.
 pub(super) enum NativeCompileResult {
     Compiled {
         entry: extern "C" fn(*mut Context) -> u64,
@@ -836,7 +835,8 @@ impl DecodedInstructions {
             }
             if matches!(
                 instruction,
-                Instruction::GetLengthProperty { .. }
+                Instruction::GetNameGlobal { .. }
+                    | Instruction::GetLengthProperty { .. }
                     | Instruction::GetPropertyByName { .. }
                     | Instruction::GetPropertyByNameWithThis { .. }
                     | Instruction::GetPropertyByValue { .. }
@@ -1257,6 +1257,7 @@ fn output_definition(
     match instruction {
         Instruction::GetArgument { dst, .. }
         | Instruction::GetName { dst, .. }
+        | Instruction::GetNameGlobal { dst, .. }
         | Instruction::StoreZero { dst }
         | Instruction::StoreOne { dst }
         | Instruction::StoreInt8 { dst, .. }
@@ -1305,6 +1306,10 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
             .bindings
             .get(usize::from(*binding_index))
             .is_some_and(|binding| binding.scope() == BindingLocatorScope::GlobalDeclarative),
+        (Opcode::GetNameGlobal, Instruction::GetNameGlobal { binding_index, .. }) => code
+            .bindings
+            .get(usize::from(*binding_index))
+            .is_some_and(|binding| binding.scope() == BindingLocatorScope::GlobalObject),
         (Opcode::GetArgument, Instruction::GetArgument { .. })
         | (Opcode::StoreZero, Instruction::StoreZero { .. })
         | (Opcode::StoreOne, Instruction::StoreOne { .. })
@@ -1378,6 +1383,7 @@ struct Helpers {
     ptr: cranelift_codegen::ir::Type,
     guard: Helper,
     copy_global_declarative_binding_register: Helper,
+    copy_global_object_binding_register: Helper,
     guard_argument_number: Helper,
     guard_stack_number: Helper,
     copy_argument_register: Helper,
@@ -1652,6 +1658,11 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32, types::I32],
                 types::I64,
             ),
+            copy_global_object_binding_register: make(
+                jit_copy_global_object_binding_register as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
             guard_argument_number: make(
                 jit_guard_argument_number as *const () as usize,
                 &[ptr, types::I32],
@@ -1901,31 +1912,41 @@ impl<'a> NativeCompiler<'a> {
                     &[ctx, binding_index, dst_value, representation],
                 );
                 let guard = bcx.inst_results(guard)[0];
-                let deopt = bcx.create_block();
-                let cont = bcx.create_block();
-                bcx.ins().brif(guard, cont, &[], deopt, &[]);
-                bcx.switch_to_block(deopt);
-                if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::BindingRead) {
+                if !self.emit_binding_read_result(bcx, ctx, helpers, pc, dst, guard) {
                     return false;
                 }
-                bcx.switch_to_block(cont);
-
-                if self.defined_register_kind(dst) != RegisterKind::Boxed {
-                    let load_helper = if self.mode == NativeMode::F64 {
-                        helpers.get_register_f64
-                    } else {
-                        helpers.get_register_i32
-                    };
-                    let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
-                    let value = bcx.ins().call_indirect(
-                        load_helper.signature,
-                        load_address,
-                        &[ctx, dst_value],
-                    );
-                    let value = bcx.inst_results(value)[0];
-                    if !self.define_register(bcx, dst, value) {
-                        return false;
-                    }
+            }
+            Instruction::GetNameGlobal {
+                dst,
+                binding_index,
+                ic_index,
+            } => {
+                let dst = register(*dst);
+                let binding_index = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(u32::from(*binding_index)));
+                let ic_index = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(u32::from(*ic_index)));
+                let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+                let representation = match (self.defined_register_kind(dst), self.mode) {
+                    (RegisterKind::Boxed, _) => 2,
+                    (_, NativeMode::F64) => 1,
+                    (_, NativeMode::I32) => 0,
+                };
+                let representation = bcx.ins().iconst(types::I32, representation);
+                let helper = bcx.ins().iconst(
+                    helpers.ptr,
+                    helpers.copy_global_object_binding_register.address as i64,
+                );
+                let guard = bcx.ins().call_indirect(
+                    helpers.copy_global_object_binding_register.signature,
+                    helper,
+                    &[ctx, binding_index, ic_index, dst_value, representation],
+                );
+                let guard = bcx.inst_results(guard)[0];
+                if !self.emit_binding_read_result(bcx, ctx, helpers, pc, dst, guard) {
+                    return false;
                 }
             }
             Instruction::GetArgument { index, dst } => {
@@ -2824,6 +2845,46 @@ impl<'a> NativeCompiler<'a> {
             NativeMode::F64 => bcx.ins().fcmp(float_condition, lhs, rhs),
         };
         bcx.ins().brif(condition, target, &[], next, &[]);
+        true
+    }
+
+    /// Finish a binding helper that copied the authoritative value into a VM
+    /// register. Boxed values stay rooted there; numeric specializations load
+    /// the already-checked value into SSA only after the pre-effect guard.
+    fn emit_binding_read_result(
+        &mut self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+        pc: usize,
+        dst: usize,
+        guard: cranelift_codegen::ir::Value,
+    ) -> bool {
+        let deopt = bcx.create_block();
+        let cont = bcx.create_block();
+        bcx.ins().brif(guard, cont, &[], deopt, &[]);
+        bcx.switch_to_block(deopt);
+        if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::BindingRead) {
+            return false;
+        }
+        bcx.switch_to_block(cont);
+
+        if self.defined_register_kind(dst) != RegisterKind::Boxed {
+            let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+            let load_helper = if self.mode == NativeMode::F64 {
+                helpers.get_register_f64
+            } else {
+                helpers.get_register_i32
+            };
+            let load_address = bcx.ins().iconst(helpers.ptr, load_helper.address as i64);
+            let value =
+                bcx.ins()
+                    .call_indirect(load_helper.signature, load_address, &[ctx, dst_value]);
+            let value = bcx.inst_results(value)[0];
+            if !self.define_register(bcx, dst, value) {
+                return false;
+            }
+        }
         true
     }
 
@@ -3847,18 +3908,61 @@ extern "C" fn jit_copy_global_declarative_binding_register(
         value
     };
 
-    let representation_matches = match representation {
-        0 => value.as_i32().is_some(),
-        1 => value.as_number().is_some(),
-        2 => true,
-        _ => false,
-    };
-    if !representation_matches {
+    if !value_matches_native_representation(&value, representation) {
         return 0;
     }
 
     context.vm.set_register(register as usize, value);
     1
+}
+
+/// Copy a warm global-object binding into a VM register without retaining any
+/// realm, object, shape, slot, or value in generated code. Accessors and IC
+/// misses replay the authoritative `GetNameGlobal` operation in the
+/// interpreter.
+extern "C" fn jit_copy_global_object_binding_register(
+    context: *mut Context,
+    binding_index: u32,
+    ic_index: u32,
+    register: u32,
+    representation: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    if !context.binding_locator_stable() {
+        return 0;
+    }
+
+    let binding_is_global = context
+        .vm
+        .frame()
+        .code_block
+        .bindings
+        .get(binding_index as usize)
+        .is_some_and(|binding| binding.scope() == BindingLocatorScope::GlobalObject);
+    if !binding_is_global {
+        return 0;
+    }
+
+    let object = context.global_object();
+    let Some(value) = cached_named_property_value(context, &object, ic_index) else {
+        return 0;
+    };
+    if !value_matches_native_representation(&value, representation) {
+        return 0;
+    }
+
+    context.vm.set_register(register as usize, value);
+    1
+}
+
+fn value_matches_native_representation(value: &JsValue, representation: u32) -> bool {
+    match representation {
+        0 => value.as_i32().is_some(),
+        1 => value.as_number().is_some(),
+        2 => true,
+        _ => false,
+    }
 }
 
 extern "C" fn jit_guard_argument_number(context: *mut Context, index: u32) -> u64 {
@@ -4066,6 +4170,14 @@ extern "C" fn jit_diagnostic_dense_array_f64_guarded(
 fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Option<JsValue> {
     let value = context.vm.get_register(register as usize);
     let object = value.as_object_borrowed()?;
+    cached_named_property_value(context, &object, ic_index)
+}
+
+fn cached_named_property_value(
+    context: &Context,
+    object: &JsObject,
+    ic_index: u32,
+) -> Option<JsValue> {
     let object = object.borrow();
     let ic = context.vm.frame().code_block().ic.get(ic_index as usize)?;
     let slot = ic.get(object.shape())?;

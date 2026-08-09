@@ -8041,6 +8041,190 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_reads_current_global_object_function_binding() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function increment(value) { return value + 1; } function decrement(value) { return value - 1; } function run(value, count) { for (let index = 0; index < count; index++) { value = increment(value); } return value; } let answer = 0; for (let index = 0; index < 80; index++) { answer = run(0, 3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+
+        let result = setup.evaluate(&mut context).expect("evaluate setup");
+        assert_eq!(result.as_i32(), Some(3));
+
+        boa_gc::force_collect();
+
+        let replacement = crate::Script::parse(
+            crate::Source::from_bytes("increment = decrement; run(10, 3)"),
+            None,
+            &mut context,
+        )
+        .expect("parse replacement");
+        let result = replacement
+            .evaluate(&mut context)
+            .expect("evaluate replacement");
+        assert_eq!(result.as_i32(), Some(7));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.compile_records.iter().any(|record| {
+            record.outcome == JitCompileOutcome::Native
+                && record.first_blocking_opcode.is_none()
+                && record.native_call_instructions > 0
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_reads_current_numeric_global_object_binding() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "var limit = 4; function sum() { let total = 0; for (let index = 0; index < limit; index++) { total = total + 2; } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = sum(); } let before = sum(); limit = 2; let current = sum(); limit = '3'; before + ',' + current + ',' + sum()",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "8,4,6"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::BindingRead
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_replays_global_object_accessor_and_missing_binding() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "globalThis.dynamicValue = 2; function sum(count) { let total = 0; for (let index = 0; index < count; index++) { total = total + dynamicValue; } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = sum(3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        let result = setup.evaluate(&mut context).expect("evaluate setup");
+        assert_eq!(result.as_i32(), Some(6));
+
+        let accessor = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let getterCalls = 0; Object.defineProperty(globalThis, 'dynamicValue', { configurable: true, get() { getterCalls++; return 3; } }); let value = sum(2); value + ',' + getterCalls",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse accessor");
+        let result = accessor.evaluate(&mut context).expect("evaluate accessor");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "6,2"
+        );
+
+        let missing = crate::Script::parse(
+            crate::Source::from_bytes("delete globalThis.dynamicValue; sum(1)"),
+            None,
+            &mut context,
+        )
+        .expect("parse missing binding");
+        let error = missing
+            .evaluate(&mut context)
+            .expect_err("the deleted binding must throw");
+        assert_eq!(
+            error.as_native().map(crate::JsNativeError::kind),
+            Some(&JsNativeErrorKind::Reference)
+        );
+
+        let inherited = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let globalPrototype = Object.getPrototypeOf(globalThis); globalPrototype.dynamicValue = 4; let first = sum(2); globalPrototype.dynamicValue = 5; first + ',' + sum(2)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse inherited binding");
+        let result = inherited
+            .evaluate(&mut context)
+            .expect("evaluate inherited binding");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "8,10"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 2, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_global_object_guard_refunds_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+            }
+            let definition = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "var limit = 4; function sum() { let total = 0; for (let index = 0; index < limit; index++) { total = total + 2; } return total; } let warm = 0; for (let index = 0; index < 80; index++) { warm = sum(); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse definition");
+            definition.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let expected =
+            evaluate_with_instruction_budget(&mut interpreter, "limit = '2'; sum()", 1_000)
+                .expect("interpreter binding fallback");
+        let result = evaluate_with_instruction_budget(&mut context, "limit = '2'; sum()", 1_000)
+            .expect("JIT binding fallback");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "global-object guard fallback must not double-charge GetNameGlobal"
+        );
+    }
+
+    #[test]
     fn context_owned_jit_deopts_mismatched_global_binding_read() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
