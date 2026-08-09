@@ -224,7 +224,7 @@ impl BigInt {
     ) -> JsResult<JsValue> {
         #[cfg(feature = "intl")]
         {
-            use crate::builtins::intl::NumberFormat;
+            use crate::builtins::intl::{IntlMathematicalValue, NumberFormat};
             use fixed_decimal::Decimal;
             use writeable::Writeable;
 
@@ -235,11 +235,13 @@ impl BigInt {
 
             // 2. Let numberFormat be ? Construct(%Intl.NumberFormat%, « locales, options »).
             let number_format = NumberFormat::new(&locales, &options, context)?;
-            let x = &mut Decimal::try_from_str(&x.to_string())
-                .map_err(|err| JsNativeError::range().with_message(err.to_string()))?;
+            let mut x = IntlMathematicalValue::Finite(
+                Decimal::try_from_str(&x.to_string())
+                    .map_err(|err| JsNativeError::range().with_message(err.to_string()))?,
+            );
 
             // 3. Return FormatNumeric(numberFormat, ℝ(x)).
-            Ok(js_string!(number_format.format(x).write_to_string()).into())
+            Ok(js_string!(number_format.format(&mut x).write_to_string()).into())
         }
 
         #[cfg(not(feature = "intl"))]

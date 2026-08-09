@@ -1,5 +1,43 @@
-use crate::builtins::intl::number_format::RoundingIncrement;
+use crate::{
+    builtins::intl::number_format::{
+        IntlMathematicalValue, RoundingIncrement, js_string_to_intl_mathematical_value,
+    },
+    js_string,
+};
+use fixed_decimal::Decimal;
 use fixed_decimal::RoundingIncrement::*;
+
+#[test]
+fn intl_mathematical_value_preserves_special_values() {
+    assert!(matches!(
+        IntlMathematicalValue::try_from_f64(f64::NAN),
+        Ok(IntlMathematicalValue::NaN)
+    ));
+    assert!(matches!(
+        IntlMathematicalValue::try_from_f64(f64::INFINITY),
+        Ok(IntlMathematicalValue::Infinity { negative: false })
+    ));
+    assert!(matches!(
+        IntlMathematicalValue::try_from_f64(f64::NEG_INFINITY),
+        Ok(IntlMathematicalValue::Infinity { negative: true })
+    ));
+
+    assert!(matches!(
+        js_string_to_intl_mathematical_value(&js_string!("not a number")),
+        IntlMathematicalValue::NaN
+    ));
+    assert!(matches!(
+        js_string_to_intl_mathematical_value(&js_string!("-Infinity")),
+        IntlMathematicalValue::Infinity { negative: true }
+    ));
+
+    let IntlMathematicalValue::Finite(value) =
+        js_string_to_intl_mathematical_value(&js_string!("0x2a"))
+    else {
+        panic!("a valid numeric string must produce a finite value");
+    };
+    assert_eq!(value, Decimal::from(42));
+}
 
 #[test]
 fn u16_to_rounding_increment_sunny_day() {

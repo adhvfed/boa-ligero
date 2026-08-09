@@ -1,9 +1,10 @@
 use std::cell::Cell;
 
 use boa_gc::{Finalize, Trace, custom_trace};
-use fixed_decimal::{Decimal, FloatPrecision, SignDisplay};
+use fixed_decimal::{Decimal, FloatPrecision, Sign, SignDisplay};
 use icu_decimal::{
     CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences, FormattedDecimal,
+    FormattedSign,
     options::{DecimalFormatterOptions, GroupingStrategy},
     preferences::NumberingSystem,
     provider::{DecimalDigitsV1, DecimalSymbolsV1},
@@ -49,6 +50,7 @@ mod tests;
 pub(crate) enum FormattedNumber<'a, T> {
     Decimal(FormattedDecimal<'a>),
     Compact(T),
+    Special(FormattedSign<'a, &'static str>),
 }
 
 impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
@@ -56,6 +58,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             FormattedNumber::Decimal(d) => d.write_to(sink),
             FormattedNumber::Compact(c) => c.write_to(sink),
+            FormattedNumber::Special(s) => s.write_to(sink),
         }
     }
 
@@ -63,6 +66,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             FormattedNumber::Decimal(d) => d.write_to_parts(sink),
             FormattedNumber::Compact(c) => c.write_to_parts(sink),
+            FormattedNumber::Special(s) => s.write_to_parts(sink),
         }
     }
 
@@ -70,6 +74,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             FormattedNumber::Decimal(d) => d.writeable_length_hint(),
             FormattedNumber::Compact(c) => c.writeable_length_hint(),
+            FormattedNumber::Special(s) => s.writeable_length_hint(),
         }
     }
 
@@ -77,6 +82,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             FormattedNumber::Decimal(d) => d.writeable_borrow(),
             FormattedNumber::Compact(c) => c.writeable_borrow(),
+            FormattedNumber::Special(s) => s.writeable_borrow(),
         }
     }
 
@@ -84,6 +90,29 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             FormattedNumber::Decimal(d) => d.write_to_string(),
             FormattedNumber::Compact(c) => c.write_to_string(),
+            FormattedNumber::Special(s) => s.write_to_string(),
+        }
+    }
+}
+
+/// A value in the domain of ECMA-402's `Intl Mathematical Value` specification type.
+#[derive(Debug)]
+pub(crate) enum IntlMathematicalValue {
+    Finite(Decimal),
+    Infinity { negative: bool },
+    NaN,
+}
+
+impl IntlMathematicalValue {
+    pub(crate) fn try_from_f64(number: f64) -> Result<Self, fixed_decimal::LimitError> {
+        if number.is_nan() {
+            Ok(Self::NaN)
+        } else if number.is_infinite() {
+            Ok(Self::Infinity {
+                negative: number.is_sign_negative(),
+            })
+        } else {
+            Decimal::try_from_f64(number, FloatPrecision::RoundTrip).map(Self::Finite)
         }
     }
 }
@@ -95,17 +124,50 @@ enum Formatter {
     Engineering(DecimalFormatter),
     Compact {
         inner: CompactDecimalFormatter,
+        sign_formatter: Box<DecimalFormatter>,
         display: CompactDisplay,
     },
 }
 
 impl Formatter {
-    fn format<'l>(&'l self, decimal: &'l Decimal) -> FormattedNumber<'l, impl Writeable> {
-        match self {
-            Formatter::Standard(fmt) | Formatter::Scientific(fmt) | Formatter::Engineering(fmt) => {
-                FormattedNumber::Decimal(fmt.format(decimal))
+    fn format<'l>(
+        &'l self,
+        value: &'l IntlMathematicalValue,
+        sign_display: SignDisplay,
+    ) -> FormattedNumber<'l, impl Writeable> {
+        match value {
+            IntlMathematicalValue::Finite(decimal) => match self {
+                Formatter::Standard(fmt)
+                | Formatter::Scientific(fmt)
+                | Formatter::Engineering(fmt) => FormattedNumber::Decimal(fmt.format(decimal)),
+                Formatter::Compact { inner, .. } => FormattedNumber::Compact(inner.format(decimal)),
+            },
+            IntlMathematicalValue::Infinity { negative } => {
+                let sign = match (negative, sign_display) {
+                    (_, SignDisplay::Never) => Sign::None,
+                    (true, _) => Sign::Negative,
+                    (false, SignDisplay::Always | SignDisplay::ExceptZero) => Sign::Positive,
+                    (false, _) => Sign::None,
+                };
+                FormattedNumber::Special(self.sign_formatter().format_sign(sign, "∞"))
             }
-            Formatter::Compact { inner, .. } => FormattedNumber::Compact(inner.format(decimal)),
+            IntlMathematicalValue::NaN => {
+                let sign = if sign_display == SignDisplay::Always {
+                    Sign::Positive
+                } else {
+                    Sign::None
+                };
+                FormattedNumber::Special(self.sign_formatter().format_sign(sign, "NaN"))
+            }
+        }
+    }
+
+    fn sign_formatter(&self) -> &DecimalFormatter {
+        match self {
+            Self::Standard(formatter)
+            | Self::Scientific(formatter)
+            | Self::Engineering(formatter) => formatter,
+            Self::Compact { sign_formatter, .. } => sign_formatter,
         }
     }
 }
@@ -143,15 +205,17 @@ impl NumberFormat {
     /// [parts]: https://tc39.es/ecma402/#sec-formatnumbertoparts
     pub(crate) fn format<'l>(
         &'l self,
-        value: &'l mut Decimal,
+        value: &'l mut IntlMathematicalValue,
     ) -> FormattedNumber<'l, impl Writeable> {
         // TODO: Missing support from ICU4X for Percent/Currency/Unit formatting.
         // TODO: Missing support from ICU4X for Scientific/Engineering notation.
 
-        self.digit_options.format_fixed_decimal(value);
-        value.apply_sign_display(self.sign_display);
+        if let IntlMathematicalValue::Finite(value) = value {
+            self.digit_options.format_fixed_decimal(value);
+            value.apply_sign_display(self.sign_display);
+        }
 
-        self.formatter.format(value)
+        self.formatter.format(value, self.sign_display)
     }
 }
 
@@ -519,6 +583,14 @@ impl NumberFormat {
                         options.into(),
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                    sign_formatter: Box::new(
+                        DecimalFormatter::try_new_with_buffer_provider(
+                            &inspector,
+                            (&locale).into(),
+                            options,
+                        )
+                        .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                    ),
                     display: CompactDisplay::Long,
                 },
                 (NotationKind::Compact, CompactDisplay::Short) => Formatter::Compact {
@@ -528,6 +600,14 @@ impl NumberFormat {
                         options.into(),
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                    sign_formatter: Box::new(
+                        DecimalFormatter::try_new_with_buffer_provider(
+                            &inspector,
+                            (&locale).into(),
+                            options,
+                        )
+                        .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                    ),
                     display: CompactDisplay::Short,
                 },
             };
@@ -878,15 +958,14 @@ fn unwrap_number_format(nf: &JsValue, context: &mut Context) -> JsResult<JsObjec
 pub(crate) fn to_intl_mathematical_value(
     value: &JsValue,
     context: &mut Context,
-) -> JsResult<Decimal> {
+) -> JsResult<IntlMathematicalValue> {
     // 1. Let primValue be ? ToPrimitive(value, number).
     let prim_value = value.to_primitive(context, PreferredType::Number)?;
 
-    // TODO: Add support in `Decimal` for infinity and NaN, which
-    // should remove the returned errors.
     match prim_value.variant() {
         // 2. If Type(primValue) is BigInt, return ℝ(primValue).
         JsVariant::BigInt(bi) => Decimal::try_from_str(&bi.to_string())
+            .map(IntlMathematicalValue::Finite)
             .map_err(|err| JsNativeError::range().with_message(err.to_string()).into()),
         // 3. If Type(primValue) is String, then
         //     a. Let str be primValue.
@@ -901,11 +980,7 @@ pub(crate) fn to_intl_mathematical_value(
             //     c. If rounded is +∞𝔽, return positive-infinity.
             //     d. If rounded is +0𝔽 and intlMV < 0, return negative-zero.
             //     e. If rounded is +0𝔽, return 0.
-            js_string_to_fixed_decimal(&s).ok_or_else(|| {
-                JsNativeError::syntax()
-                    .with_message("could not parse the provided string")
-                    .into()
-            })
+            Ok(js_string_to_intl_mathematical_value(&s))
         }
         // 4. Else,
         _ => {
@@ -914,29 +989,30 @@ pub(crate) fn to_intl_mathematical_value(
             // c. Let str be Number::toString(x, 10).
             let x = prim_value.to_number(context)?;
 
-            Decimal::try_from_f64(x, FloatPrecision::RoundTrip)
+            IntlMathematicalValue::try_from_f64(x)
                 .map_err(|err| JsNativeError::range().with_message(err.to_string()).into())
         }
     }
 }
 
-/// Abstract operation [`StringToNumber ( str )`][spec], but specialized for the conversion
-/// to a `FixedDecimal`.
+/// Abstract operation [`StringToNumber ( str )`][spec], specialized for conversion to an
+/// [`IntlMathematicalValue`].
 ///
 /// [spec]: https://tc39.es/ecma262/#sec-stringtonumber
-// TODO: Introduce `Infinity` and `NaN` to `Decimal` to make this operation
-// infallible.
-pub(crate) fn js_string_to_fixed_decimal(string: &JsString) -> Option<Decimal> {
+pub(crate) fn js_string_to_intl_mathematical_value(string: &JsString) -> IntlMathematicalValue {
     // 1. Let text be ! StringToCodePoints(str).
     // 2. Let literal be ParseText(text, StringNumericLiteral).
     let Ok(string) = string.trim().to_std_string() else {
         // 3. If literal is a List of errors, return NaN.
-        return None;
+        return IntlMathematicalValue::NaN;
     };
     // 4. Return StringNumericValue of literal.
     match string.as_str() {
-        "" => return Some(Decimal::from(0)),
-        "-Infinity" | "Infinity" | "+Infinity" => return None,
+        "" => return IntlMathematicalValue::Finite(Decimal::from(0)),
+        "-Infinity" => return IntlMathematicalValue::Infinity { negative: true },
+        "Infinity" | "+Infinity" => {
+            return IntlMathematicalValue::Infinity { negative: false };
+        }
         _ => {}
     }
 
@@ -947,7 +1023,7 @@ pub(crate) fn js_string_to_fixed_decimal(string: &JsString) -> Option<Decimal> {
         (Some(b'0'), Some(b'x' | b'X')) => Some(16),
         // Make sure that no further variants of "infinity" are parsed.
         (Some(b'i' | b'I'), _) => {
-            return None;
+            return IntlMathematicalValue::NaN;
         }
         _ => None,
     };
@@ -956,14 +1032,16 @@ pub(crate) fn js_string_to_fixed_decimal(string: &JsString) -> Option<Decimal> {
     let s = if let Some(base) = base {
         let string = &string[2..];
         if string.is_empty() {
-            return None;
+            return IntlMathematicalValue::NaN;
         }
-        let int = BigInt::from_str_radix(string, base).ok()?;
+        let Ok(int) = BigInt::from_str_radix(string, base) else {
+            return IntlMathematicalValue::NaN;
+        };
 
         int.to_string()
     } else {
         string
     };
 
-    Decimal::try_from_str(&s).ok()
+    Decimal::try_from_str(&s).map_or(IntlMathematicalValue::NaN, IntlMathematicalValue::Finite)
 }

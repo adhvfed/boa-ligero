@@ -313,21 +313,16 @@ impl Number {
 
         #[cfg(feature = "intl")]
         {
-            use fixed_decimal::{Decimal, FloatPrecision};
             use writeable::Writeable;
 
-            use crate::builtins::intl::NumberFormat;
-
-            if !x.is_finite() {
-                return Ok(JsValue::new(js_string!(x)));
-            }
+            use crate::builtins::intl::{IntlMathematicalValue, NumberFormat};
 
             let locales = args.get_or_undefined(0).clone();
             let options = args.get_or_undefined(1).clone();
 
             // 2. Let numberFormat be ? Construct(%Intl.NumberFormat%, « locales, options »).
             let number_format = NumberFormat::new(&locales, &options, context)?;
-            let mut x = Decimal::try_from_f64(x, FloatPrecision::RoundTrip)
+            let mut x = IntlMathematicalValue::try_from_f64(x)
                 .map_err(|err| JsNativeError::range().with_message(err.to_string()))?;
 
             // 3. Return FormatNumeric(numberFormat, ! ToIntlMathematicalValue(x)).
