@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use boa_icu_data::BoaNumberSpecialSymbolsV1;
 use icu_decimal::provider::DecimalDigitsV1;
 use icu_provider::{
     DataError, DataErrorKind, DataIdentifierCow, DataMarker, DataMarkerAttributes, DataMarkerInfo,
@@ -11,6 +12,8 @@ use icu_provider::{
     export::{ExportMarker, ExportableProvider},
 };
 use icu_provider_source::SourceDataProvider;
+
+use crate::cldr::SupplementalNumberData;
 
 /// ECMA-402 simple digit mappings not guaranteed to appear in ICU4X's locale-derived inventory.
 ///
@@ -112,11 +115,20 @@ fn simple_digits(identifier: &str) -> Option<[char; 10]> {
     }))
 }
 
-pub(crate) struct Ecma402SourceProvider<'a>(&'a SourceDataProvider);
+pub(crate) struct Ecma402SourceProvider<'a> {
+    inner: &'a SourceDataProvider,
+    supplemental_numbers: &'a SupplementalNumberData,
+}
 
 impl<'a> Ecma402SourceProvider<'a> {
-    pub(crate) const fn new(inner: &'a SourceDataProvider) -> Self {
-        Self(inner)
+    pub(crate) const fn new(
+        inner: &'a SourceDataProvider,
+        supplemental_numbers: &'a SupplementalNumberData,
+    ) -> Self {
+        Self {
+            inner,
+            supplemental_numbers,
+        }
     }
 }
 
@@ -126,7 +138,24 @@ impl DynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
         marker: DataMarkerInfo,
         request: DataRequest<'_>,
     ) -> Result<DataResponse<ExportMarker>, DataError> {
-        match self.0.load_data(marker, request) {
+        if marker.id == BoaNumberSpecialSymbolsV1::INFO.id {
+            let Some(symbols) = self
+                .supplemental_numbers
+                .special_symbols()
+                .get(request.id.locale)
+            else {
+                return Err(DataErrorKind::IdentifierNotFound.with_req(marker, request));
+            };
+            let payload = DataPayload::<BoaNumberSpecialSymbolsV1>::from_owned(symbols.clone());
+            return Ok(DataResponse {
+                metadata: DataResponseMetadata::default(),
+                payload: <ExportMarker as UpcastDataPayload<BoaNumberSpecialSymbolsV1>>::upcast(
+                    payload,
+                ),
+            });
+        }
+
+        match self.inner.load_data(marker, request) {
             Err(error)
                 if error.kind == DataErrorKind::IdentifierNotFound
                     && marker.id == DecimalDigitsV1::INFO.id =>
@@ -150,7 +179,17 @@ impl IterableDynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
         &self,
         marker: DataMarkerInfo,
     ) -> Result<BTreeSet<DataIdentifierCow<'_>>, DataError> {
-        let mut identifiers = self.0.iter_ids_for_marker(marker)?;
+        if marker.id == BoaNumberSpecialSymbolsV1::INFO.id {
+            return Ok(self
+                .supplemental_numbers
+                .special_symbols()
+                .keys()
+                .copied()
+                .map(DataIdentifierCow::from_locale)
+                .collect());
+        }
+
+        let mut identifiers = self.inner.iter_ids_for_marker(marker)?;
         if marker.id == DecimalDigitsV1::INFO.id {
             identifiers.extend(
                 SIMPLE_DIGIT_ZEROES
@@ -172,7 +211,9 @@ impl IterableDynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
 
 impl ExportableProvider for Ecma402SourceProvider<'_> {
     fn supported_markers(&self) -> BTreeSet<DataMarkerInfo> {
-        self.0.supported_markers()
+        let mut markers = self.inner.supported_markers();
+        markers.insert(BoaNumberSpecialSymbolsV1::INFO);
+        markers
     }
 }
 
@@ -183,7 +224,8 @@ mod tests {
     #[test]
     fn adds_explicit_decimal_digits() {
         let source = SourceDataProvider::new();
-        let provider = Ecma402SourceProvider::new(&source);
+        let supplemental = SupplementalNumberData::load().unwrap();
+        let provider = Ecma402SourceProvider::new(&source, &supplemental);
         let identifiers = provider.iter_ids_for_marker(DecimalDigitsV1::INFO).unwrap();
         assert!(
             identifiers

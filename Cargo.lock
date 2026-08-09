@@ -408,6 +408,7 @@ dependencies = [
  "bitflags 2.13.1",
  "boa_ast",
  "boa_gc",
+ "boa_icu_data",
  "boa_icu_provider",
  "boa_interner",
  "boa_macros",
@@ -522,9 +523,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "boa_icu_data"
+version = "1.0.0-dev"
+dependencies = [
+ "databake",
+ "icu_provider",
+ "serde",
+ "yoke",
+ "zerofrom",
+]
+
+[[package]]
 name = "boa_icu_provider"
 version = "1.0.0-dev"
 dependencies = [
+ "boa_icu_data",
  "icu_casemap",
  "icu_collator",
  "icu_datetime",
@@ -1758,6 +1771,7 @@ dependencies = [
 name = "gen-icu4x-data"
 version = "1.0.0-dev"
 dependencies = [
+ "boa_icu_data",
  "icu_casemap",
  "icu_collator",
  "icu_datetime",
@@ -1773,7 +1787,11 @@ dependencies = [
  "icu_segmenter",
  "icu_time",
  "log",
+ "serde",
+ "serde_json",
  "simple_logger",
+ "ureq",
+ "zip",
 ]
 
 [[package]]

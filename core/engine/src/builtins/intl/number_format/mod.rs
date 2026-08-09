@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use boa_gc::{Finalize, Trace, custom_trace};
+use boa_icu_data::{BoaNumberSpecialSymbolsV1, NumberSpecialSymbols};
 use fixed_decimal::{Decimal, FloatPrecision, Sign, SignDisplay};
 use icu_decimal::{
     CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences, FormattedDecimal,
@@ -17,8 +18,8 @@ use icu_experimental::dimension::provider::{
 use icu_locale::{Locale, extensions::unicode::Value};
 use icu_plurals::PluralOperands;
 use icu_provider::{
-    DataMarker, DataMarkerAttributes, DataPayload, DataProvider, DynamicDataProvider,
-    buf::BufferMarker,
+    DataErrorKind, DataMarker, DataMarkerAttributes, DataPayload, DataProvider,
+    DynamicDataProvider, buf::BufferMarker,
 };
 use num_bigint::BigInt;
 use num_traits::Num;
@@ -68,30 +69,24 @@ enum FormattedNumeric<'a, T> {
     Decimal(FormattedDecimal<'a>),
     Scientific(FormattedScientific<'a>),
     Compact(T),
-    Special(FormattedSign<'a, SpecialValue>),
+    Special(FormattedSign<'a, SpecialValue<'a>>),
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SpecialValue {
-    Infinity,
-    NaN,
+struct SpecialValue<'a> {
+    value: &'a str,
+    part: &'static str,
 }
 
-impl Writeable for SpecialValue {
+impl Writeable for SpecialValue<'_> {
     fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
-        sink.write_str(match self {
-            Self::Infinity => "∞",
-            Self::NaN => "NaN",
-        })
+        sink.write_str(self.value)
     }
 
     fn write_to_parts<S: writeable::PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
         let part = writeable::Part {
             category: "number",
-            value: match self {
-                Self::Infinity => "infinity",
-                Self::NaN => "nan",
-            },
+            value: self.part,
         };
         sink.with_part(part, |sink| self.write_to(sink))
     }
@@ -238,6 +233,7 @@ impl Formatter {
     fn format<'l>(
         &'l self,
         value: &'l IntlMathematicalValue,
+        special_symbols: Option<&'l NumberSpecialSymbols<'l>>,
         sign_display: SignDisplay,
         exponent: i16,
     ) -> FormattedNumeric<'l, impl Writeable> {
@@ -259,15 +255,21 @@ impl Formatter {
             },
             IntlMathematicalValue::Infinity { .. } => {
                 let sign = special_value_sign(value, sign_display);
-                FormattedNumeric::Special(
-                    self.sign_formatter()
-                        .format_sign(sign, SpecialValue::Infinity),
-                )
+                let value = special_symbols.map_or("∞", |symbols| &*symbols.infinity);
+                FormattedNumeric::Special(self.sign_formatter().format_sign(
+                    sign,
+                    SpecialValue {
+                        value,
+                        part: "infinity",
+                    },
+                ))
             }
             IntlMathematicalValue::NaN => {
                 let sign = special_value_sign(value, sign_display);
+                let value = special_symbols.map_or("NaN", |symbols| &*symbols.nan);
                 FormattedNumeric::Special(
-                    self.sign_formatter().format_sign(sign, SpecialValue::NaN),
+                    self.sign_formatter()
+                        .format_sign(sign, SpecialValue { value, part: "nan" }),
                 )
             }
         }
@@ -304,6 +306,7 @@ pub(crate) struct NumberFormat {
     locale: Locale,
     formatter: Formatter,
     style_data: StyleData,
+    special_symbols: Option<DataPayload<BoaNumberSpecialSymbolsV1>>,
     numbering_system: NumberingSystem,
     unit_options: UnitFormatOptions,
     digit_options: DigitFormatOptions,
@@ -411,6 +414,7 @@ impl NumberFormat {
 
         let number = self.formatter.format(
             value,
+            self.special_symbols.as_ref().map(DataPayload::get),
             if owns_sign {
                 SignDisplay::Never
             } else {
@@ -777,6 +781,21 @@ impl NumberFormat {
             id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
             ..icu_provider::DataRequest::default()
         };
+        let special_symbols = match context.intl_provider().load(request) {
+            Ok(response) => {
+                let response: icu_provider::DataResponse<BoaNumberSpecialSymbolsV1> = response;
+                Some(response.payload)
+            }
+            Err(error)
+                if matches!(
+                    error.kind,
+                    DataErrorKind::MarkerNotFound | DataErrorKind::IdentifierNotFound
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(js_error!(TypeError: "{}", error.to_string())),
+        };
         let style_data = match unit_options.style() {
             Style::Percent => {
                 let response: icu_provider::DataResponse<PercentEssentialsV1> = context
@@ -919,6 +938,7 @@ impl NumberFormat {
             numbering_system,
             formatter,
             style_data,
+            special_symbols,
             unit_options,
             digit_options,
             use_grouping,

@@ -250,6 +250,27 @@ fn percent_style_preserves_structured_parts() {
 
 #[cfg(feature = "intl_bundled")]
 #[test]
+fn special_values_use_localized_symbols_for_every_notation() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"
+                JSON.stringify([
+                    new Intl.NumberFormat("zh-TW").format(NaN),
+                    new Intl.NumberFormat("zh-TW", { notation: "scientific" }).format(NaN),
+                    new Intl.NumberFormat("zh-TW", { notation: "compact" }).format(NaN),
+                ])
+            "#,
+            js_string!(r#"["非數值","非數值","非數值"]"#),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("zh-TW").formatToParts(NaN))"#,
+            js_string!(r#"[{"type":"nan","value":"非數值"}]"#),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
 fn unit_style_uses_localized_patterns_and_plural_forms() {
     run_test_actions([
         TestAction::assert_eq(
@@ -333,7 +354,12 @@ fn compound_units_fall_back_to_locale_composition() {
 #[test]
 fn special_number_parts_are_tagged() {
     let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);
-    SpecialValue::Infinity.write_to_parts(&mut parts).unwrap();
+    SpecialValue {
+        value: "∞",
+        part: "infinity",
+    }
+    .write_to_parts(&mut parts)
+    .unwrap();
     assert_eq!(
         parts.parts,
         [FormattedPart {

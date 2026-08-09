@@ -135,6 +135,7 @@ static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBuffe
             provider_from_icu_crate!(icu_normalizer),
             provider_from_icu_crate!(icu_plurals),
             provider_from_icu_crate!(icu_segmenter),
+            provider_from_icu_crate!(boa_icu_data, boa_icu_data::MARKERS),
         ]);
         let fallbacker = LocaleFallbacker::try_new_with_buffer_provider(&provider)
             .expect("The statically compiled data file should be valid.");
@@ -180,6 +181,7 @@ pub fn buffer() -> impl DynamicDryDataProvider<BufferMarker> {
 
 #[cfg(test)]
 mod tests {
+    use boa_icu_data::BoaNumberSpecialSymbolsV1;
     use icu_decimal::provider::DecimalDigitsV1;
     use icu_provider::prelude::*;
 
@@ -200,5 +202,19 @@ mod tests {
                     panic!("missing digits for numbering system {numbering_system}: {error}")
                 });
         }
+    }
+
+    #[test]
+    fn bundled_provider_includes_supplemental_number_symbols() {
+        let provider = super::buffer();
+        let locale = "zh-Hant".parse().unwrap();
+        let response: DataResponse<BoaNumberSpecialSymbolsV1> = provider
+            .as_deserializing()
+            .load(DataRequest {
+                id: DataIdentifierBorrowed::for_locale(&locale),
+                ..DataRequest::default()
+            })
+            .unwrap();
+        assert_eq!(response.payload.get().nan, "非數值");
     }
 }

@@ -1,0 +1,29 @@
+[package]
+name = "boa_icu_data"
+description = "Supplemental ICU4X data schemas for Boa's ECMA-402 implementation."
+keywords = ["javascript", "cldr", "unicode"]
+categories = ["internationalization", "no-std"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+databake = { workspace = true, optional = true, features = ["derive"] }
+icu_provider.workspace = true
+serde = { workspace = true, optional = true, features = ["derive"] }
+yoke = { workspace = true, features = ["derive"] }
+zerofrom = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+datagen = ["serde", "dep:databake", "icu_provider/export"]
+serde = ["dep:serde", "icu_provider/serde"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

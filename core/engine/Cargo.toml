@@ -54,6 +54,7 @@ intl_bundled = ["intl", "dep:boa_icu_provider"]
 # Prefer this over `intl_bundled` if you want to reduce the size of the final binary
 # by providing a smaller ICU4X data provider.
 intl = [
+    "dep:boa_icu_data",
     "boa_gc/icu",
     "icu_normalizer/serde",
     "dep:icu_locale",
@@ -171,6 +172,7 @@ oneshot = { workspace = true, features = ["async"] }
 async-channel.workspace = true
 
 # intl deps
+boa_icu_data = { workspace = true, features = ["serde"], optional = true }
 boa_icu_provider = { workspace = true, features = ["std"], optional = true }
 sys-locale = { workspace = true, optional = true }
 icu_provider = { workspace = true, optional = true }

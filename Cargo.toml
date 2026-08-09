@@ -41,6 +41,7 @@ boa_ast = { version = "~1.0.0-dev", path = "core/ast" }
 boa_engine = { version = "~1.0.0-dev", path = "core/engine", default-features = false }
 boa_gc = { version = "~1.0.0-dev", path = "core/gc" }
 boa_icu_provider = { version = "~1.0.0-dev", path = "core/icu_provider" }
+boa_icu_data = { version = "~1.0.0-dev", path = "core/icu_data" }
 boa_interner = { version = "~1.0.0-dev", path = "core/interner" }
 boa_macros = { version = "~1.0.0-dev", path = "core/macros" }
 boa_parser = { version = "~1.0.0-dev", path = "core/parser" }
@@ -178,6 +179,9 @@ icu_pattern = { version = "~0.4.2", default-features = false }
 writeable = "0.6.2"
 tinystr = "0.8.2"
 yoke = "0.8.3"
+databake = "0.2.1"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+ureq = "3.3.0"
 zerofrom = "0.1.8"
 fixed_decimal = "0.7.2"
 

@@ -10,6 +10,7 @@ license.workspace = true
 description.workspace = true
 
 [dependencies]
+boa_icu_data = { workspace = true, features = ["datagen"] }
 icu_provider_export = { workspace = true, features = [
     "blob_exporter",
     "rayon",
@@ -22,6 +23,10 @@ icu_provider_source = { workspace = true, features = [
 icu_provider.workspace = true
 log.workspace = true
 simple_logger.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+ureq.workspace = true
+zip.workspace = true
 
 # Components
 

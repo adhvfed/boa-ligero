@@ -7,6 +7,7 @@ use icu_provider_export::blob_exporter::BlobExporter;
 use icu_provider_export::prelude::*;
 use icu_provider_source::{CoverageLevel, SourceDataProvider};
 
+mod cldr;
 mod source;
 use source::Ecma402SourceProvider;
 
@@ -98,6 +99,7 @@ const SERVICES: &[(&str, &[DataMarkerInfo])] = &[
     ("icu_normalizer", icu_normalizer::provider::MARKERS),
     ("icu_plurals", icu_plurals::provider::MARKERS),
     ("icu_segmenter", icu_segmenter::provider::MARKERS),
+    ("boa_icu_data", boa_icu_data::MARKERS),
 ];
 
 fn export_for_service(
@@ -154,7 +156,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         is_sanctioned_unit_attribute(attributes.as_str())
     })
     .with_recommended_segmenter_models();
-    let provider = Ecma402SourceProvider::new(&source);
+    let supplemental_number_data = cldr::SupplementalNumberData::load()?;
+    let provider = Ecma402SourceProvider::new(&source, &supplemental_number_data);
     for (service, keys) in SERVICES {
         export_for_service(service, keys, &provider, driver.clone())?;
     }
