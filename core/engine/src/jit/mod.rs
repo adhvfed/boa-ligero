@@ -217,7 +217,8 @@ pub struct JitResourceCounters {
     pub oversized_functions: u64,
     /// Exact function variants that hit an already-retained terminal failure.
     pub terminal_failure_hits: u64,
-    /// Legacy call-target observations dropped after their bounded map filled.
+    /// Reserved schema-10 counter from the removed last-target feedback map.
+    /// Generic ordinary-call continuations do not update it.
     pub call_target_capacity: u64,
     /// Unseen artifacts suppressed after the aggregate code-payload threshold.
     pub code_bytes: u64,
@@ -454,8 +455,8 @@ pub enum JitAdmissionReason {
     AllowedStraightLineWork,
     /// Static native eligibility rejected the body before code generation.
     DeniedNativeIneligible,
-    /// The body contains a call, but compiled callers cannot yet resume after
-    /// the scheduler transition.
+    /// Legacy schema value retained for consumers of older diagnostic records.
+    /// Current ordinary-call continuations no longer emit this reason.
     DeniedCallBoundary,
     /// A fully native straight-line body is below the measured work floor.
     DeniedStraightLineTooSmall,
@@ -516,7 +517,7 @@ pub enum JitExitReason {
     DenseElement = 4,
     /// Named-property shape, slot, or representation changed.
     NamedProperty = 5,
-    /// The ordinary call target did not match its monomorphic feedback.
+    /// The call target was not eligible for the ordinary-call continuation.
     CallTarget = 6,
     /// An integer result left the native `i32` representation.
     IntegerOverflow = 7,
@@ -1232,7 +1233,6 @@ const MAX_LOOP_CODE_BYTES: usize = 1024 * 1024;
 const MAX_LOOP_COMPILE_NS: u128 = 10_000_000;
 const MAX_FUNCTION_ENTRY_STATES: usize = 192;
 const MAX_FUNCTION_BYTECODE_INSTRUCTIONS: usize = 1_024;
-const MAX_CALL_TARGET_SITES: usize = 1_024;
 const MAX_RETAINED_CODE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CUMULATIVE_COMPILE_NS: u128 = 100_000_000;
 const MAX_COMPILE_ATTEMPT_NS: u128 = 10_000_000;
@@ -1411,14 +1411,8 @@ pub struct JitBackend {
     loop_plans: FxHashMap<JitCacheKey, native::LoopRegionPlan>,
     loop_code_bytes: usize,
     compilation_breakers: JitCompilationBreakers,
-    /// The last ordinary-function target observed at each bytecode call site.
-    /// Native call lowering specializes against this identity and deopts when
-    /// a later value is a different function, including another ordinary
-    /// function with the same calling convention.
-    call_targets: FxHashMap<(u64, u32), u64>,
     thresholds: JitThresholds,
     admission_min_straight_line_instructions: u32,
-    admission_allow_call_boundaries: bool,
     stats: JitStats,
     diagnostics: Option<JitDiagnosticState>,
     #[cfg(test)]
@@ -1473,7 +1467,7 @@ impl Drop for JitBackend {
         //    diagnostic methods; none returns a code address, and `JitStats`
         //    and `JitDiagnosticSnapshot` are counters and `(pc, kind, reason)`
         //    exit records. Nothing durable — `CodeBlock` admission state,
-        //    `call_targets` (bytecode `debug_id`s, not addresses),
+        //    diagnostic call observations (bytecode `debug_id`s, not addresses),
         //    `vm.jit_pending`, `vm.jit_exit_pending` — holds a native address.
         //
         // 2. Compiled code contains no cross-module or self-referential code
@@ -1546,10 +1540,8 @@ impl JitBackend {
             loop_plans: FxHashMap::default(),
             loop_code_bytes: 0,
             compilation_breakers: JitCompilationBreakers::default(),
-            call_targets: FxHashMap::default(),
             thresholds: JitThresholds::default(),
             admission_min_straight_line_instructions: Self::MIN_STRAIGHT_LINE_INSTRUCTIONS,
-            admission_allow_call_boundaries: false,
             stats: JitStats::default(),
             diagnostics: None,
             #[cfg(test)]
@@ -2307,10 +2299,6 @@ impl JitBackend {
     #[cfg(test)]
     fn allow_small_native_entries_for_tests(&mut self) {
         self.admission_min_straight_line_instructions = 0;
-        // The semantic call-lowering tests intentionally exercise the existing
-        // scheduler exit even though production admission rejects callers that
-        // cannot yet resume natively after it.
-        self.admission_allow_call_boundaries = true;
     }
 
     /// Record an ordinary function entry for tiering.
@@ -2343,17 +2331,6 @@ impl JitBackend {
 
         let analysis = native::admission_profile(code, self.diagnostics.is_some());
         let (allowed, mut state, reason, profile, rejection) = match analysis {
-            Ok(profile)
-                if profile.call_instructions > 0 && !self.admission_allow_call_boundaries =>
-            {
-                (
-                    false,
-                    JitAdmissionState::Denied,
-                    JitAdmissionReason::DeniedCallBoundary,
-                    profile,
-                    None,
-                )
-            }
             Ok(profile) if profile.backward_branches > 0 => (
                 true,
                 JitAdmissionState::Allowed,
@@ -2637,11 +2614,10 @@ impl JitBackend {
 
     /// Whether the interpreter needs to report call sites to this backend.
     ///
-    /// Production call-target feedback is disabled until compiled callers
-    /// have a continuation ABI. Detailed diagnostics remain independently
-    /// opt-in and bounded.
+    /// Call-site feedback is diagnostics-only and bounded. The generic
+    /// ordinary-call continuation does not speculate on target identity.
     pub(crate) const fn observes_call_sites(&self) -> bool {
-        self.diagnostics.is_some() || self.admission_allow_call_boundaries
+        self.diagnostics.is_some()
     }
 
     /// Whether the interpreter must report storage-read sites to this backend.
@@ -2670,28 +2646,17 @@ impl JitBackend {
         }
     }
 
-    fn record_legacy_call_target(&mut self, key: (u64, u32), target_code_id: u64) {
-        if self.call_targets.contains_key(&key) || self.call_targets.len() < MAX_CALL_TARGET_SITES {
-            self.call_targets.insert(key, target_code_id);
-        } else {
-            self.update_resource_counters(|counters| {
-                counters.call_target_capacity = counters.call_target_capacity.saturating_add(1);
-            });
-        }
-    }
-
     /// Observe one interpreted `Call` without changing production admission.
     ///
-    /// Detailed records are bounded and source-free. The legacy last-target
-    /// feedback remains available only to the existing in-crate native-call
-    /// semantic tests, and only before the caller has attempted its entry.
+    /// Detailed records are bounded and source-free. They measure target
+    /// stability and cached-code availability, but do not steer production
+    /// compilation or continuation eligibility.
     pub(crate) fn observe_call_site(
         &mut self,
         code: &CodeBlock,
         pc: u32,
         context: &Context,
         argument_count: usize,
-        record_legacy_feedback: bool,
     ) {
         if !self.observes_call_sites() {
             return;
@@ -2708,9 +2673,6 @@ impl JitBackend {
         });
 
         let target = if let Some(target_code_id) = ordinary_target {
-            if self.admission_allow_call_boundaries && record_legacy_feedback {
-                self.record_legacy_call_target((code.debug_id, pc), target_code_id);
-            }
             let budgeted = context.instruction_budget_remaining().is_some();
             let cached_native = match self.cache.get(&JitCacheKey::function(
                 target_code_id,
@@ -2731,11 +2693,6 @@ impl JitBackend {
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.record_call_site(code.debug_id, pc, target);
         }
-    }
-
-    /// Return the monomorphic target recorded for a bytecode call site.
-    pub(super) fn call_target(&self, code: &CodeBlock, pc: usize) -> Option<u64> {
-        self.call_targets.get(&(code.debug_id, pc as u32)).copied()
     }
 
     /// Whether this code block has enough observed activity for compilation.
@@ -3556,22 +3513,6 @@ mod tests {
     }
 
     #[test]
-    fn jit_legacy_call_targets_are_bounded_without_replacing_retained_sites() {
-        let mut backend = JitBackend::new();
-        for index in 0..MAX_CALL_TARGET_SITES {
-            backend.record_legacy_call_target((index as u64, index as u32), index as u64 + 10);
-        }
-        assert_eq!(backend.call_targets.len(), MAX_CALL_TARGET_SITES);
-
-        backend.record_legacy_call_target((0, 0), 999);
-        backend.record_legacy_call_target((u64::MAX, u32::MAX), 123);
-        assert_eq!(backend.call_targets.len(), MAX_CALL_TARGET_SITES);
-        assert_eq!(backend.call_targets.get(&(0, 0)), Some(&999));
-        assert!(!backend.call_targets.contains_key(&(u64::MAX, u32::MAX)));
-        assert_eq!(backend.stats().resources.call_target_capacity, 1);
-    }
-
-    #[test]
     fn jit_function_and_loop_capacity_reservations_coexist_in_both_fill_orders() {
         fn fill_function_states(backend: &mut JitBackend) {
             let ready = CachedEntry {
@@ -4313,7 +4254,7 @@ mod tests {
         assert!(!backend.admit_function_entry(&tiny_code));
         assert!(backend.admit_function_entry(&loop_code));
         assert!(!backend.admit_function_entry(&unsupported_code));
-        assert!(!backend.admit_function_entry(&call_boundary_code));
+        assert!(backend.admit_function_entry(&call_boundary_code));
 
         let snapshot = backend.diagnostic_snapshot().expect("diagnostics enabled");
         assert_eq!(snapshot.schema_version, JIT_DIAGNOSTIC_SCHEMA_VERSION);
@@ -4342,8 +4283,8 @@ mod tests {
                 && record.supported_prefix_instructions < record.bytecode_instructions
         }));
         assert!(snapshot.admission_records.iter().any(|record| {
-            !record.allowed
-                && record.reason == JitAdmissionReason::DeniedCallBoundary
+            record.allowed
+                && record.reason == JitAdmissionReason::AllowedBackwardBranch
                 && !record.leaf_fast_path
                 && record.blocker.is_none()
                 && record.native_backward_branches > 0
@@ -4353,7 +4294,7 @@ mod tests {
         assert!(!serialized.contains("distinctive_private"));
         assert!(serialized.contains("\"denied_straight_line_too_small\""));
         assert!(serialized.contains("\"denied_native_ineligible\""));
-        assert!(serialized.contains("\"denied_call_boundary\""));
+        assert!(!serialized.contains("\"denied_call_boundary\""));
 
         let mut bounded = JitBackend::new();
         bounded.enable_diagnostics(JitDiagnosticLimits {
@@ -4372,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn context_owned_jit_denies_call_boundary_without_compiling_an_artifact() {
+    fn context_owned_jit_continues_ordinary_call_without_scheduler_exit() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let script = crate::Script::parse(
@@ -4388,17 +4329,18 @@ mod tests {
         assert_eq!(result.as_i32(), Some(55));
 
         let stats = context.jit_stats().expect("JIT was enabled");
-        assert_eq!(stats.compilations, 0, "stats: {stats:?}");
-        assert_eq!(stats.shim_compilations, 0, "stats: {stats:?}");
-        assert_eq!(stats.native_compilations, 0, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
         assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
         let diagnostics = context
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
-        assert!(diagnostics.compile_records.is_empty());
+        assert!(diagnostics.compile_records.iter().any(|record| {
+            record.outcome == JitCompileOutcome::Native && record.native_call_instructions > 0
+        }));
         assert!(diagnostics.admission_records.iter().any(|record| {
-            !record.allowed
-                && record.reason == JitAdmissionReason::DeniedCallBoundary
+            record.allowed
+                && record.reason == JitAdmissionReason::AllowedBackwardBranch
                 && record.native_backward_branches > 0
                 && record.native_call_instructions > 0
         }));
@@ -4406,7 +4348,7 @@ mod tests {
             .call_records
             .iter()
             .find(|record| record.ordinary_calls > 0 && record.same_ordinary_target_calls > 0)
-            .expect("the denied caller's dynamic call site was retained");
+            .expect("the warming caller's dynamic call site was retained");
         assert_eq!(call.calls, call.ordinary_calls + call.non_ordinary_calls);
         assert_eq!(
             call.ordinary_calls,
@@ -4428,7 +4370,7 @@ mod tests {
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; } return total; } function subtract(value) { return value - 1; } function apply(callback, value) { return callback(value); } let answer = 0; for (let index = 0; index < 70; index++) { answer = hot(10); } for (let index = 0; index < 70; index++) { answer = apply(hot, 10); } answer = answer + apply(subtract, 5); answer = answer + apply(Math.max, 5); answer",
+                "function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; } return total; } function subtract(value) { return value - 1; } function apply(callback, value) { return callback(value) & 255; } let answer = 0; for (let index = 0; index < 70; index++) { answer = hot(10); } for (let index = 0; index < 70; index++) { answer = apply(hot, 10); } answer = answer + apply(subtract, 5); answer = answer + apply(Math.max, 5); answer",
             ),
             None,
             &mut context,
@@ -4466,14 +4408,14 @@ mod tests {
         assert!(diagnostics.admission_records.iter().any(|record| {
             record.code_id == call.caller_code_id
                 && !record.allowed
-                && record.reason == JitAdmissionReason::DeniedCallBoundary
+                && record.reason == JitAdmissionReason::DeniedNativeIneligible
         }));
         assert!(
             diagnostics
                 .compile_records
                 .iter()
                 .all(|record| record.code_id != call.caller_code_id),
-            "the denied caller must not install an artifact: {diagnostics:?}"
+            "the ineligible caller must not install an artifact: {diagnostics:?}"
         );
     }
 
@@ -7667,6 +7609,116 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_continues_nested_ordinary_calls() {
+        let mut context = Context::default();
+        enable_jit_without_admission_floor(&mut context);
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function leaf(value) { return value + 1; } function middle(value) { return leaf(value) + 1; } function apply(function_value, value) { return function_value(value); } let answer = 0; for (let i = 0; i < 80; i++) { answer = apply(middle, 40); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(42));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_continues_after_exception_caught_in_callee() {
+        let mut context = Context::default();
+        enable_jit_without_admission_floor(&mut context);
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function guarded(value) { try { throw new Error(\"expected\"); } catch (error) { return error.message === \"expected\" ? value + 1 : 0; } } function apply(function_value, value) { return function_value(value); } let answer = 0; for (let i = 0; i < 80; i++) { answer = apply(guarded, 41); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(42));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_preserves_call_continuation_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                enable_jit_without_admission_floor(&mut context);
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "function add(left, right) { return left + right; } function apply(function_value, left, right) { return function_value(left, right); } let warm = 0; for (let i = 0; i < 80; i++) { warm = apply(add, 20, 22); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+
+        let expected =
+            evaluate_with_instruction_budget(&mut interpreter, "apply(add, 20, 22)", 1_000)
+                .expect("interpreter call");
+        let result = evaluate_with_instruction_budget(&mut context, "apply(add, 20, 22)", 1_000)
+            .expect("native call continuation");
+
+        assert_eq!(result, expected);
+        assert_eq!(result.as_i32(), Some(42));
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "the compiled caller and interpreted callee must each charge their own bytecodes once"
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats.deopts, before.deopts, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+
+        let expected_error =
+            evaluate_with_instruction_budget(&mut interpreter, "apply(add, 20, 22)", 12)
+                .expect_err("the interpreter budget must expire in the call");
+        let error = evaluate_with_instruction_budget(&mut context, "apply(add, 20, 22)", 12)
+            .expect_err("the JIT budget must expire in the call");
+
+        assert_eq!(error, expected_error);
+        assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+        assert_eq!(context.instruction_budget_remaining(), Some(0));
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
+        let exhausted_stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            exhausted_stats.native_entries > stats.native_entries,
+            "stats: {exhausted_stats:?}"
+        );
+    }
+
+    #[test]
     fn context_owned_jit_preserves_recursion_limit() {
         let mut context = Context::default();
         context.enable_jit();
@@ -7789,16 +7841,14 @@ mod tests {
         assert_eq!(result.as_i32(), Some(42));
 
         let stats = context.jit_stats().expect("JIT was enabled");
-        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
-        assert!(stats.native_entries >= 2, "stats: {stats:?}");
-        assert!(stats.scheduler_call_exits > 0, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
         let diagnostics = context
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
-        assert!(diagnostics.exit_records.iter().any(|record| {
-            record.kind == JitDiagnosticExitKind::Call
-                && record.reason == JitExitReason::Scheduler
-                && record.count > 0
+        assert!(diagnostics.exit_records.iter().all(|record| {
+            record.kind != JitDiagnosticExitKind::Call || record.reason != JitExitReason::Scheduler
         }));
     }
 
@@ -7819,12 +7869,12 @@ mod tests {
         assert_eq!(result.as_i32(), Some(3365));
 
         let stats = context.jit_stats().expect("JIT was enabled");
-        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.deopts >= 1, "stats: {stats:?}");
     }
 
     #[test]
-    fn context_owned_jit_deopts_different_ordinary_call_target() {
+    fn context_owned_jit_continues_different_ordinary_call_target() {
         let mut context = Context::default();
         enable_jit_without_admission_floor(&mut context);
         let script = crate::Script::parse(
@@ -7840,8 +7890,51 @@ mod tests {
         assert_eq!(result.as_i32(), Some(3358));
 
         let stats = context.jit_stats().expect("JIT was enabled");
-        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
-        assert!(stats.deopts >= 1, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_continues_boxed_method_load_and_call() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "class Counter { constructor() { this.value = 0; } increment(amount) { this.value = this.value + amount; return this.value; } } function advance(counter, count) { let last = 0; for (let index = 0; index < count; index++) { last = counter.increment(1); } return last; } let counter = new Counter(); let answer = 0; for (let index = 0; index < 80; index++) { answer = advance(counter, 3); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+
+        let result = setup.evaluate(&mut context).expect("evaluate setup");
+        assert_eq!(result.as_i32(), Some(240));
+
+        boa_gc::force_collect();
+
+        let after_gc = crate::Script::parse(
+            crate::Source::from_bytes("advance(counter, 3)"),
+            None,
+            &mut context,
+        )
+        .expect("parse after GC");
+        let result = after_gc.evaluate(&mut context).expect("evaluate after GC");
+        assert_eq!(result.as_i32(), Some(243));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.native_storage.named_guard_hits > 0);
+        assert_eq!(
+            diagnostics.native_storage.named_loads,
+            diagnostics.native_storage.named_guard_hits
+        );
     }
 
     #[test]

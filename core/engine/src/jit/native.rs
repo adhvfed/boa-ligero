@@ -985,6 +985,10 @@ struct RegisterDefinition {
 struct RegisterAnalysis {
     before: Vec<Vec<RegisterKind>>,
     after: Vec<Vec<RegisterKind>>,
+    /// Registers whose current values are used on at least one path after each
+    /// instruction. Safepoints materialize only this set instead of every
+    /// definition the compiler has ever seen.
+    live_after: Vec<BTreeSet<usize>>,
     /// The single register each instruction rewrites, if any. Recorded here so
     /// the definedness bookkeeping in the compiler cannot drift from
     /// `output_definition`.
@@ -1009,7 +1013,7 @@ fn analyze_registers(
     let mut before_ids = Vec::with_capacity(instructions.instructions.len());
     let mut after_ids = Vec::with_capacity(instructions.instructions.len());
     let mut targets = Vec::with_capacity(instructions.instructions.len());
-    let call_pushes = call_push_operands(instructions);
+    let call_boxed_pushes = call_boxed_push_operands(instructions)?;
 
     for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
         before_ids.push(current.clone());
@@ -1018,7 +1022,7 @@ fn analyze_registers(
             let definition = current.get(register).copied()?;
             mark_definition(definition, &mut definitions);
         }
-        if call_pushes.contains(&index)
+        if call_boxed_pushes.contains(&index)
             && let Instruction::PushFromRegister { src } = instruction
         {
             let definition = current.get(usize::from(*src)).copied()?;
@@ -1054,11 +1058,111 @@ fn analyze_registers(
             .collect()
     };
 
+    let live_after = analyze_register_liveness(instructions, register_count, &targets)?;
     Some(RegisterAnalysis {
         before: before_ids.iter().map(|ids| kinds(ids)).collect(),
         after: after_ids.iter().map(|ids| kinds(ids)).collect(),
+        live_after,
         targets,
     })
+}
+
+fn analyze_register_liveness(
+    instructions: &DecodedInstructions,
+    register_count: usize,
+    definitions: &[Option<usize>],
+) -> Option<Vec<BTreeSet<usize>>> {
+    let mut uses = Vec::with_capacity(instructions.instructions.len());
+    let mut successors = Vec::with_capacity(instructions.instructions.len());
+
+    for (index, (_, next_pc, instruction)) in instructions.instructions.iter().enumerate() {
+        let instruction_uses: BTreeSet<usize> = register_uses(instruction).into_iter().collect();
+        if instruction_uses
+            .iter()
+            .any(|register| *register >= register_count)
+        {
+            return None;
+        }
+        uses.push(instruction_uses);
+
+        let mut instruction_successors = Vec::with_capacity(2);
+        if let Some(target_pc) = branch_target(instruction) {
+            instruction_successors.push(*instructions.pc_to_index.get(&target_pc)?);
+        }
+        if fallthrough(instruction) {
+            if let Some(next) = instructions.pc_to_index.get(next_pc) {
+                instruction_successors.push(*next);
+            } else if index + 1 < instructions.instructions.len() {
+                return None;
+            }
+        }
+        instruction_successors.sort_unstable();
+        instruction_successors.dedup();
+        successors.push(instruction_successors);
+    }
+
+    let mut live_before = vec![BTreeSet::new(); instructions.instructions.len()];
+    let mut live_after = vec![BTreeSet::new(); instructions.instructions.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in (0..instructions.instructions.len()).rev() {
+            let mut after = BTreeSet::new();
+            for successor in &successors[index] {
+                after.extend(live_before[*successor].iter().copied());
+            }
+            let mut before = after.clone();
+            if let Some(definition) = definitions.get(index).copied().flatten() {
+                before.remove(&definition);
+            }
+            before.extend(uses[index].iter().copied());
+            if after != live_after[index] || before != live_before[index] {
+                live_after[index] = after;
+                live_before[index] = before;
+                changed = true;
+            }
+        }
+    }
+    Some(live_after)
+}
+
+fn register_uses(instruction: &Instruction) -> Vec<usize> {
+    let register = |value: crate::vm::opcode::RegisterOperand| usize::from(value);
+    match instruction {
+        Instruction::Move { src, .. }
+        | Instruction::Inc { src, .. }
+        | Instruction::PushFromRegister { src }
+        | Instruction::SetAccumulator { src } => vec![register(*src)],
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::JumpIfNotLessThan { lhs, rhs, .. }
+        | Instruction::JumpIfNotLessThanOrEqual { lhs, rhs, .. }
+        | Instruction::JumpIfNotGreaterThan { lhs, rhs, .. }
+        | Instruction::JumpIfNotGreaterThanOrEqual { lhs, rhs, .. }
+        | Instruction::JumpIfNotEqual { lhs, rhs, .. } => {
+            vec![register(*lhs), register(*rhs)]
+        }
+        Instruction::GetLengthProperty { value, .. }
+        | Instruction::GetPropertyByName { value, .. } => vec![register(*value)],
+        Instruction::GetPropertyByNameWithThis {
+            receiver, value, ..
+        } => vec![register(*receiver), register(*value)],
+        Instruction::GetPropertyByValue {
+            receiver,
+            object,
+            key,
+            ..
+        }
+        | Instruction::GetPropertyByValuePush {
+            receiver,
+            object,
+            key,
+            ..
+        } => vec![register(*receiver), register(*object), register(*key)],
+        _ => Vec::new(),
+    }
 }
 
 fn mark_definition(definition: usize, definitions: &mut [RegisterDefinition]) {
@@ -1091,24 +1195,49 @@ fn object_operands(instruction: &Instruction) -> Vec<usize> {
     }
 }
 
-fn call_push_operands(instructions: &DecodedInstructions) -> BTreeSet<usize> {
-    let mut call_pushes = BTreeSet::new();
-    for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
-        if !matches!(instruction, Instruction::Call { .. }) {
+/// Identify the two boxed prologue operands (`this`, function) for each
+/// supported call-convention group.
+///
+/// Arguments may have arbitrary register-only bytecode between their
+/// `PushFromRegister` instructions, so adjacency to `Call` is not a valid role
+/// test. Walk backward to recover all `argument_count + 2` pushes, then mark
+/// only the first two in forward order as boxed. Numeric arguments remain in
+/// the native representation and are boxed by their push helper.
+///
+/// A nested call, stack pop, or control-flow edge before the complete group is
+/// ambiguous without full value-stack dataflow. Reject that shape instead of
+/// guessing which register contains the callable object.
+fn call_boxed_push_operands(instructions: &DecodedInstructions) -> Option<BTreeSet<usize>> {
+    let mut boxed_pushes = BTreeSet::new();
+    for (call_index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
+        let Instruction::Call { argument_count } = instruction else {
             continue;
-        }
-
-        let mut previous = index;
-        while let Some(push_index) = previous.checked_sub(1) {
-            let Instruction::PushFromRegister { .. } = &instructions.instructions[push_index].2
-            else {
-                break;
-            };
-            call_pushes.insert(push_index);
+        };
+        let required_pushes = usize::from(*argument_count).checked_add(2)?;
+        let mut group = Vec::with_capacity(required_pushes);
+        let mut previous = call_index;
+        while group.len() < required_pushes {
+            let push_index = previous.checked_sub(1)?;
+            let candidate = &instructions.instructions[push_index].2;
+            match candidate {
+                Instruction::PushFromRegister { .. } => group.push(push_index),
+                Instruction::Call { .. }
+                | Instruction::PopIntoRegister { .. }
+                | Instruction::Jump { .. }
+                | Instruction::JumpIfNotLessThan { .. }
+                | Instruction::JumpIfNotLessThanOrEqual { .. }
+                | Instruction::JumpIfNotGreaterThan { .. }
+                | Instruction::JumpIfNotGreaterThanOrEqual { .. }
+                | Instruction::JumpIfNotEqual { .. }
+                | Instruction::Return => return None,
+                _ => {}
+            }
             previous = push_index;
         }
+        group.reverse();
+        boxed_pushes.extend(group.into_iter().take(2));
     }
-    call_pushes
+    Some(boxed_pushes)
 }
 
 fn output_definition(
@@ -1223,10 +1352,7 @@ fn branch_target(instruction: &Instruction) -> Option<usize> {
 }
 
 fn fallthrough(instruction: &Instruction) -> bool {
-    !matches!(
-        instruction,
-        Instruction::Jump { .. } | Instruction::Call { .. } | Instruction::Return
-    )
+    !matches!(instruction, Instruction::Jump { .. } | Instruction::Return)
 }
 
 fn has_explicit_edges(instruction: &Instruction) -> bool {
@@ -1238,7 +1364,6 @@ fn has_explicit_edges(instruction: &Instruction) -> bool {
             | Instruction::JumpIfNotGreaterThan { .. }
             | Instruction::JumpIfNotGreaterThanOrEqual { .. }
             | Instruction::JumpIfNotEqual { .. }
-            | Instruction::Call { .. }
             | Instruction::Return
     )
 }
@@ -1265,6 +1390,7 @@ struct Helpers {
     get_argument_f64: Helper,
     dense_i32_guarded: Helper,
     dense_f64_guarded: Helper,
+    named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
     call_ordinary: Helper,
@@ -1594,6 +1720,15 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::F64, types::I32, ptr],
                 types::I64,
             ),
+            named_boxed_guarded: make(
+                if self.instrument_storage {
+                    jit_diagnostic_named_property_boxed_guarded as *const () as usize
+                } else {
+                    jit_named_property_boxed_guarded as *const () as usize
+                },
+                &[ptr, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
             named_i32_guarded: make(
                 if self.instrument_storage {
                     jit_diagnostic_named_property_i32_guarded as *const () as usize
@@ -1614,7 +1749,7 @@ impl<'a> NativeCompiler<'a> {
             ),
             call_ordinary: make(
                 jit_call_ordinary as *const () as usize,
-                &[ptr, types::I32, types::I64],
+                &[ptr, types::I32],
                 types::I64,
             ),
             set_pc: make(
@@ -1974,14 +2109,25 @@ impl<'a> NativeCompiler<'a> {
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let f64_output = (self.mode == NativeMode::F64).then(|| {
+                let boxed = self.defined_register_kind(dst) == RegisterKind::Boxed;
+                let f64_output = (!boxed && self.mode == NativeMode::F64).then(|| {
                     bcx.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         8,
                         3,
                     ))
                 });
-                let guarded_value = if self.mode == NativeMode::F64 {
+                let guarded_value = if boxed {
+                    let helper = bcx
+                        .ins()
+                        .iconst(helpers.ptr, helpers.named_boxed_guarded.address as i64);
+                    let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+                    bcx.ins().call_indirect(
+                        helpers.named_boxed_guarded.signature,
+                        helper,
+                        &[ctx, object, ic_index, dst_value],
+                    )
+                } else if self.mode == NativeMode::F64 {
                     let helper = bcx
                         .ins()
                         .iconst(helpers.ptr, helpers.named_f64_guarded.address as i64);
@@ -2008,7 +2154,7 @@ impl<'a> NativeCompiler<'a> {
                 let guarded_value = bcx.inst_results(guarded_value)[0];
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                if self.mode == NativeMode::F64 {
+                if boxed || self.mode == NativeMode::F64 {
                     bcx.ins().brif(guarded_value, cont, &[], deopt, &[]);
                 } else {
                     let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
@@ -2020,7 +2166,11 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 }
                 bcx.switch_to_block(cont);
-                if self.mode == NativeMode::F64 {
+                if boxed {
+                    // The helper copied a traced `JsValue` directly between
+                    // VM registers. Generic post-instruction bookkeeping
+                    // clears any stale native definedness for this boxed dst.
+                } else if self.mode == NativeMode::F64 {
                     let result = bcx.ins().stack_load(
                         types::F64,
                         f64_output.expect("F64 mode has an output slot"),
@@ -2119,13 +2269,18 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::Call { argument_count } => {
-                let Some(expected_target) = self.backend.call_target(self.code, pc) else {
+                // `function_call` can allocate, invoke host code, trigger GC,
+                // and execute nested frames. Publish dirty primitives that are
+                // live across the call so the VM owns the complete observable
+                // caller state throughout that safepoint. Boxed registers
+                // already live in traced VM slots.
+                if !self.emit_materialize_live_dirty_registers(bcx, ctx, helpers) {
                     return false;
-                };
+                }
                 // The helper leaves the calling-convention stack untouched on
-                // a non-ordinary or different ordinary callee. That makes
-                // this a real guard exit: the interpreter can re-execute the
-                // Call opcode with its normal generic-call semantics.
+                // a non-ordinary callee. That makes this a pre-effect guard
+                // exit: the interpreter can re-execute the Call opcode with
+                // its normal generic-call semantics.
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
                 let helper = bcx
                     .ins()
@@ -2133,11 +2288,10 @@ impl<'a> NativeCompiler<'a> {
                 let argument_count = bcx
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*argument_count)));
-                let expected_target = bcx.ins().iconst(types::I64, expected_target as i64);
                 let status = bcx.ins().call_indirect(
                     helpers.call_ordinary.signature,
                     helper,
-                    &[ctx, argument_count, expected_target],
+                    &[ctx, argument_count],
                 );
                 let status = bcx.inst_results(status)[0];
 
@@ -2151,24 +2305,25 @@ impl<'a> NativeCompiler<'a> {
                 let guard_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
                 let guard_failed = bcx.ins().band(status, guard_mask);
                 let deopt = bcx.create_block();
-                let called = bcx.create_block();
-                bcx.ins().brif(guard_failed, deopt, &[], called, &[]);
+                let transition_check = bcx.create_block();
+                bcx.ins()
+                    .brif(guard_failed, deopt, &[], transition_check, &[]);
 
                 bcx.switch_to_block(deopt);
                 if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::CallTarget) {
                     return false;
                 }
 
-                bcx.switch_to_block(called);
-                let status = bcx.ins().iconst(
-                    types::I64,
-                    JitExit::encode_with_reason(
-                        JitExitKind::Call,
-                        JitExitReason::Scheduler,
-                        next_pc as u32,
-                    ) as i64,
-                );
+                bcx.switch_to_block(transition_check);
+                let has_transition = bcx.ins().icmp_imm(IntCC::NotEqual, status, 0);
+                let transition = bcx.create_block();
+                let called = bcx.create_block();
+                bcx.ins().brif(has_transition, transition, &[], called, &[]);
+
+                bcx.switch_to_block(transition);
                 bcx.ins().return_(&[status]);
+
+                bcx.switch_to_block(called);
             }
             Instruction::Add { dst, lhs, rhs } => {
                 let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
@@ -2695,18 +2850,61 @@ impl<'a> NativeCompiler<'a> {
                 .call_indirect(helpers.refund_instruction_budget.signature, helper, &[ctx]);
         }
 
-        // Dirty values are materialized before returning to the interpreter.
-        //
-        // A dirty register is not necessarily *live natively* on the path that
-        // reached this exit: a definition the path branched around still puts
-        // the register in `self.dirty`, and `try_use_var` cannot tell us so —
-        // it only rejects *undeclared* variables, and silently materializes a
-        // declared-but-undefined variable as zero. Writing that zero back would
-        // replace whatever the VM frame still holds. Each register therefore
-        // carries a companion flag that the same control flow keeps in sync, and
-        // the store helper honours it.
+        if !self.emit_materialize_dirty_registers(bcx, ctx, helpers) {
+            return false;
+        }
+        self.emit_set_pc(bcx, ctx, helpers, pc);
+        let status = bcx.ins().iconst(
+            types::I64,
+            JitExit::encode_with_reason(JitExitKind::Deopt, reason, pc as u32) as i64,
+        );
+        bcx.ins().return_(&[status]);
+        true
+    }
+
+    /// Materialize every primitive definition that may be live on the current
+    /// path into its VM register.
+    ///
+    /// A dirty register is not necessarily defined on every path: a definition
+    /// the path branched around still puts the register in `self.dirty`, and
+    /// `try_use_var` silently materializes a declared-but-undefined variable as
+    /// zero. The companion definedness flag follows the same control flow, so
+    /// the store helper updates the VM only when the native value is real.
+    fn emit_materialize_dirty_registers(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+    ) -> bool {
         let registers: Vec<usize> = self.dirty.iter().copied().collect();
-        for register in registers {
+        self.emit_materialize_registers(bcx, ctx, helpers, &registers)
+    }
+
+    /// Materialize only dirty primitives that remain live after the current
+    /// instruction. This is the safepoint path for a successful call: dead
+    /// temporaries and a destination overwritten by the following pop are not
+    /// observable while the callee runs.
+    fn emit_materialize_live_dirty_registers(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+    ) -> bool {
+        let Some(live_after) = self.analysis.live_after.get(self.current_instruction) else {
+            return false;
+        };
+        let registers: Vec<usize> = self.dirty.intersection(live_after).copied().collect();
+        self.emit_materialize_registers(bcx, ctx, helpers, &registers)
+    }
+
+    fn emit_materialize_registers(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+        registers: &[usize],
+    ) -> bool {
+        for &register in registers {
             let Some(value) = self.use_register(bcx, register) else {
                 return false;
             };
@@ -2726,12 +2924,6 @@ impl<'a> NativeCompiler<'a> {
                 &[ctx, register_value, value, defined],
             );
         }
-        self.emit_set_pc(bcx, ctx, helpers, pc);
-        let status = bcx.ins().iconst(
-            types::I64,
-            JitExit::encode_with_reason(JitExitKind::Deopt, reason, pc as u32) as i64,
-        );
-        bcx.ins().return_(&[status]);
         true
     }
 
@@ -3897,6 +4089,21 @@ fn named_property_value(context: &Context, register: u32, ic_index: u32) -> Opti
     }
 }
 
+extern "C" fn jit_named_property_boxed_guarded(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some(value) = named_property_value(context, register, ic_index) else {
+        return 0;
+    };
+    context.vm.set_register(dst as usize, value);
+    1
+}
+
 extern "C" fn jit_named_property_f64_guarded(
     context: *mut Context,
     register: u32,
@@ -3952,6 +4159,25 @@ extern "C" fn jit_diagnostic_named_property_f64_guarded(
     result
 }
 
+extern "C" fn jit_diagnostic_named_property_boxed_guarded(
+    context: *mut Context,
+    register: u32,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    let result = jit_named_property_boxed_guarded(context, register, ic_index, dst);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.named_guard_misses = counters.named_guard_misses.saturating_add(1);
+    } else {
+        counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
+        counters.named_loads = counters.named_loads.saturating_add(1);
+    }
+    result
+}
+
 extern "C" fn jit_diagnostic_named_property_i32_guarded(
     context: *mut Context,
     register: u32,
@@ -3970,11 +4196,7 @@ extern "C" fn jit_diagnostic_named_property_i32_guarded(
     result
 }
 
-extern "C" fn jit_call_ordinary(
-    context: *mut Context,
-    argument_count: u32,
-    expected_target: u64,
-) -> u64 {
+extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let argument_count = argument_count as usize;
@@ -3989,12 +4211,13 @@ extern "C" fn jit_call_ordinary(
     let Some(ordinary) = object.downcast_ref::<OrdinaryFunction>() else {
         return JIT_GUARD_FAIL_BIT;
     };
-    if !ordinary.codeblock().is_ordinary()
-        || ordinary.codeblock().is_class_constructor()
-        || ordinary.codeblock().debug_id != expected_target
-    {
+    if !ordinary.codeblock().is_ordinary() || ordinary.codeblock().is_class_constructor() {
         return JIT_GUARD_FAIL_BIT;
     }
+
+    let caller_depth = context.vm.frames.len();
+    let caller_code_id = context.vm.frame().code_block.debug_id;
+    let continuation_pc = context.vm.frame().pc;
 
     let call = crate::builtins::function::function_call(
         &object,
@@ -4017,11 +4240,46 @@ extern "C" fn jit_call_ordinary(
     };
 
     match call.resolve(context) {
-        Ok(_) => JitExit::encode_with_reason(
-            JitExitKind::Call,
-            JitExitReason::Scheduler,
-            context.vm.frame().pc,
-        ),
+        Ok(true) => 0,
+        Ok(false) => match context.run_interpreter_until_frame_depth(caller_depth) {
+            std::ops::ControlFlow::Continue(())
+                if context.vm.frames.len() == caller_depth
+                    && context.vm.frame().code_block.debug_id == caller_code_id
+                    && context.vm.frame().pc == continuation_pc =>
+            {
+                0
+            }
+            std::ops::ControlFlow::Continue(())
+                if context.vm.frames.len() < caller_depth && !context.vm.frames.is_empty() =>
+            {
+                JitExit::encode_with_reason(
+                    JitExitKind::Call,
+                    JitExitReason::Scheduler,
+                    context.vm.frame().pc,
+                )
+            }
+            std::ops::ControlFlow::Continue(()) => {
+                let mut error = crate::error::PanicError::new(
+                    "invalid JIT ordinary-call continuation metadata",
+                )
+                .into();
+                context.capture_error_backtrace(&mut error);
+                jit_break(
+                    context,
+                    crate::vm::CompletionRecord::Throw(error),
+                    JitExitKind::Completion,
+                    JitExitReason::Unknown,
+                    continuation_pc,
+                )
+            }
+            std::ops::ControlFlow::Break(record) => jit_break(
+                context,
+                record,
+                JitExitKind::Completion,
+                JitExitReason::Exception,
+                continuation_pc,
+            ),
+        },
         Err(mut error) => {
             context.capture_error_backtrace(&mut error);
             let pc = context.vm.frame().pc;

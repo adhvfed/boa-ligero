@@ -1226,6 +1226,29 @@ impl Context {
         ControlFlow::Continue(())
     }
 
+    /// Run interpreter frames until control returns to `caller_depth`.
+    ///
+    /// Unlike [`Self::run_interpreter_until_frame_change`], this follows
+    /// nested calls instead of yielding when they push another frame. The JIT
+    /// ordinary-call trampoline uses it after `function_call` has installed
+    /// the callee's normal frame. Returns and exceptions still flow through
+    /// the regular opcode handlers and `handle_return`; this method only owns
+    /// the depth boundary at which the compiled caller may resume.
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_interpreter_until_frame_depth(
+        &mut self,
+        caller_depth: usize,
+    ) -> ControlFlow<CompletionRecord> {
+        while self.vm.frames.len() > caller_depth {
+            let frame_depth = self.vm.frames.len();
+            if let ControlFlow::Break(record) = self.run_interpreter_until_frame_change(frame_depth)
+            {
+                return ControlFlow::Break(record);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     #[cfg(feature = "jit")]
     fn run_interpreter_until_frame_change_with_jit(
         &mut self,
@@ -1389,13 +1412,7 @@ impl Context {
 
         match instruction {
             Instruction::Call { argument_count } if observe_call => {
-                backend.observe_call_site(
-                    &code,
-                    pc,
-                    self,
-                    usize::from(argument_count),
-                    !self.vm.frame().jit_entry_attempted(),
-                );
+                backend.observe_call_site(&code, pc, self, usize::from(argument_count));
             }
             Instruction::GetLengthProperty { .. } if observe_storage => {
                 backend.observe_storage_site(
