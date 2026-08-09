@@ -339,6 +339,9 @@ showing that another boundary dominates.
 - [Global-object binding-read checkpoint, 2026-08-09](39-global-object-binding-read-checkpoint-2026-08-09.md)
   — accepted global-object binding semantics, mutation/GC/budget evidence, and
   the measured flat-call improvement.
+- [Number `BitOr` lowering design, 2026-08-09](40-number-bitor-design-2026-08-09.md)
+  — an exact `f64`-to-`ToInt32` contract selected to unlock overflowing
+  integer-style arithmetic without incorrect wrapping shortcuts.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
