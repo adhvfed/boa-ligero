@@ -161,6 +161,11 @@ struct Opt {
     #[arg(long)]
     no_can_block: bool,
 
+    /// Run with the bytecode interpreter and do not create a JIT backend.
+    #[cfg(feature = "jit")]
+    #[arg(long)]
+    no_jit: bool,
+
     /// Treats the input files as modules.
     #[arg(long, short = 'm', group = "mod")]
     module: bool,
@@ -184,6 +189,16 @@ impl Opt {
     const fn has_dump_flag(&self) -> bool {
         self.dump_ast.is_some()
     }
+}
+
+#[cfg(feature = "jit")]
+fn configure_jit(builder: ContextBuilder, args: &Opt) -> ContextBuilder {
+    builder.jit(!args.no_jit)
+}
+
+#[cfg(not(feature = "jit"))]
+fn configure_jit(builder: ContextBuilder, _args: &Opt) -> ContextBuilder {
+    builder
 }
 
 /// The different types of format available for dumping.
@@ -569,10 +584,11 @@ fn main() -> Result<()> {
 
     let executor = Rc::new(Executor::new(printer.clone()));
     let loader = Rc::new(SimpleModuleLoader::new(&args.root).map_err(|e| eyre!(e.to_string()))?);
-    let context = &mut ContextBuilder::new()
+    let builder = ContextBuilder::new()
         .job_executor(executor.clone())
         .module_loader(loader.clone())
-        .can_block(!args.no_can_block)
+        .can_block(!args.no_can_block);
+    let context = &mut configure_jit(builder, &args)
         .build()
         .map_err(|e| eyre!(e.to_string()))?;
 
@@ -715,6 +731,27 @@ fn main() -> Result<()> {
     handle.join().expect("failed to join thread");
 
     Ok(result?)
+}
+
+#[cfg(all(test, feature = "jit"))]
+mod tests {
+    use super::{ContextBuilder, Opt, configure_jit};
+    use clap::Parser;
+
+    #[test]
+    fn cli_uses_jit_by_default_and_accepts_runtime_opt_out() {
+        let default = Opt::try_parse_from(["boa"]).unwrap();
+        let context = configure_jit(ContextBuilder::new(), &default)
+            .build()
+            .unwrap();
+        assert!(context.jit_enabled());
+
+        let interpreter = Opt::try_parse_from(["boa", "--no-jit"]).unwrap();
+        let context = configure_jit(ContextBuilder::new(), &interpreter)
+            .build()
+            .unwrap();
+        assert!(!context.jit_enabled());
+    }
 }
 
 fn readline_thread_main(

@@ -72,6 +72,19 @@ with this command:
 cargo run --release --bin boa_tester -- run -v 2> error.log
 ```
 
+The default-feature tester runs with JIT enabled. Use `--jit` to record that
+choice explicitly or `--no-jit` to run the interpreter. Complex engine changes
+should normally run both arms and save them to separate output directories:
+
+```shell
+cargo run --release --bin boa_tester -- run --jit -o ./test-results-jit
+cargo run --release --bin boa_tester -- run --no-jit -o ./test-results-interpreter
+```
+
+The selected mode is printed in the summary and stored in the result JSON.
+`$262.agent` workers inherit it, so the interpreter arm does not create a JIT
+backend on worker threads.
+
 This will run the test suite in verbose mode (you can remove the `-v` part to run it in non-verbose mode),
 and output nice colorings in the terminal. It will also output any panic information into the `error.log` file.
 

@@ -3,8 +3,8 @@
 use boa_runtime::test262 as js262;
 
 use crate::{
-    Harness, Outcome, Phase, SpecEdition, Statistics, SuiteResult, Test, TestFlags,
-    TestOutcomeResult, TestResult, TestSuite, VersionedStats, read::ErrorType,
+    ExecutionOptions, Harness, Outcome, Phase, SpecEdition, Statistics, SuiteResult, Test,
+    TestFlags, TestOutcomeResult, TestResult, TestSuite, VersionedStats, read::ErrorType,
 };
 use boa_engine::{
     Context, JsArgs, JsError, JsNativeErrorKind, JsResult, JsValue, Source,
@@ -13,7 +13,6 @@ use boa_engine::{
     module::{Module, SimpleModuleLoader},
     native_function::NativeFunction,
     object::FunctionObjectBuilder,
-    optimizer::OptimizerOptions,
     parser::source::ReadChar,
     property::Attribute,
     script::Script,
@@ -33,8 +32,7 @@ impl TestSuite {
         verbose: u8,
         parallel: bool,
         max_edition: SpecEdition,
-        optimizer_options: OptimizerOptions,
-        console: bool,
+        execution_options: ExecutionOptions,
     ) -> SuiteResult {
         if verbose != 0 {
             println!("Suite {}:", self.path.display());
@@ -43,30 +41,12 @@ impl TestSuite {
         let suites: Vec<_> = if parallel {
             self.suites
                 .par_iter()
-                .map(|suite| {
-                    suite.run(
-                        harness,
-                        verbose,
-                        parallel,
-                        max_edition,
-                        optimizer_options,
-                        console,
-                    )
-                })
+                .map(|suite| suite.run(harness, verbose, parallel, max_edition, execution_options))
                 .collect()
         } else {
             self.suites
                 .iter()
-                .map(|suite| {
-                    suite.run(
-                        harness,
-                        verbose,
-                        parallel,
-                        max_edition,
-                        optimizer_options,
-                        console,
-                    )
-                })
+                .map(|suite| suite.run(harness, verbose, parallel, max_edition, execution_options))
                 .collect()
         };
 
@@ -74,13 +54,13 @@ impl TestSuite {
             self.tests
                 .par_iter()
                 .filter(|test| test.edition <= max_edition)
-                .map(|test| test.run(harness, verbose, optimizer_options, console))
+                .map(|test| test.run(harness, verbose, execution_options))
                 .collect()
         } else {
             self.tests
                 .iter()
                 .filter(|test| test.edition <= max_edition)
-                .map(|test| test.run(harness, verbose, optimizer_options, console))
+                .map(|test| test.run(harness, verbose, execution_options))
                 .collect()
         };
 
@@ -167,29 +147,27 @@ impl Test {
         &self,
         harness: &Harness,
         verbose: u8,
-        optimizer_options: OptimizerOptions,
-        console: bool,
+        execution_options: ExecutionOptions,
     ) -> TestResult {
         if self.flags.contains(TestFlags::MODULE) || self.flags.contains(TestFlags::RAW) {
-            return self.run_once(harness, false, verbose, optimizer_options, console);
+            return self.run_once(harness, false, verbose, execution_options);
         }
 
         if self
             .flags
             .contains(TestFlags::STRICT | TestFlags::NO_STRICT)
         {
-            let r = self.run_once(harness, false, verbose, optimizer_options, console);
+            let r = self.run_once(harness, false, verbose, execution_options);
             if r.result != TestOutcomeResult::Passed {
                 return r;
             }
-            self.run_once(harness, true, verbose, optimizer_options, console)
+            self.run_once(harness, true, verbose, execution_options)
         } else {
             self.run_once(
                 harness,
                 self.flags.contains(TestFlags::STRICT),
                 verbose,
-                optimizer_options,
-                console,
+                execution_options,
             )
         }
     }
@@ -248,8 +226,7 @@ impl Test {
         harness: &Harness,
         strict: bool,
         verbosity: u8,
-        optimizer_options: OptimizerOptions,
-        console: bool,
+        execution_options: ExecutionOptions,
     ) -> TestResult {
         let Ok(source) = Source::from_filepath(&self.path) else {
             return self.create_result(
@@ -275,7 +252,7 @@ impl Test {
         let result = std::panic::catch_unwind(|| match self.expected_outcome {
             Outcome::Positive => {
                 let (ref mut context, async_result, mut handles) =
-                    match self.create_context(harness, optimizer_options, console) {
+                    match self.create_context(harness, execution_options) {
                         Ok(r) => r,
                         Err(e) => return (false, e),
                     };
@@ -360,7 +337,10 @@ impl Test {
                     self.path.display()
                 );
 
-                let context = &mut Context::default();
+                let context = &mut execution_options
+                    .configure(Context::builder())
+                    .build()
+                    .expect("cannot fail with default global object");
 
                 if self.is_module() {
                     match Module::parse(source, None, context) {
@@ -379,7 +359,7 @@ impl Test {
                 phase: Phase::Resolution,
                 error_type,
             } => {
-                let context = &mut match self.create_context(harness, optimizer_options, console) {
+                let context = &mut match self.create_context(harness, execution_options) {
                     Ok(r) => r,
                     Err(e) => return (false, e),
                 }
@@ -426,7 +406,7 @@ impl Test {
                 error_type,
             } => {
                 let (ref mut context, _async_result, mut handles) =
-                    match self.create_context(harness, optimizer_options, console) {
+                    match self.create_context(harness, execution_options) {
                         Ok(r) => r,
                         Err(e) => return (false, e),
                     };
@@ -522,8 +502,7 @@ impl Test {
     fn create_context(
         &self,
         harness: &Harness,
-        optimizer_options: OptimizerOptions,
-        console: bool,
+        execution_options: ExecutionOptions,
     ) -> Result<(Context, AsyncResult, WorkerHandles), String> {
         let async_result = AsyncResult::default();
         let handles = WorkerHandles::new();
@@ -531,21 +510,23 @@ impl Test {
             SimpleModuleLoader::new(self.path.parent().expect("test should have a parent dir"))
                 .expect("test path should be canonicalizable"),
         );
-        let mut context = Context::builder()
+        let mut context = execution_options
+            .configure(Context::builder())
             .module_loader(loader.clone())
             .can_block(!self.flags.contains(TestFlags::CAN_BLOCK_IS_FALSE))
             .build()
             .expect("cannot fail with default global object");
 
-        context.set_optimizer_options(optimizer_options);
+        context.set_optimizer_options(execution_options.optimizer_options);
 
         // Register the print() function.
         register_print_fn(&mut context, async_result.clone());
 
         // add the $262 object.
-        let _js262 = js262::register_js262(handles.clone(), console, &mut context);
+        let _js262 =
+            js262::register_js262(handles.clone(), execution_options.console, &mut context);
 
-        if console {
+        if execution_options.console {
             let console = boa_runtime::Console::init(&mut context);
             context
                 .register_global_property(boa_runtime::Console::NAME, console, Attribute::all())

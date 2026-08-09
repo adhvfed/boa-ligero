@@ -1,4 +1,4 @@
-use crate::{Statistics, VersionedStats};
+use crate::{ExecutionMode, Statistics, VersionedStats};
 
 use super::SuiteResult;
 use color_eyre::{Result, eyre::WrapErr};
@@ -17,6 +17,8 @@ struct ResultInfo {
     commit: Box<str>,
     #[serde(rename = "u")]
     test262_commit: Box<str>,
+    #[serde(rename = "m", default)]
+    mode: ExecutionMode,
     #[serde(rename = "r")]
     results: SuiteResult,
 }
@@ -28,6 +30,8 @@ struct ReducedResultInfo {
     commit: Box<str>,
     #[serde(rename = "u")]
     test262_commit: Box<str>,
+    #[serde(rename = "m", default)]
+    mode: ExecutionMode,
     #[serde(rename = "a")]
     stats: Statistics,
     #[serde(rename = "av", default)]
@@ -40,6 +44,7 @@ impl From<ResultInfo> for ReducedResultInfo {
         Self {
             commit: info.commit,
             test262_commit: info.test262_commit,
+            mode: info.mode,
             stats: info.results.stats,
             versioned_stats: info.results.versioned_stats,
         }
@@ -52,6 +57,8 @@ struct FeaturesInfo {
     commit: Box<str>,
     #[serde(rename = "u")]
     test262_commit: Box<str>,
+    #[serde(rename = "m", default)]
+    mode: ExecutionMode,
     #[serde(rename = "n")]
     suite_name: Box<str>,
     #[serde(rename = "f")]
@@ -63,6 +70,7 @@ impl From<ResultInfo> for FeaturesInfo {
         Self {
             commit: info.commit,
             test262_commit: info.test262_commit,
+            mode: info.mode,
             suite_name: info.results.name,
             features: info.results.features,
         }
@@ -86,6 +94,7 @@ pub(crate) fn write_json(
     output_dir: &Path,
     verbose: u8,
     test262_path: &Path,
+    mode: ExecutionMode,
 ) -> Result<()> {
     let mut branch = env::var("GITHUB_REF").unwrap_or_default();
     if branch.starts_with("refs/pull") {
@@ -111,6 +120,7 @@ pub(crate) fn write_json(
     let new_results = ResultInfo {
         commit: env::var("GITHUB_SHA").unwrap_or_default().into_boxed_str(),
         test262_commit: get_test262_commit(test262_path)?,
+        mode,
         results,
     };
 
@@ -218,6 +228,11 @@ pub(crate) fn compare_results(base: &Path, new: &Path, markdown: bool) -> Result
     let conformance_diff = new_conformance - base_conformance;
 
     let test_diff = compute_result_diff(Path::new(""), &base_results.results, &new_results.results);
+
+    println!(
+        "Execution modes: base={}, new={}",
+        base_results.mode, new_results.mode
+    );
 
     if markdown {
         /// Simple function to add commas as thousands separator for integers.

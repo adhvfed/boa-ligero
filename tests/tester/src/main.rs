@@ -30,7 +30,7 @@ use serde::{
     de::{Unexpected, Visitor},
 };
 
-use boa_engine::optimizer::OptimizerOptions;
+use boa_engine::{context::ContextBuilder, optimizer::OptimizerOptions};
 use edition::SpecEdition;
 use read::ErrorType;
 
@@ -43,6 +43,57 @@ mod edition;
 mod exec;
 mod read;
 mod results;
+
+/// Effective engine execution mode used for every context in a test run.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ExecutionMode {
+    #[default]
+    Interpreter,
+    Jit,
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interpreter => f.write_str("interpreter"),
+            Self::Jit => f.write_str("jit"),
+        }
+    }
+}
+
+/// Engine configuration shared by all main and worker contexts in a run.
+#[derive(Clone, Copy, Debug)]
+struct ExecutionOptions {
+    optimizer_options: OptimizerOptions,
+    console: bool,
+    mode: ExecutionMode,
+}
+
+impl ExecutionOptions {
+    #[cfg(feature = "jit")]
+    fn configure(self, builder: ContextBuilder) -> ContextBuilder {
+        builder.jit(self.mode == ExecutionMode::Jit)
+    }
+
+    #[cfg(not(feature = "jit"))]
+    fn configure(self, builder: ContextBuilder) -> ContextBuilder {
+        debug_assert_eq!(self.mode, ExecutionMode::Interpreter);
+        builder
+    }
+}
+
+fn resolve_execution_mode(force_jit: bool, force_interpreter: bool) -> Result<ExecutionMode> {
+    if force_jit && !cfg!(feature = "jit") {
+        bail!("--jit requires building boa_tester with its `jit` feature");
+    }
+
+    if force_interpreter || !cfg!(feature = "jit") {
+        Ok(ExecutionMode::Interpreter)
+    } else {
+        Ok(ExecutionMode::Jit)
+    }
+}
 
 /// Structure that contains the configuration of the tester.
 #[derive(Debug, Deserialize)]
@@ -147,6 +198,14 @@ enum Cli {
         #[arg(long, short = 'O')]
         optimize: bool,
 
+        /// Explicitly run with the JIT (the default in a default-feature build).
+        #[arg(long, conflicts_with = "no_jit")]
+        jit: bool,
+
+        /// Run with the bytecode interpreter and do not create a JIT backend.
+        #[arg(long, conflicts_with = "jit")]
+        no_jit: bool,
+
         /// Optional output folder for the full results information.
         #[arg(short, long, value_hint = ValueHint::DirPath)]
         output: Option<PathBuf>,
@@ -203,12 +262,15 @@ fn main() -> Result<()> {
             max_panics,
             output,
             optimize,
+            jit,
+            no_jit,
             disable_parallelism,
             config: config_path,
             edition,
             versioned,
             console,
         } => {
+            let mode = resolve_execution_mode(jit, no_jit)?;
             let config: Config = {
                 let input = std::fs::read_to_string(&config_path).wrap_err_with(|| {
                     eyre!("could not read config file `{}`", config_path.display())
@@ -232,6 +294,16 @@ fn main() -> Result<()> {
             .canonicalize();
             let test262_path = &test262_path.wrap_err("could not get the Test262 path")?;
 
+            let execution_options = ExecutionOptions {
+                optimizer_options: if optimize {
+                    OptimizerOptions::OPTIMIZE_ALL
+                } else {
+                    OptimizerOptions::empty()
+                },
+                console,
+                mode,
+            };
+
             run_test_suite(
                 &config,
                 verbose,
@@ -243,12 +315,7 @@ fn main() -> Result<()> {
                 output.as_deref(),
                 edition.unwrap_or_default(),
                 versioned,
-                if optimize {
-                    OptimizerOptions::OPTIMIZE_ALL
-                } else {
-                    OptimizerOptions::empty()
-                },
-                console,
+                execution_options,
             )
         }
         Cli::Compare {
@@ -410,8 +477,7 @@ fn run_test_suite(
     output: Option<&Path>,
     edition: SpecEdition,
     versioned: bool,
-    optimizer_options: OptimizerOptions,
-    console: bool,
+    execution_options: ExecutionOptions,
 ) -> Result<()> {
     if let Some(path) = output {
         if path.exists() {
@@ -424,6 +490,7 @@ fn run_test_suite(
     }
 
     if verbose != 0 {
+        println!("Execution mode: {}", execution_options.mode);
         println!("Loading the test suite...");
     }
     let harness = read_harness(test262_path).wrap_err("could not read harness")?;
@@ -447,7 +514,7 @@ fn run_test_suite(
             if verbose != 0 {
                 println!("Test loaded, starting...");
             }
-            let result = test.run(&harness, verbose, optimizer_options, console);
+            let result = test.run(&harness, verbose, execution_options);
             enforce_panic_limit(
                 usize::from(result.result == TestOutcomeResult::Panic),
                 max_panics,
@@ -474,14 +541,7 @@ fn run_test_suite(
         if verbose != 0 {
             println!("Test suite loaded, starting tests...");
         }
-        let results = suite.run(
-            &harness,
-            verbose,
-            parallel,
-            edition,
-            optimizer_options,
-            console,
-        );
+        let results = suite.run(&harness, verbose, parallel, edition, execution_options);
         if let Some(selected_feature) = selected_feature
             && results.stats.total == 0
         {
@@ -532,7 +592,7 @@ fn run_test_suite(
                 ignored,
                 panic,
             } = results.stats;
-            println!("\n\nResults ({edition}):");
+            println!("\n\nResults ({edition}, {}):", execution_options.mode);
             println!("Total tests: {total}");
             println!("Passed tests: {}", passed.to_string().green());
             println!("Ignored tests: {}", ignored.to_string().yellow());
@@ -549,8 +609,14 @@ fn run_test_suite(
 
         let panic_count = results.stats.panic;
         if let Some(output) = output {
-            write_json(results, output, verbose, test262_path)
-                .wrap_err("could not write the results to the output JSON file")?;
+            write_json(
+                results,
+                output,
+                verbose,
+                test262_path,
+                execution_options.mode,
+            )
+            .wrap_err("could not write the results to the output JSON file")?;
         }
         enforce_panic_limit(panic_count, max_panics)?;
     }
@@ -569,13 +635,62 @@ fn enforce_panic_limit(panic_count: usize, max_panics: Option<usize>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::enforce_panic_limit;
+    #[cfg(feature = "jit")]
+    use super::ExecutionOptions;
+    use super::{Cli, ExecutionMode, enforce_panic_limit, resolve_execution_mode};
+    #[cfg(feature = "jit")]
+    use boa_engine::{Context, optimizer::OptimizerOptions};
+    use clap::Parser;
 
     #[test]
     fn panic_limit_is_optional_and_inclusive() {
         assert!(enforce_panic_limit(4, None).is_ok());
         assert!(enforce_panic_limit(4, Some(4)).is_ok());
         assert!(enforce_panic_limit(4, Some(3)).is_err());
+    }
+
+    #[test]
+    fn jit_cli_modes_are_explicit_and_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["boa_tester", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["boa_tester", "run", "--jit"]).is_ok());
+        assert!(Cli::try_parse_from(["boa_tester", "run", "--no-jit"]).is_ok());
+        assert!(Cli::try_parse_from(["boa_tester", "run", "--jit", "--no-jit"]).is_err());
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn execution_mode_configures_context_at_construction() {
+        assert_eq!(
+            resolve_execution_mode(false, false).unwrap(),
+            ExecutionMode::Jit
+        );
+        assert_eq!(
+            resolve_execution_mode(false, true).unwrap(),
+            ExecutionMode::Interpreter
+        );
+
+        for (mode, enabled) in [
+            (ExecutionMode::Jit, true),
+            (ExecutionMode::Interpreter, false),
+        ] {
+            let options = ExecutionOptions {
+                optimizer_options: OptimizerOptions::empty(),
+                console: false,
+                mode,
+            };
+            let context = options.configure(Context::builder()).build().unwrap();
+            assert_eq!(context.jit_enabled(), enabled);
+        }
+    }
+
+    #[cfg(not(feature = "jit"))]
+    #[test]
+    fn feature_disabled_tester_rejects_forced_jit() {
+        assert!(resolve_execution_mode(true, false).is_err());
+        assert_eq!(
+            resolve_execution_mode(false, false).unwrap(),
+            ExecutionMode::Interpreter
+        );
     }
 }
 

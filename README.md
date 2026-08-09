@@ -140,6 +140,8 @@ For more information see: [`getrandom` WebAssembly Support][getrandom-webassembl
 
 - Clone this repo.
 - Run with `cargo run -- test.js` in the project root directory where `test.js` is a path to an existing JS file with any valid JS code.
+- JIT is enabled in the default build. Pass `--no-jit` after `--` to run the
+  interpreter, for example `cargo run -- --no-jit test.js`.
 - If any JS doesn't work then it's a bug. Please raise an [issue](https://github.com/boa-dev/boa/issues/)!
 
 ### Example
@@ -165,6 +167,8 @@ Options:
       --flowgraph-direction <FORMAT>  Specifies the direction of the flowgraph. Default is top-top-bottom [possible values: top-to-bottom, bottom-to-top, left-to-right, right-to-left]
       --debug-object                  Inject debugging object `$boa`
       --test262-object                Inject the test262 host object `$262`
+      --no-can-block                  Disallow the main thread from blocking (e.g. `Atomics.wait`)
+      --no-jit                        Run with the bytecode interpreter and do not create a JIT backend
   -m, --module                        Treats the input files as modules
   -r, --root <ROOT>                   Root path from where the module resolver will try to load the modules [default: .]
   -h, --help                          Print help (see more with '--help')

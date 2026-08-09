@@ -229,6 +229,9 @@ fn agent_obj(handles: WorkerHandles, console: bool, context: &mut Context) -> Js
 
     let (reports_tx, reports_rx) = mpsc::channel();
 
+    #[cfg(feature = "jit")]
+    let jit_enabled = context.jit_enabled();
+
     let start = unsafe {
         let bus = bus.clone();
         NativeFunction::from_closure(move |_, args, context| {
@@ -242,10 +245,10 @@ fn agent_obj(handles: WorkerHandles, console: bool, context: &mut Context) -> Js
             let tx = reports_tx.clone();
 
             handles.0.borrow_mut().push(std::thread::spawn(move || {
-                let context = &mut Context::builder()
-                    .can_block(true)
-                    .build()
-                    .map_err(|e| e.to_string())?;
+                #[cfg(feature = "jit")]
+                let context = &mut build_agent_context(jit_enabled).map_err(|e| e.to_string())?;
+                #[cfg(not(feature = "jit"))]
+                let context = &mut build_agent_context().map_err(|e| e.to_string())?;
                 register_js262_worker(rx, tx, context);
 
                 if console {
@@ -308,6 +311,16 @@ fn agent_obj(handles: WorkerHandles, console: bool, context: &mut Context) -> Js
             0,
         )
         .build()
+}
+
+#[cfg(feature = "jit")]
+fn build_agent_context(jit_enabled: bool) -> JsResult<Context> {
+    Context::builder().can_block(true).jit(jit_enabled).build()
+}
+
+#[cfg(not(feature = "jit"))]
+fn build_agent_context() -> JsResult<Context> {
+    Context::builder().can_block(true).build()
 }
 
 /// Initializes the `$262` object in a worker agent.
@@ -376,4 +389,15 @@ fn register_js262_worker(
             Attribute::WRITABLE | Attribute::CONFIGURABLE,
         )
         .expect("shouldn't fail with the default global");
+}
+
+#[cfg(all(test, feature = "jit"))]
+mod tests {
+    use super::build_agent_context;
+
+    #[test]
+    fn agent_context_inherits_parent_jit_mode() {
+        assert!(build_agent_context(true).unwrap().jit_enabled());
+        assert!(!build_agent_context(false).unwrap().jit_enabled());
+    }
 }
