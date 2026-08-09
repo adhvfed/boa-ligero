@@ -1858,6 +1858,7 @@ impl<'ctx> ByteCompiler<'ctx> {
         block: bool,
     ) {
         let mut contains_using = false;
+        let mut contains_await_using = false;
         for item in list.statements() {
             let StatementListItem::Declaration(declaration) = item else {
                 continue;
@@ -1866,23 +1867,25 @@ impl<'ctx> ByteCompiler<'ctx> {
                 continue;
             };
             contains_using |= matches!(declaration, LexicalDeclaration::Using(_));
+            contains_await_using |= matches!(declaration, LexicalDeclaration::AwaitUsing(_));
         }
 
-        if !contains_using {
+        if !contains_using && !contains_await_using {
             self.compile_statement_list(list, use_expr, block);
             return;
         }
 
-        self.compile_sync_resource_scope(use_expr, |compiler| {
+        self.compile_resource_scope(use_expr, contains_await_using, |compiler| {
             compiler.compile_statement_list(list, use_expr, block);
         });
     }
 
-    /// Compiles an operation whose abrupt exits must dispose one synchronous
-    /// lexical resource scope.
-    pub(crate) fn compile_sync_resource_scope(
+    /// Compiles an operation whose abrupt exits must dispose one lexical
+    /// resource scope.
+    pub(crate) fn compile_resource_scope(
         &mut self,
         use_expr: bool,
+        asynchronous: bool,
         compile: impl FnOnce(&mut Self),
     ) {
         self.bytecode.emit_create_disposable_resource_scope();
@@ -1928,8 +1931,29 @@ impl<'ctx> ByteCompiler<'ctx> {
         let completion_value = self.register_allocator.alloc();
         self.bytecode
             .emit_set_register_from_accumulator(completion_value.variable());
-        self.bytecode
-            .emit_dispose_resources(has_error.variable(), error.variable());
+        if asynchronous {
+            let result = self.register_allocator.alloc();
+            let needs_await = self.register_allocator.alloc();
+            self.bytecode.emit_dispose_resources_async(
+                has_error.variable(),
+                error.variable(),
+                result.variable(),
+                needs_await.variable(),
+            );
+            let disposal_complete = self.jump_if_false(&needs_await);
+            self.bytecode.emit_await(result.variable());
+            let resume_kind = self.register_allocator.alloc();
+            self.pop_into_register(&resume_kind);
+            self.pop_into_register(&result);
+            self.generator_next(&result, &resume_kind);
+            self.register_allocator.dealloc(resume_kind);
+            self.patch_jump(disposal_complete);
+            self.register_allocator.dealloc(result);
+            self.register_allocator.dealloc(needs_await);
+        } else {
+            self.bytecode
+                .emit_dispose_resources(has_error.variable(), error.variable());
+        }
         self.bytecode
             .emit_set_accumulator(completion_value.variable());
         self.register_allocator.dealloc(completion_value);
@@ -2624,9 +2648,8 @@ impl<'ctx> ByteCompiler<'ctx> {
                                 self.bytecode.emit_store_undefined(value.variable());
                             }
 
-                            // TODO: Add resource to async disposal stack
-                            // For now, we just bind the variable like a let declaration
-                            // Full implementation will add: AddAsyncDisposableResource opcode
+                            self.bytecode
+                                .emit_add_async_disposable_resource(value.variable());
 
                             self.emit_binding(BindingOpcode::InitLexical, ident, &value);
                             self.register_allocator.dealloc(value);
@@ -2640,7 +2663,8 @@ impl<'ctx> ByteCompiler<'ctx> {
                                 self.bytecode.emit_store_undefined(value.variable());
                             }
 
-                            // TODO: SAME
+                            self.bytecode
+                                .emit_add_async_disposable_resource(value.variable());
                             self.compile_declaration_pattern(
                                 pattern,
                                 BindingOpcode::InitLexical,

@@ -1,5 +1,5 @@
 use boa_ast::{
-    declaration::Binding,
+    declaration::{Binding, LexicalDeclaration},
     operations::bound_names,
     scope::BindingLocatorError,
     statement::{
@@ -21,14 +21,17 @@ impl ByteCompiler<'_> {
         label: Option<Sym>,
         use_expr: bool,
     ) {
-        let has_using_initializer = matches!(
-            for_loop.init(),
-            Some(ForLoopInitializer::Lexical(declaration))
-                if matches!(declaration.declaration(), boa_ast::declaration::LexicalDeclaration::Using(_))
-        );
+        let resource_hint = match for_loop.init() {
+            Some(ForLoopInitializer::Lexical(declaration)) => match declaration.declaration() {
+                LexicalDeclaration::Using(_) => Some(false),
+                LexicalDeclaration::AwaitUsing(_) => Some(true),
+                LexicalDeclaration::Let(_) | LexicalDeclaration::Const(_) => None,
+            },
+            _ => None,
+        };
 
-        if has_using_initializer {
-            self.compile_sync_resource_scope(use_expr, |compiler| {
+        if let Some(asynchronous) = resource_hint {
+            self.compile_resource_scope(use_expr, asynchronous, |compiler| {
                 compiler.compile_for_loop_body(for_loop, label, use_expr);
             });
         } else {
@@ -330,14 +333,57 @@ impl ByteCompiler<'_> {
         self.register_allocator.dealloc(done_reg);
 
         let outer_scope = self.push_declarative_scope(for_of_loop.scope());
+        self.compile_for_of_iteration(for_of_loop, use_expr);
 
+        self.pop_declarative_scope(outer_scope);
+        self.bytecode.emit_jump(start_address);
+
+        self.patch_jump(exit);
+        self.pop_loop_control_info();
+
+        self.iterator_close(for_of_loop.r#await());
+    }
+
+    fn compile_for_of_iteration(&mut self, for_of_loop: &ForOfLoop, use_expr: bool) {
+        let handler_index = self.push_handler();
+        match for_of_loop.initializer() {
+            IterableLoopInitializer::Using(_) => {
+                self.compile_resource_scope(use_expr, false, |compiler| {
+                    compiler.compile_for_of_binding_and_body(for_of_loop, use_expr);
+                });
+            }
+            IterableLoopInitializer::AwaitUsing(_) => {
+                self.compile_resource_scope(use_expr, true, |compiler| {
+                    compiler.compile_for_of_binding_and_body(for_of_loop, use_expr);
+                });
+            }
+            _ => self.compile_for_of_binding_and_body(for_of_loop, use_expr),
+        }
+
+        let exit = self.jump();
+        self.patch_handler(handler_index);
+
+        let error = self.register_allocator.alloc();
+        self.bytecode.emit_exception(error.variable());
+
+        // Resource disposal precedes IteratorClose. Ignore a close failure so
+        // the completion produced by the iteration remains observable.
+        let close_handler = self.push_handler();
+        self.iterator_close(for_of_loop.r#await());
+        self.patch_handler(close_handler);
+
+        self.bytecode.emit_throw(error.variable());
+        self.register_allocator.dealloc(error);
+        self.patch_jump(exit);
+    }
+
+    fn compile_for_of_binding_and_body(&mut self, for_of_loop: &ForOfLoop, use_expr: bool) {
         // For let/const with a local identifier binding, emit iterator_value
         // directly into the binding's persistent register to avoid a Move.
-        let handler_index = if let IterableLoopInitializer::Let(Binding::Identifier(ident))
-        | IterableLoopInitializer::Const(Binding::Identifier(ident))
-        | IterableLoopInitializer::Using(Binding::Identifier(ident))
-        | IterableLoopInitializer::AwaitUsing(Binding::Identifier(ident)) =
-            for_of_loop.initializer()
+        // Resource bindings need a temporary because their disposer is acquired
+        // before the lexical binding is initialized.
+        if let IterableLoopInitializer::Let(Binding::Identifier(ident))
+        | IterableLoopInitializer::Const(Binding::Identifier(ident)) = for_of_loop.initializer()
             && let ident = ident.to_js_string(self.interner())
             && let ident = self.lexical_scope.get_identifier_reference(ident)
             && ident.local()
@@ -345,12 +391,9 @@ impl ByteCompiler<'_> {
             let reg = self.register_allocator.alloc_persistent();
             self.local_binding_registers.insert(ident, reg.index());
             self.bytecode.emit_iterator_value(reg.variable());
-
-            self.push_handler()
         } else {
             let value = self.register_allocator.alloc();
             self.bytecode.emit_iterator_value(value.variable());
-            let handler_index = self.push_handler();
             match for_of_loop.initializer() {
                 IterableLoopInitializer::Identifier(ident) => {
                     let ident = ident.to_js_string(self.interner());
@@ -374,7 +417,6 @@ impl ByteCompiler<'_> {
                     self.access_set(Access::Property { access }, |_| &value);
                 }
                 IterableLoopInitializer::Var(declaration) => {
-                    // ignore initializers since those aren't allowed on for-of loops.
                     assert!(declaration.init().is_none());
                     match declaration.binding() {
                         Binding::Identifier(ident) => {
@@ -391,56 +433,43 @@ impl ByteCompiler<'_> {
                     }
                 }
                 IterableLoopInitializer::Let(declaration)
-                | IterableLoopInitializer::Const(declaration)
-                | IterableLoopInitializer::Using(declaration)
-                | IterableLoopInitializer::AwaitUsing(declaration) => match declaration {
-                    Binding::Identifier(ident) => {
-                        let ident = ident.to_js_string(self.interner());
-                        self.emit_binding(BindingOpcode::InitLexical, ident, &value);
-                    }
-                    Binding::Pattern(pattern) => {
-                        self.compile_declaration_pattern(
-                            pattern,
-                            BindingOpcode::InitLexical,
-                            &value,
-                        );
-                    }
-                },
+                | IterableLoopInitializer::Const(declaration) => {
+                    self.bind_for_of_lexical(declaration, &value);
+                }
+                IterableLoopInitializer::Using(declaration) => {
+                    self.bytecode.emit_add_disposable_resource(value.variable());
+                    self.bind_for_of_lexical(declaration, &value);
+                }
+                IterableLoopInitializer::AwaitUsing(declaration) => {
+                    self.bytecode
+                        .emit_add_async_disposable_resource(value.variable());
+                    self.bind_for_of_lexical(declaration, &value);
+                }
                 IterableLoopInitializer::Pattern(pattern) => {
                     self.compile_declaration_pattern(pattern, BindingOpcode::SetName, &value);
                 }
             }
 
             self.register_allocator.dealloc(value);
-            handler_index
-        };
-
-        self.compile_stmt(for_of_loop.body(), use_expr, true);
-
-        {
-            let exit = self.jump();
-            self.patch_handler(handler_index);
-
-            let error = self.register_allocator.alloc();
-            self.bytecode.emit_exception(error.variable());
-
-            // NOTE: Capture throw of the iterator close and ignore it.
-            let handler_index = self.push_handler();
-            self.iterator_close(for_of_loop.r#await());
-            self.patch_handler(handler_index);
-
-            self.bytecode.emit_throw(error.variable());
-            self.register_allocator.dealloc(error);
-            self.patch_jump(exit);
         }
 
-        self.pop_declarative_scope(outer_scope);
-        self.bytecode.emit_jump(start_address);
+        self.compile_stmt(for_of_loop.body(), use_expr, true);
+    }
 
-        self.patch_jump(exit);
-        self.pop_loop_control_info();
-
-        self.iterator_close(for_of_loop.r#await());
+    fn bind_for_of_lexical(
+        &mut self,
+        declaration: &Binding,
+        value: &crate::bytecompiler::Register,
+    ) {
+        match declaration {
+            Binding::Identifier(ident) => {
+                let ident = ident.to_js_string(self.interner());
+                self.emit_binding(BindingOpcode::InitLexical, ident, value);
+            }
+            Binding::Pattern(pattern) => {
+                self.compile_declaration_pattern(pattern, BindingOpcode::InitLexical, value);
+            }
+        }
     }
 
     pub(crate) fn compile_while_loop(

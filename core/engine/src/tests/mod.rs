@@ -132,6 +132,33 @@ fn using_disposes_during_generator_return_and_initializer_failure() {
 }
 
 #[test]
+fn await_using_suspends_and_preserves_mixed_disposal_order() {
+    run_test_actions([
+        TestAction::run(
+            "var asyncDisposalLog = [];
+            (async function () {
+                await using bottom = {
+                    async [Symbol.asyncDispose]() { asyncDisposalLog.push('bottom'); }
+                };
+                using middle = {
+                    [Symbol.dispose]() { asyncDisposalLog.push('middle'); }
+                };
+                await using top = {
+                    async [Symbol.asyncDispose]() { asyncDisposalLog.push('top'); }
+                };
+                asyncDisposalLog.push('body');
+            })().then(() => asyncDisposalLog.push('done'));",
+        ),
+        TestAction::assert_eq("asyncDisposalLog.join(',')", js_str!("body,top")),
+        TestAction::inspect_context(|context| context.run_jobs().unwrap()),
+        TestAction::assert_eq(
+            "asyncDisposalLog.join(',')",
+            js_str!("body,top,middle,bottom,done"),
+        ),
+    ]);
+}
+
+#[test]
 fn deeply_nested_expression_does_not_overflow_stack() {
     // Regression: deeply nested expressions used to overflow the native stack
     // while parsing (recursive descent burns ~one frame per operator-precedence

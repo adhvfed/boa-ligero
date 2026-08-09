@@ -1,7 +1,11 @@
 //! Shared runtime primitives for explicit resource management.
 
-use crate::{Context, JsError, JsResult, JsValue, object::JsFunction, symbol::JsSymbol};
-use boa_gc::{Finalize, Trace};
+use crate::{
+    Context, JsArgs, JsError, JsResult, JsValue, NativeFunction, js_string,
+    object::{FunctionObjectBuilder, JsFunction, builtins::JsPromise},
+    symbol::JsSymbol,
+};
+use boa_gc::{Finalize, Gc, GcRefCell, Trace};
 
 /// How a resource's disposer is invoked.
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +25,7 @@ pub(crate) struct DisposableResource {
     value: JsValue,
     method: Option<JsFunction>,
     await_result: bool,
+    needs_await: bool,
     #[unsafe_ignore_trace]
     call: DisposableCall,
 }
@@ -46,6 +51,7 @@ impl DisposableResource {
                     .expect("GetMethod must return a callable function object"),
             ),
             await_result: false,
+            needs_await: false,
             call: DisposableCall::Use,
         }))
     }
@@ -58,6 +64,7 @@ impl DisposableResource {
                 value,
                 method: None,
                 await_result: true,
+                needs_await: true,
                 call: DisposableCall::Use,
             });
         }
@@ -82,6 +89,7 @@ impl DisposableResource {
                     .expect("GetMethod must return a callable function object"),
             ),
             await_result,
+            needs_await: true,
             call: DisposableCall::Use,
         })
     }
@@ -92,6 +100,7 @@ impl DisposableResource {
             value,
             method: Some(method),
             await_result: asynchronous,
+            needs_await: asynchronous,
             call: DisposableCall::Adopt,
         }
     }
@@ -102,6 +111,7 @@ impl DisposableResource {
             value: JsValue::undefined(),
             method: Some(method),
             await_result: asynchronous,
+            needs_await: asynchronous,
             call: DisposableCall::Defer,
         }
     }
@@ -128,6 +138,11 @@ impl DisposableResource {
             Ok(JsValue::undefined())
         }
     }
+
+    /// Whether disposal must suspend on this resource's result.
+    pub(crate) const fn needs_await(&self) -> bool {
+        self.needs_await
+    }
 }
 
 /// Frame-local storage for nested lexical resource scopes.
@@ -151,13 +166,120 @@ impl DisposableResourceStack {
     }
 
     /// Removes and returns the innermost scope in disposal order.
-    pub(crate) fn take_scope(&mut self) -> std::iter::Rev<std::vec::IntoIter<DisposableResource>> {
+    pub(crate) fn take_scope(&mut self) -> Vec<DisposableResource> {
         let start = self
             .scopes
             .pop()
             .expect("disposal bytecode must balance resource scopes");
-        self.resources.split_off(start).into_iter().rev()
+        self.resources.split_off(start)
     }
+}
+
+#[derive(Debug, Trace, Finalize)]
+struct AsyncDisposalState {
+    resources: Vec<DisposableResource>,
+    completion: Option<JsError>,
+}
+
+/// The initial result of asynchronous disposal.
+pub(crate) enum AsyncDisposal {
+    /// No asynchronous resource was reached, so disposal completed inline.
+    Complete,
+    /// Disposal suspended at an asynchronous resource.
+    Pending(JsPromise),
+}
+
+/// Starts disposal and runs synchronous resources inline until the first
+/// asynchronous resource requires suspension.
+pub(crate) fn begin_async_disposal(
+    resources: Vec<DisposableResource>,
+    completion: Option<JsError>,
+    context: &mut Context,
+) -> JsResult<AsyncDisposal> {
+    let state = Gc::new(GcRefCell::new(AsyncDisposalState {
+        resources,
+        completion,
+    }));
+    match resume_async_disposal(state, context)? {
+        Some(promise) => Ok(AsyncDisposal::Pending(promise)),
+        None => Ok(AsyncDisposal::Complete),
+    }
+}
+
+fn resume_async_disposal(
+    state: Gc<GcRefCell<AsyncDisposalState>>,
+    context: &mut Context,
+) -> JsResult<Option<JsPromise>> {
+    loop {
+        let Some(resource) = state.borrow_mut().resources.pop() else {
+            return match state.borrow().completion.clone() {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        };
+
+        match resource.invoke(context) {
+            Ok(result) if resource.needs_await() => {
+                let promise = JsPromise::resolve(result, context)?;
+                let on_fulfilled = async_disposal_handler(state.clone(), false, context);
+                let on_rejected = async_disposal_handler(state, true, context);
+                return Ok(Some(promise.then_intrinsic(
+                    Some(on_fulfilled),
+                    Some(on_rejected),
+                    context,
+                )));
+            }
+            Ok(_) => {}
+            Err(error) => record_async_error(&state, error, context)?,
+        }
+    }
+}
+
+fn async_disposal_handler(
+    state: Gc<GcRefCell<AsyncDisposalState>>,
+    rejected: bool,
+    context: &mut Context,
+) -> JsFunction {
+    #[derive(Trace, Finalize)]
+    struct Captures {
+        state: Gc<GcRefCell<AsyncDisposalState>>,
+        #[unsafe_ignore_trace]
+        rejected: bool,
+    }
+
+    FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_copy_closure_with_captures(
+            |_, args, captures, context| {
+                if captures.rejected {
+                    record_async_error(
+                        &captures.state,
+                        JsError::from_opaque(args.get_or_undefined(0).clone()),
+                        context,
+                    )?;
+                }
+                Ok(resume_async_disposal(captures.state.clone(), context)?
+                    .map_or_else(JsValue::undefined, Into::into))
+            },
+            Captures { state, rejected },
+        ),
+    )
+    .name(js_string!())
+    .length(1)
+    .build()
+}
+
+fn record_async_error(
+    state: &Gc<GcRefCell<AsyncDisposalState>>,
+    error: JsError,
+    context: &mut Context,
+) -> JsResult<()> {
+    let suppressed = state.borrow_mut().completion.take();
+    state.borrow_mut().completion = Some(match suppressed {
+        None => error,
+        Some(suppressed) => suppress_error(error, suppressed, context)?,
+    });
+    Ok(())
 }
 
 /// Combines a disposal failure with the completion it replaces.

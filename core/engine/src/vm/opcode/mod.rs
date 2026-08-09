@@ -2270,10 +2270,24 @@ generate_opcodes! {
     /// - Registers:
     ///   - Input: has_error, error
     DisposeResources { has_error: RegisterOperand, error: RegisterOperand },
-    /// Reserved [`Opcode`].
-    Reserved4 => Reserved,
-    /// Reserved [`Opcode`].
-    Reserved5 => Reserved,
+
+    /// Adds an asynchronous disposable resource to the innermost scope.
+    ///
+    /// - Registers:
+    ///   - Input: value
+    AddAsyncDisposableResource { value: RegisterOperand },
+
+    /// Begins disposing an asynchronous resource scope.
+    ///
+    /// - Registers:
+    ///   - Input: has_error, error
+    ///   - Output: result, needs_await
+    DisposeResourcesAsync {
+        has_error: RegisterOperand,
+        error: RegisterOperand,
+        result: RegisterOperand,
+        needs_await: RegisterOperand,
+    },
     /// Reserved [`Opcode`].
     Reserved6 => Reserved,
     /// Reserved [`Opcode`].

@@ -374,16 +374,16 @@ impl CodeBlock {
                 | Instruction::CreateUnmappedArgumentsObject { .. }
                 | Instruction::CreateDisposableResourceScope
                 | Instruction::AddDisposableResource { .. }
-                | Instruction::DisposeResources { .. } => {
+                | Instruction::DisposeResources { .. }
+                | Instruction::AddAsyncDisposableResource { .. }
+                | Instruction::DisposeResourcesAsync { .. } => {
                     graph.add_node(previous_pc, NodeShape::None, label.into(), Color::None);
                     graph.add_edge(previous_pc, pc, None, Color::None, EdgeStyle::Line);
                 }
                 Instruction::Return => {
                     graph.add_node(previous_pc, NodeShape::Diamond, label.into(), Color::Red);
                 }
-                Instruction::Reserved4
-                | Instruction::Reserved5
-                | Instruction::Reserved6
+                Instruction::Reserved6
                 | Instruction::Reserved7
                 | Instruction::Reserved8
                 | Instruction::Reserved9

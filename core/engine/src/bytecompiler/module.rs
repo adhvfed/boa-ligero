@@ -1,14 +1,39 @@
 use super::{ByteCompiler, Literal, ToJsString};
 use crate::vm::opcode::BindingOpcode;
-use boa_ast::{ModuleItem, ModuleItemList, declaration::ExportDeclaration};
+use boa_ast::{
+    Declaration, ModuleItem, ModuleItemList, StatementListItem,
+    declaration::{ExportDeclaration, LexicalDeclaration},
+};
 use boa_interner::Sym;
 
 impl ByteCompiler<'_> {
     /// Compiles a [`ModuleItemList`].
     #[inline]
     pub fn compile_module_item_list(&mut self, list: &ModuleItemList) {
-        for node in list.items() {
-            self.compile_module_item(node);
+        let mut contains_using = false;
+        let mut contains_await_using = false;
+        for item in list.items() {
+            let ModuleItem::StatementListItem(StatementListItem::Declaration(declaration)) = item
+            else {
+                continue;
+            };
+            let Declaration::Lexical(declaration) = declaration.as_ref() else {
+                continue;
+            };
+            contains_using |= matches!(declaration, LexicalDeclaration::Using(_));
+            contains_await_using |= matches!(declaration, LexicalDeclaration::AwaitUsing(_));
+        }
+
+        if contains_using || contains_await_using {
+            self.compile_resource_scope(false, contains_await_using, |compiler| {
+                for item in list.items() {
+                    compiler.compile_module_item(item);
+                }
+            });
+        } else {
+            for item in list.items() {
+                self.compile_module_item(item);
+            }
         }
     }
 

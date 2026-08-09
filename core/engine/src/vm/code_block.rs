@@ -908,7 +908,8 @@ impl CodeBlock {
             | Instruction::IsObject { value }
             | Instruction::BindThisValue { value }
             | Instruction::BitNot { value }
-            | Instruction::AddDisposableResource { value } => {
+            | Instruction::AddDisposableResource { value }
+            | Instruction::AddAsyncDisposableResource { value } => {
                 format!("value:{value}")
             }
             Instruction::ImportCall {
@@ -943,6 +944,16 @@ impl CodeBlock {
                 error: exception,
             } => {
                 format!("has_exception:{has_exception}, exception:{exception}")
+            }
+            Instruction::DisposeResourcesAsync {
+                has_error,
+                error,
+                result,
+                needs_await,
+            } => {
+                format!(
+                    "has_error:{has_error}, error:{error}, result:{result}, needs_await:{needs_await}"
+                )
             }
             Instruction::SetAccumulator { src }
             | Instruction::PushFromRegister { src }
@@ -1028,9 +1039,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved4
-            | Instruction::Reserved5
-            | Instruction::Reserved6
+            Instruction::Reserved6
             | Instruction::Reserved7
             | Instruction::Reserved8
             | Instruction::Reserved9
