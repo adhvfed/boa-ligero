@@ -52,6 +52,7 @@ fn error_names() {
         TestAction::assert_eq("URIError.name", js_str!("URIError")),
         TestAction::assert_eq("TypeError.name", js_str!("TypeError")),
         TestAction::assert_eq("AggregateError.name", js_str!("AggregateError")),
+        TestAction::assert_eq("SuppressedError.name", js_str!("SuppressedError")),
     ]);
 }
 
@@ -66,5 +67,24 @@ fn error_lengths() {
         TestAction::assert_eq("URIError.length", 1),
         TestAction::assert_eq("TypeError.length", 1),
         TestAction::assert_eq("AggregateError.length", 2),
+        TestAction::assert_eq("SuppressedError.length", 3),
+    ]);
+}
+
+#[test]
+fn suppressed_error_properties() {
+    run_test_actions([
+        TestAction::assert("SuppressedError() instanceof SuppressedError"),
+        TestAction::assert("SuppressedError.prototype instanceof Error"),
+        TestAction::assert_eq(
+            "new SuppressedError(1, 2, 3).toString()",
+            js_str!("SuppressedError: 3"),
+        ),
+        TestAction::assert_eq(
+            "Reflect.ownKeys(new SuppressedError(1, 2, 3)).join(',')",
+            js_str!("message,error,suppressed"),
+        ),
+        TestAction::assert_eq("new SuppressedError(1, 2, 3).error", 1),
+        TestAction::assert_eq("new SuppressedError(1, 2, 3).suppressed", 2),
     ]);
 }
