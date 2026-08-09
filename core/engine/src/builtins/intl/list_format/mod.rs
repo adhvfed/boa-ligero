@@ -1,5 +1,3 @@
-use std::fmt::Write;
-
 use boa_gc::{Finalize, Trace};
 use icu_list::{
     ListFormatter, ListFormatterPreferences,
@@ -11,7 +9,7 @@ use icu_locale::Locale;
 use crate::{
     Context, JsArgs, JsData, JsExpect, JsNativeError, JsResult, JsString, JsValue,
     builtins::{
-        Array, BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject, OrdinaryObject,
+        BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject, OrdinaryObject,
         intl::options::EmptyPreferences,
         iterable::IteratorHint,
         options::{get_option, get_options_object},
@@ -29,6 +27,7 @@ use super::{
     Service,
     locale::{canonicalize_locale_list, filter_locales, resolve_locale},
     options::IntlOptions,
+    parts::{PartsCollector, UnmarkedStyle},
 };
 
 mod options;
@@ -262,86 +261,7 @@ impl ListFormat {
         args: &[JsValue],
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        // TODO: maybe try to move this into icu4x?
-        use writeable::{PartsWrite, Writeable};
-
-        #[derive(Debug, Clone)]
-        enum Part {
-            Literal(String),
-            Element(String),
-        }
-
-        impl Part {
-            const fn typ(&self) -> &'static str {
-                match self {
-                    Self::Literal(_) => "literal",
-                    Self::Element(_) => "element",
-                }
-            }
-
-            #[allow(clippy::missing_const_for_fn)]
-            fn value(self) -> String {
-                match self {
-                    Self::Literal(s) | Self::Element(s) => s,
-                }
-            }
-        }
-
-        #[derive(Debug, Clone)]
-        struct WriteString(String);
-
-        impl Write for WriteString {
-            fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                self.0.write_str(s)
-            }
-
-            fn write_char(&mut self, c: char) -> std::fmt::Result {
-                self.0.write_char(c)
-            }
-        }
-
-        impl PartsWrite for WriteString {
-            type SubPartsWrite = Self;
-
-            fn with_part(
-                &mut self,
-                _part: writeable::Part,
-                mut f: impl FnMut(&mut Self::SubPartsWrite) -> std::fmt::Result,
-            ) -> std::fmt::Result {
-                f(self)
-            }
-        }
-
-        #[derive(Debug, Clone)]
-        struct PartsCollector(Vec<Part>);
-
-        impl Write for PartsCollector {
-            fn write_str(&mut self, _: &str) -> std::fmt::Result {
-                Ok(())
-            }
-        }
-
-        impl PartsWrite for PartsCollector {
-            type SubPartsWrite = WriteString;
-
-            fn with_part(
-                &mut self,
-                part: writeable::Part,
-                mut f: impl FnMut(&mut Self::SubPartsWrite) -> core::fmt::Result,
-            ) -> core::fmt::Result {
-                assert_eq!(part.category, "list");
-                let mut string = WriteString(String::new());
-                f(&mut string)?;
-                if !string.0.is_empty() {
-                    match part.value {
-                        "element" => self.0.push(Part::Element(string.0)),
-                        "literal" => self.0.push(Part::Literal(string.0)),
-                        _ => unreachable!(),
-                    }
-                }
-                Ok(())
-            }
-        }
+        use writeable::Writeable;
 
         // 1. Let lf be the this value.
         // 2. Perform ? RequireInternalSlot(lf, [[InitializedListFormat]]).
@@ -366,44 +286,12 @@ impl ListFormat {
         // https://tc39.es/ecma402/#sec-formatlisttoparts
 
         // 1. Let parts be ! CreatePartsFromList(listFormat, list).
-        let mut parts = PartsCollector(Vec::new());
+        let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);
         lf.native
             .format(strings)
             .write_to_parts(&mut parts)
             .map_err(|e| JsNativeError::typ().with_message(e.to_string()))?;
-
-        // 2. Let result be ! ArrayCreate(0).
-        let result = Array::array_create(0, None, context)
-            .js_expect("creating an empty array with default proto must not fail")?;
-
-        // 3. Let n be 0.
-        // 4. For each Record { [[Type]], [[Value]] } part in parts, do
-        for (n, part) in parts.0.into_iter().enumerate() {
-            // a. Let O be OrdinaryObjectCreate(%Object.prototype%).
-            let o = context
-                .intrinsics()
-                .templates()
-                .ordinary_object()
-                .create(OrdinaryObject, vec![]);
-
-            // b. Perform ! CreateDataPropertyOrThrow(O, "type", part.[[Type]]).
-            o.create_data_property_or_throw(js_string!("type"), js_string!(part.typ()), context)
-                .js_expect("operation must not fail per the spec")?;
-
-            // c. Perform ! CreateDataPropertyOrThrow(O, "value", part.[[Value]]).
-            o.create_data_property_or_throw(js_string!("value"), js_string!(part.value()), context)
-                .js_expect("operation must not fail per the spec")?;
-
-            // d. Perform ! CreateDataPropertyOrThrow(result, ! ToString(n), O).
-            result
-                .create_data_property_or_throw(n, o, context)
-                .js_expect("operation must not fail per the spec")?;
-
-            // e. Increment n by 1.
-        }
-
-        // 5. Return result.
-        Ok(result.into())
+        parts.into_js_array(context)
     }
 
     /// [`Intl.ListFormat.prototype.resolvedOptions ( )`][spec].

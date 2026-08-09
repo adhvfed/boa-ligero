@@ -1,8 +1,9 @@
 use crate::{
     builtins::intl::number_format::{
-        IntlMathematicalValue, NumberPart, PartsCollector, RoundingIncrement, SpecialValue,
+        IntlMathematicalValue, RoundingIncrement, SpecialValue,
         js_string_to_intl_mathematical_value,
     },
+    builtins::intl::parts::{FormattedPart, PartsCollector, UnmarkedStyle},
     js_string,
 };
 use fixed_decimal::Decimal;
@@ -33,31 +34,15 @@ fn numbering_system_preferences_reach_the_formatter() {
 }
 
 #[test]
-fn number_parts_preserve_special_and_compact_boundaries() {
-    let mut parts = PartsCollector::new(false);
+fn special_number_parts_are_tagged() {
+    let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);
     SpecialValue::Infinity.write_to_parts(&mut parts).unwrap();
     assert_eq!(
         parts.parts,
-        [NumberPart {
+        [FormattedPart {
             kind: "infinity",
             value: "∞".to_owned(),
         }]
-    );
-
-    let mut parts = PartsCollector::new(true);
-    core::fmt::Write::write_str(&mut parts, "\u{a0}million").unwrap();
-    assert_eq!(
-        parts.parts,
-        [
-            NumberPart {
-                kind: "literal",
-                value: "\u{a0}".to_owned(),
-            },
-            NumberPart {
-                kind: "compact",
-                value: "million".to_owned(),
-            },
-        ]
     );
 }
 

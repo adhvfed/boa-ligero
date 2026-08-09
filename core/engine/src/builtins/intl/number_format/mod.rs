@@ -20,13 +20,14 @@ use super::{
     Service,
     locale::{canonicalize_locale_list, filter_locales, resolve_locale},
     options::{IntlOptions, coerce_options_to_object},
+    parts::{PartsCollector, UnmarkedStyle},
 };
 use crate::{
-    Context, JsArgs, JsData, JsExpect, JsNativeError, JsObject, JsResult, JsString, JsSymbol,
-    JsValue, NativeFunction,
+    Context, JsArgs, JsData, JsNativeError, JsObject, JsResult, JsString, JsSymbol, JsValue,
+    NativeFunction,
     builtins::{
-        Array, BuiltInConstructor, BuiltInObject, IntrinsicObject, OrdinaryObject,
-        builder::BuiltInBuilder, options::get_option,
+        BuiltInConstructor, BuiltInObject, IntrinsicObject, builder::BuiltInBuilder,
+        options::get_option,
     },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_string,
@@ -76,106 +77,6 @@ impl Writeable for SpecialValue {
             },
         };
         sink.with_part(part, |sink| self.write_to(sink))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct NumberPart {
-    kind: &'static str,
-    value: String,
-}
-
-#[derive(Debug)]
-struct PartsCollector {
-    parts: Vec<NumberPart>,
-    active_part: Option<&'static str>,
-    compact: bool,
-}
-
-impl PartsCollector {
-    fn new(compact: bool) -> Self {
-        Self {
-            parts: Vec::new(),
-            active_part: None,
-            compact,
-        }
-    }
-
-    fn push(&mut self, kind: &'static str, value: &str) {
-        if value.is_empty() {
-            return;
-        }
-
-        if let Some(last) = self.parts.last_mut()
-            && last.kind == kind
-        {
-            last.value.push_str(value);
-        } else {
-            self.parts.push(NumberPart {
-                kind,
-                value: value.to_owned(),
-            });
-        }
-    }
-
-    fn push_unmarked(&mut self, value: &str) {
-        if !self.compact {
-            self.push("literal", value);
-            return;
-        }
-
-        let mut start = 0;
-        let mut whitespace = None;
-        for (index, character) in value.char_indices() {
-            let is_whitespace = character.is_whitespace();
-            if whitespace.is_some_and(|current| current != is_whitespace) {
-                self.push(
-                    if whitespace == Some(true) {
-                        "literal"
-                    } else {
-                        "compact"
-                    },
-                    &value[start..index],
-                );
-                start = index;
-            }
-            whitespace = Some(is_whitespace);
-        }
-
-        self.push(
-            if whitespace == Some(true) {
-                "literal"
-            } else {
-                "compact"
-            },
-            &value[start..],
-        );
-    }
-}
-
-impl core::fmt::Write for PartsCollector {
-    fn write_str(&mut self, value: &str) -> core::fmt::Result {
-        if let Some(kind) = self.active_part {
-            self.push(kind, value);
-        } else {
-            self.push_unmarked(value);
-        }
-        Ok(())
-    }
-}
-
-impl writeable::PartsWrite for PartsCollector {
-    type SubPartsWrite = Self;
-
-    fn with_part(
-        &mut self,
-        part: writeable::Part,
-        mut write: impl FnMut(&mut Self::SubPartsWrite) -> core::fmt::Result,
-    ) -> core::fmt::Result {
-        let previous = self.active_part.replace(part.value);
-        let result = write(self);
-        self.active_part = previous;
-        result
     }
 }
 
@@ -871,32 +772,16 @@ impl NumberFormat {
         // 5. Return FormatNumericToParts(nf, x).
         let nf = nf.borrow();
         let nf = nf.data();
-        let mut parts = PartsCollector::new(matches!(nf.formatter, Formatter::Compact { .. }));
+        let unmarked_style = if matches!(nf.formatter, Formatter::Compact { .. }) {
+            UnmarkedStyle::Compact
+        } else {
+            UnmarkedStyle::Literal
+        };
+        let mut parts = PartsCollector::new(unmarked_style);
         nf.format(&mut value)
             .write_to_parts(&mut parts)
             .map_err(|error| JsNativeError::typ().with_message(error.to_string()))?;
-
-        let result = Array::array_create(0, None, context)
-            .js_expect("creating an empty array with the default prototype must not fail")?;
-
-        for (index, part) in parts.parts.into_iter().enumerate() {
-            let object = context
-                .intrinsics()
-                .templates()
-                .ordinary_object()
-                .create(OrdinaryObject, vec![]);
-            object
-                .create_data_property_or_throw(js_string!("type"), js_string!(part.kind), context)
-                .js_expect("creating a property on a fresh ordinary object must not fail")?;
-            object
-                .create_data_property_or_throw(js_string!("value"), js_string!(part.value), context)
-                .js_expect("creating a property on a fresh ordinary object must not fail")?;
-            result
-                .create_data_property_or_throw(index, object, context)
-                .js_expect("creating an indexed property on a fresh array must not fail")?;
-        }
-
-        Ok(result.into())
+        parts.into_js_array(context)
     }
 
     /// [`Intl.NumberFormat.prototype.resolvedOptions ( )`][spec].

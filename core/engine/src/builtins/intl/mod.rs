@@ -92,6 +92,7 @@ pub(crate) mod plural_rules;
 pub(crate) mod segmenter;
 
 mod options;
+mod parts;
 
 // No singletons are allowed as lang markers.
 // Hopefully, we'll be able to migrate this to the definition of `Service` in the future
