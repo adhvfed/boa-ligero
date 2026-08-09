@@ -4687,6 +4687,14 @@ mod tests {
     fn admission_cache_is_scoped_to_backend_generation() {
         let mut context = Context::default();
         context.enable_jit();
+        let thresholds = JitThresholds {
+            function_entries: 64,
+            // This test exercises function-entry admission. Letting the inner loop
+            // compile first couples the assertion to the independent OSR resource
+            // breaker, whose wall-clock limit can trip under parallel test load.
+            loop_backedges: u32::MAX,
+        };
+        context.set_jit_thresholds(thresholds);
         let setup = crate::Script::parse(
             crate::Source::from_bytes(
                 "function sum(n) { let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } let first = 0; for (let i = 0; i < 80; i++) { first = sum(10); } first",
@@ -4702,13 +4710,8 @@ mod tests {
                 .as_i32(),
             Some(45)
         );
-        assert!(
-            context
-                .jit_stats()
-                .expect("first JIT backend")
-                .native_compilations
-                >= 1
-        );
+        let stats = context.jit_stats().expect("first JIT backend");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
 
         context.disable_jit();
         assert_eq!(context.active_jit_backend_id, 0);
@@ -4724,6 +4727,7 @@ mod tests {
         );
 
         context.enable_jit();
+        context.set_jit_thresholds(thresholds);
         let warm_again = crate::Script::parse(
             crate::Source::from_bytes(
                 "let second = 0; for (let i = 0; i < 80; i++) { second = sum(10); } second",
