@@ -1,7 +1,8 @@
 # Number `BitOr` lowering design — 2026-08-09
 
-Status: selected for a bounded whole-function prototype. Loop OSR remains
-explicitly excluded from this slice.
+Status: accepted and implemented by `dca5f7fc`. Loop OSR remains explicitly
+excluded from this slice. Results are recorded in the
+[implementation checkpoint](41-number-bitor-checkpoint-2026-08-09.md).
 
 # Measured problem
 
