@@ -161,6 +161,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             // test262 uses the Manx locale.
             // Required by https://github.com/tc39/test262/blob/a073f479f80b336256b7fc4e04700c827293e2fe/test/intl402/PluralRules/prototype/resolvedOptions/plural-categories-order.js
             DataLocaleFamily::with_descendants(locale!("gv").into()),
+            // ICU's pt-PT number-range separator is more specific than the
+            // generic Portuguese CLDR range pattern.
+            DataLocaleFamily::single(locale!("pt-PT").into()),
         ]);
 
     let driver = ExportDriver::new(

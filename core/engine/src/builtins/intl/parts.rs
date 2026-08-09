@@ -12,6 +12,40 @@ pub(crate) struct FormattedPart {
     pub(crate) value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeSource {
+    Start,
+    End,
+    Shared,
+}
+
+impl RangeSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "startRange",
+            Self::End => "endRange",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RangePart {
+    pub(crate) kind: &'static str,
+    pub(crate) value: String,
+    pub(crate) source: RangeSource,
+}
+
+impl RangePart {
+    pub(crate) fn new(part: FormattedPart, source: RangeSource) -> Self {
+        Self {
+            kind: part.kind,
+            value: part.value,
+            source,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum UnmarkedStyle {
     /// Drop text outside an ICU part.
@@ -91,28 +125,57 @@ impl PartsCollector {
     }
 
     pub(crate) fn into_js_array(self, context: &mut Context) -> JsResult<JsValue> {
-        let result = Array::array_create(0, None, context)
-            .js_expect("creating an empty array with the default prototype must not fail")?;
-
-        for (index, part) in self.parts.into_iter().enumerate() {
-            let object = context
-                .intrinsics()
-                .templates()
-                .ordinary_object()
-                .create(OrdinaryObject, vec![]);
-            object
-                .create_data_property_or_throw(js_string!("type"), js_string!(part.kind), context)
-                .js_expect("creating a property on a fresh ordinary object must not fail")?;
-            object
-                .create_data_property_or_throw(js_string!("value"), js_string!(part.value), context)
-                .js_expect("creating a property on a fresh ordinary object must not fail")?;
-            result
-                .create_data_property_or_throw(index, object, context)
-                .js_expect("creating an indexed property on a fresh array must not fail")?;
-        }
-
-        Ok(result.into())
+        parts_into_js_array(
+            self.parts
+                .into_iter()
+                .map(|part| (part.kind, part.value, None)),
+            context,
+        )
     }
+}
+
+pub(crate) fn range_parts_into_js_array(
+    parts: Vec<RangePart>,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    parts_into_js_array(
+        parts
+            .into_iter()
+            .map(|part| (part.kind, part.value, Some(part.source.as_str()))),
+        context,
+    )
+}
+
+fn parts_into_js_array(
+    parts: impl IntoIterator<Item = (&'static str, String, Option<&'static str>)>,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let result = Array::array_create(0, None, context)
+        .js_expect("creating an empty array with the default prototype must not fail")?;
+
+    for (index, (kind, value, source)) in parts.into_iter().enumerate() {
+        let object = context
+            .intrinsics()
+            .templates()
+            .ordinary_object()
+            .create(OrdinaryObject, vec![]);
+        object
+            .create_data_property_or_throw(js_string!("type"), js_string!(kind), context)
+            .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        object
+            .create_data_property_or_throw(js_string!("value"), js_string!(value), context)
+            .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        if let Some(source) = source {
+            object
+                .create_data_property_or_throw(js_string!("source"), js_string!(source), context)
+                .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        }
+        result
+            .create_data_property_or_throw(index, object, context)
+            .js_expect("creating an indexed property on a fresh array must not fail")?;
+    }
+
+    Ok(result.into())
 }
 
 impl core::fmt::Write for PartsCollector {

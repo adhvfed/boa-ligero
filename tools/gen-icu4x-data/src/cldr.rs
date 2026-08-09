@@ -43,8 +43,15 @@ struct Numbers {
 struct Symbols {
     infinity: String,
     nan: String,
+    #[serde(rename = "approximatelySign")]
+    approximately_sign: String,
     #[serde(rename = "minusSign")]
     minus_sign: String,
+}
+
+#[derive(Deserialize)]
+struct MiscPatterns {
+    range: String,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +95,15 @@ impl SupplementalNumberData {
                 return Err(format!("CLDR locale {locale_name} is missing {key}").into());
             };
             let symbols: Symbols = serde_json::from_value(symbols.clone())?;
+            let misc_key = format!(
+                "miscPatterns-numberSystem-{}",
+                numbers.default_numbering_system
+            );
+            let Some(misc_patterns) = numbers.sections.get(&misc_key) else {
+                return Err(format!("CLDR locale {locale_name} is missing {misc_key}").into());
+            };
+            let misc_patterns: MiscPatterns = serde_json::from_value(misc_patterns.clone())?;
+            let range_separator = range_pattern_infix(&misc_patterns.range)?;
             let currency_key = format!(
                 "currencyFormats-numberSystem-{}",
                 numbers.default_numbering_system
@@ -107,6 +123,15 @@ impl SupplementalNumberData {
                 NumberSpecialSymbols {
                     infinity: Cow::Owned(symbols.infinity),
                     nan: Cow::Owned(symbols.nan),
+                    approximately_sign: Cow::Owned(symbols.approximately_sign),
+                    // ICU's Portuguese (Portugal) number-range convention is
+                    // intentionally more specific than CLDR's generic number
+                    // range pattern.
+                    range_separator: Cow::Owned(if locale_name == "pt-PT" {
+                        " - ".to_owned()
+                    } else {
+                        range_separator
+                    }),
                 },
             );
             let alpha_pattern = currency_formats
@@ -140,6 +165,21 @@ impl SupplementalNumberData {
     ) -> &HashMap<DataLocale, CurrencyAccountingPatterns<'static>> {
         &self.accounting_patterns
     }
+}
+
+fn range_pattern_infix(pattern: &str) -> Result<String, Box<dyn Error>> {
+    let Some(after_start) = pattern.strip_prefix("{0}") else {
+        return Err(format!("number range pattern must start with {{0}}: {pattern:?}").into());
+    };
+    let Some(infix) = after_start.strip_suffix("{1}") else {
+        return Err(format!("number range pattern must end with {{1}}: {pattern:?}").into());
+    };
+    if infix.is_empty() {
+        return Err(
+            format!("number range pattern must have a non-empty infix: {pattern:?}").into(),
+        );
+    }
+    Ok(infix.to_owned())
 }
 
 #[derive(Debug)]
@@ -362,6 +402,18 @@ mod tests {
     #[test]
     fn extracts_typed_accounting_patterns() {
         let data = SupplementalNumberData::load().unwrap();
+        let en_symbols = data
+            .special_symbols()
+            .get(&DataLocale::try_from_str("en").unwrap())
+            .unwrap();
+        assert_eq!(&*en_symbols.approximately_sign, "~");
+        assert_eq!(&*en_symbols.range_separator, "–");
+        let pt_pt_symbols = data
+            .special_symbols()
+            .get(&DataLocale::try_from_str("pt-PT").unwrap())
+            .unwrap();
+        assert_eq!(&*pt_pt_symbols.range_separator, " - ");
+
         let en = data
             .accounting_patterns()
             .get(&DataLocale::try_from_str("en").unwrap())

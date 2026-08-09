@@ -31,7 +31,7 @@ use super::{
     Service,
     locale::{canonicalize_locale_list, filter_locales, resolve_locale},
     options::{IntlOptions, coerce_options_to_object},
-    parts::{PartsCollector, UnmarkedStyle},
+    parts::{PartsCollector, UnmarkedStyle, range_parts_into_js_array},
 };
 use crate::{
     Context, JsArgs, JsData, JsNativeError, JsObject, JsResult, JsString, JsSymbol, JsValue,
@@ -63,6 +63,8 @@ mod currency;
 use currency::{CurrencyFormatterOptions, FormattedCurrency};
 mod unit;
 use unit::{FormattedUnit, UnitData};
+mod range;
+use range::RangeFormatter;
 
 #[cfg(test)]
 mod tests;
@@ -465,6 +467,51 @@ impl NumberFormat {
             }
         }
     }
+
+    fn unmarked_style(&self) -> UnmarkedStyle {
+        if matches!(self.formatter, Formatter::Compact { .. }) {
+            UnmarkedStyle::Compact
+        } else {
+            UnmarkedStyle::Literal
+        }
+    }
+
+    fn collect_parts(&self, value: &mut IntlMathematicalValue) -> JsResult<PartsCollector> {
+        let mut parts = PartsCollector::new(self.unmarked_style());
+        self.format(value)
+            .write_to_parts(&mut parts)
+            .map_err(|error| JsNativeError::typ().with_message(error.to_string()))?;
+        Ok(parts)
+    }
+
+    fn partition_range(
+        &self,
+        start: &mut IntlMathematicalValue,
+        end: &mut IntlMathematicalValue,
+    ) -> JsResult<Vec<super::parts::RangePart>> {
+        if matches!(start, IntlMathematicalValue::NaN) || matches!(end, IntlMathematicalValue::NaN)
+        {
+            return Err(JsNativeError::range()
+                .with_message("number range endpoints must not be NaN")
+                .into());
+        }
+
+        let start = self.collect_parts(start)?.parts;
+        let end = self.collect_parts(end)?.parts;
+        let (approximately_sign, range_separator) =
+            self.special_symbols.as_ref().map_or(("~", "–"), |data| {
+                (
+                    &*data.get().approximately_sign,
+                    &*data.get().range_separator,
+                )
+            });
+        Ok(RangeFormatter::new(
+            range_separator,
+            approximately_sign,
+            self.unit_options.style(),
+        )
+        .format(start, end))
+    }
 }
 
 impl Service for NumberFormat {
@@ -497,6 +544,12 @@ impl IntrinsicObject for NumberFormat {
                 Attribute::CONFIGURABLE,
             )
             .method(Self::format_to_parts, js_string!("formatToParts"), 1)
+            .method(Self::format_range, js_string!("formatRange"), 2)
+            .method(
+                Self::format_range_to_parts,
+                js_string!("formatRangeToParts"),
+                2,
+            )
             .method(Self::resolved_options, js_string!("resolvedOptions"), 0)
             .build();
     }
@@ -512,7 +565,7 @@ impl BuiltInObject for NumberFormat {
 
 impl BuiltInConstructor for NumberFormat {
     const CONSTRUCTOR_ARGUMENTS: usize = 0;
-    const PROTOTYPE_STORAGE_SLOTS: usize = 5;
+    const PROTOTYPE_STORAGE_SLOTS: usize = 7;
     const CONSTRUCTOR_STORAGE_SLOTS: usize = 1;
 
     const STANDARD_CONSTRUCTOR: fn(&StandardConstructors) -> &StandardConstructor =
@@ -793,21 +846,8 @@ impl NumberFormat {
             id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
             ..icu_provider::DataRequest::default()
         };
-        let special_symbols = match context.intl_provider().load(request) {
-            Ok(response) => {
-                let response: icu_provider::DataResponse<BoaNumberSpecialSymbolsV1> = response;
-                Some(response.payload)
-            }
-            Err(error)
-                if matches!(
-                    error.kind,
-                    DataErrorKind::MarkerNotFound | DataErrorKind::IdentifierNotFound
-                ) =>
-            {
-                None
-            }
-            Err(error) => return Err(js_error!(TypeError: "{}", error.to_string())),
-        };
+        let special_symbols =
+            load_optional_payload::<BoaNumberSpecialSymbolsV1>(context.intl_provider(), request)?;
         let style_data = match unit_options.style() {
             Style::Percent => {
                 let response: icu_provider::DataResponse<PercentEssentialsV1> = context
@@ -1087,16 +1127,37 @@ impl NumberFormat {
         // 5. Return FormatNumericToParts(nf, x).
         let nf = nf.borrow();
         let nf = nf.data();
-        let unmarked_style = if matches!(nf.formatter, Formatter::Compact { .. }) {
-            UnmarkedStyle::Compact
-        } else {
-            UnmarkedStyle::Literal
-        };
-        let mut parts = PartsCollector::new(unmarked_style);
-        nf.format(&mut value)
-            .write_to_parts(&mut parts)
-            .map_err(|error| JsNativeError::typ().with_message(error.to_string()))?;
-        parts.into_js_array(context)
+        nf.collect_parts(&mut value)?.into_js_array(context)
+    }
+
+    /// [`Intl.NumberFormat.prototype.formatRange ( start, end )`][spec].
+    ///
+    /// [spec]: https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrange
+    fn format_range(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+        let nf = unwrap_number_format(this, context)?;
+        let (mut start, mut end) = range_endpoints(args, context)?;
+        let parts = nf.borrow().data().partition_range(&mut start, &mut end)?;
+        Ok(js_string!(
+            parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<String>()
+        )
+        .into())
+    }
+
+    /// [`Intl.NumberFormat.prototype.formatRangeToParts ( start, end )`][spec].
+    ///
+    /// [spec]: https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrangetoparts
+    fn format_range_to_parts(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        let nf = unwrap_number_format(this, context)?;
+        let (mut start, mut end) = range_endpoints(args, context)?;
+        let parts = nf.borrow().data().partition_range(&mut start, &mut end)?;
+        range_parts_into_js_array(parts, context)
     }
 
     /// [`Intl.NumberFormat.prototype.resolvedOptions ( )`][spec].
@@ -1290,6 +1351,41 @@ impl NumberFormat {
         // 6. Return options.
         Ok(options.build().into())
     }
+}
+
+fn load_optional_payload<M: DataMarker>(
+    provider: &impl DataProvider<M>,
+    request: icu_provider::DataRequest<'_>,
+) -> JsResult<Option<DataPayload<M>>> {
+    match provider.load(request) {
+        Ok(response) => Ok(Some(response.payload)),
+        Err(error)
+            if matches!(
+                error.kind,
+                DataErrorKind::MarkerNotFound | DataErrorKind::IdentifierNotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(js_error!(TypeError: "{}", error.to_string())),
+    }
+}
+
+fn range_endpoints(
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<(IntlMathematicalValue, IntlMathematicalValue)> {
+    let start = args.get_or_undefined(0);
+    let end = args.get_or_undefined(1);
+    if start.is_undefined() || end.is_undefined() {
+        return Err(JsNativeError::typ()
+            .with_message("number range endpoints must not be undefined")
+            .into());
+    }
+
+    let start = to_intl_mathematical_value(start, context)?;
+    let end = to_intl_mathematical_value(end, context)?;
+    Ok((start, end))
 }
 
 /// Abstract operation [`UnwrapNumberFormat ( nf )`][spec].

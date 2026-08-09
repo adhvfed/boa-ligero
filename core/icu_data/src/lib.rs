@@ -35,6 +35,14 @@ pub struct NumberSpecialSymbols<'data> {
     /// The localized representation of `NaN`.
     #[cfg_attr(feature = "serde", serde(borrow))]
     pub nan: Cow<'data, str>,
+
+    /// The localized sign used to mark an approximate number.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    pub approximately_sign: Cow<'data, str>,
+
+    /// The locale-specific infix placed between distinct range endpoints.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    pub range_separator: Cow<'data, str>,
 }
 
 icu_provider::data_struct!(
