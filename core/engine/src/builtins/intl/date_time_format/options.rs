@@ -1,7 +1,7 @@
 //! Intl.DateTimeFormat options module
 
 use crate::{
-    Context, JsError, JsNativeError, JsObject, JsResult, JsValue,
+    Context, JsNativeError, JsObject, JsResult, JsValue,
     builtins::{
         intl::{
             ServicePreferences, date_time_format::FormatType, locale::validate_extension,
@@ -33,6 +33,7 @@ use icu_provider::{
     },
 };
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum HourCycle {
     H11,
     H12,
@@ -52,16 +53,33 @@ impl OptionType for HourCycle {
     }
 }
 
-impl TryFrom<HourCycle> for IcuHourCycle {
-    type Error = JsError;
-    fn try_from(hc: HourCycle) -> Result<Self, Self::Error> {
-        match hc {
-            HourCycle::H11 => Ok(IcuHourCycle::H11),
-            HourCycle::H12 => Ok(IcuHourCycle::H12),
-            HourCycle::H23 => Ok(IcuHourCycle::H23),
-            // TODO: Work on support for H24, potentially remove depending on fate
-            // of H24 option.
-            HourCycle::H24 => Err(js_error!(RangeError: "h24 not currently supported.")),
+impl HourCycle {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::H11 => "h11",
+            Self::H12 => "h12",
+            Self::H23 => "h23",
+            Self::H24 => "h24",
+        }
+    }
+
+    pub(super) const fn is_hour12(self) -> bool {
+        matches!(self, Self::H11 | Self::H12)
+    }
+
+    pub(super) const fn to_icu(self) -> IcuHourCycle {
+        match self {
+            Self::H11 => IcuHourCycle::H11,
+            Self::H12 => IcuHourCycle::H12,
+            Self::H23 | Self::H24 => IcuHourCycle::H23,
+        }
+    }
+
+    pub(super) const fn from_icu(value: IcuHourCycle) -> Self {
+        match value {
+            IcuHourCycle::H11 => Self::H11,
+            IcuHourCycle::H12 => Self::H12,
+            _ => Self::H23,
         }
     }
 }
@@ -154,8 +172,8 @@ impl OptionType for IcuHourCycle {
 // This section includes formatting options that act as an intermediary between
 // user space and ICU4X's datetimeformat composite fields.
 
+#[derive(Debug, Clone)]
 pub(super) struct FormatOptions {
-    _hour_cycle: Option<IcuHourCycle>,                 // -> ???
     week_day: Option<WeekDay>,                         // e -> Maps to DateField
     era: Option<Era>,                                  // G -> Maps to YearStyle
     year: Option<Year>,                                // Y -> Maps to DateField
@@ -170,11 +188,7 @@ pub(super) struct FormatOptions {
 }
 
 impl FormatOptions {
-    pub(super) fn try_init(
-        options: &JsObject,
-        hour_cycle: Option<IcuHourCycle>, // TODO: Is option correct?
-        context: &mut Context,
-    ) -> JsResult<Self> {
+    pub(super) fn try_init(options: &JsObject, context: &mut Context) -> JsResult<Self> {
         // Below is adapted and inlined from Step 24 of `CreateDateTimeFormat`
         let week_day = get_option::<WeekDay>(options, js_string!("weekday"), context)?;
         let era = get_option::<Era>(options, js_string!("era"), context)?;
@@ -192,7 +206,6 @@ impl FormatOptions {
             get_option::<TimeZoneName>(options, js_string!("timeZoneName"), context)?;
 
         Ok(Self {
-            _hour_cycle: hour_cycle,
             week_day,
             era,
             year,
@@ -207,8 +220,33 @@ impl FormatOptions {
         })
     }
 
-    pub(super) fn fractional_second_digits(&self) -> Option<SubsecondDigits> {
-        self.fractional_second_digits
+    pub(super) const fn has_hour(&self) -> bool {
+        self.hour.is_some()
+    }
+
+    /// Visits the resolved component options in the property order required by ECMA-402.
+    pub(super) fn for_each_resolved_option(&self, mut visitor: impl FnMut(&'static str, JsValue)) {
+        macro_rules! visit_string_option {
+            ($field:ident, $name:literal) => {
+                if let Some(value) = self.$field {
+                    visitor($name, js_string!(value.as_str()).into());
+                }
+            };
+        }
+
+        visit_string_option!(week_day, "weekday");
+        visit_string_option!(era, "era");
+        visit_string_option!(year, "year");
+        visit_string_option!(month, "month");
+        visit_string_option!(day, "day");
+        visit_string_option!(day_period, "dayPeriod");
+        visit_string_option!(hour, "hour");
+        visit_string_option!(minute, "minute");
+        visit_string_option!(second, "second");
+        if let Some(value) = self.fractional_second_digits {
+            visitor("fractionalSecondDigits", value.digits().into());
+        }
+        visit_string_option!(time_zone_name, "timeZoneName");
     }
 
     pub(super) fn set_date_defaults(&mut self) {
@@ -345,6 +383,14 @@ impl OptionType for WeekDay {
 }
 
 impl WeekDay {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Short => "short",
+            Self::Long => "long",
+        }
+    }
+
     pub(crate) fn to_length(self) -> Length {
         match self {
             Self::Long => Length::Long,
@@ -362,6 +408,14 @@ pub(crate) enum Era {
 }
 
 impl Era {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Short => "short",
+            Self::Long => "long",
+        }
+    }
+
     pub(crate) fn to_length(self) -> Length {
         match self {
             Self::Long => Length::Long,
@@ -388,6 +442,15 @@ pub(crate) enum Year {
     Numeric,
 }
 
+impl Year {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+        }
+    }
+}
+
 impl OptionType for Year {
     fn from_value(value: JsValue, context: &mut Context) -> JsResult<Self> {
         match value.to_string(context)?.to_std_string_escaped().as_ref() {
@@ -408,6 +471,16 @@ pub(crate) enum Month {
 }
 
 impl Month {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+            Self::Narrow => "narrow",
+            Self::Short => "short",
+            Self::Long => "long",
+        }
+    }
+
     pub(crate) fn to_length(self) -> Length {
         // NOTE (nekevss): after a brief glance, narrow does not appear to be
         // currently supported by ICU4X ... TBD
@@ -438,6 +511,15 @@ pub(crate) enum Day {
     Numeric,
 }
 
+impl Day {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+        }
+    }
+}
+
 impl OptionType for Day {
     fn from_value(value: JsValue, context: &mut Context) -> JsResult<Self> {
         match value.to_string(context)?.to_std_string_escaped().as_ref() {
@@ -456,6 +538,14 @@ pub(crate) enum DayPeriod {
 }
 
 impl DayPeriod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Short => "short",
+            Self::Long => "long",
+        }
+    }
+
     pub(crate) fn to_length(self) -> Length {
         match self {
             Self::Long => Length::Long,
@@ -482,6 +572,15 @@ pub(crate) enum Hour {
     Numeric,
 }
 
+impl Hour {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+        }
+    }
+}
+
 impl OptionType for Hour {
     fn from_value(value: JsValue, context: &mut Context) -> JsResult<Self> {
         match value.to_string(context)?.to_std_string_escaped().as_ref() {
@@ -498,6 +597,15 @@ pub(crate) enum Minute {
     Numeric,
 }
 
+impl Minute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+        }
+    }
+}
+
 impl OptionType for Minute {
     fn from_value(value: JsValue, context: &mut Context) -> JsResult<Self> {
         match value.to_string(context)?.to_std_string_escaped().as_ref() {
@@ -512,6 +620,15 @@ impl OptionType for Minute {
 pub(crate) enum Second {
     TwoDigit,
     Numeric,
+}
+
+impl Second {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoDigit => "2-digit",
+            Self::Numeric => "numeric",
+        }
+    }
 }
 
 impl OptionType for Second {
@@ -585,6 +702,17 @@ impl OptionType for TimeZoneName {
 }
 
 impl TimeZoneName {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Short => "short",
+            Self::Long => "long",
+            Self::ShortOffset => "shortOffset",
+            Self::LongOffset => "longOffset",
+            Self::ShortGeneric => "shortGeneric",
+            Self::LongGeneric => "longGeneric",
+        }
+    }
+
     fn to_zone_style(self) -> ZoneStyle {
         match self {
             TimeZoneName::LongGeneric => ZoneStyle::GenericLong,

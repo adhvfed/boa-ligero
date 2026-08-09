@@ -14,14 +14,12 @@ use crate::{
 };
 
 use icu_locale::extensions::unicode::value;
-use icu_locale::{LanguageIdentifier, Locale, LocaleCanonicalizer};
+use icu_locale::{LanguageIdentifier, Locale, LocaleCanonicalizer, locale};
 use icu_provider::{
     DataIdentifierBorrowed, DataLocale, DataMarker, DataMarkerAttributes, DataRequest,
     DataRequestMetadata, DryDataProvider,
 };
 use indexmap::IndexSet;
-
-use tap::TapOptional;
 
 /// Abstract operation `DefaultLocale ( )`
 ///
@@ -33,12 +31,32 @@ use tap::TapOptional;
 ///
 /// [spec]: https://tc39.es/ecma402/#sec-defaultlocale
 pub(crate) fn default_locale(canonicalizer: &LocaleCanonicalizer) -> Locale {
-    sys_locale::get_locale()
-        .and_then(|loc| loc.parse::<Locale>().ok())
-        .tap_some_mut(|loc| {
-            canonicalizer.canonicalize(loc);
-        })
-        .unwrap_or(Locale::UNKNOWN)
+    canonicalize_default_locale(sys_locale::get_locale().as_deref(), canonicalizer)
+}
+
+/// Canonicalizes a host-provided locale without allowing an invalid locale to enter ICU's
+/// service-specific fallback machinery.
+fn canonicalize_default_locale(
+    host_locale: Option<&str>,
+    canonicalizer: &LocaleCanonicalizer,
+) -> Locale {
+    let mut locale = host_locale
+        .and_then(|locale| locale.parse().ok())
+        .unwrap_or(locale!("en-US"));
+
+    canonicalizer.canonicalize(&mut locale);
+    canonicalize_default_language_alias(&mut locale);
+
+    locale
+}
+
+fn canonicalize_default_language_alias(locale: &mut Locale) {
+    // ICU4X intentionally preserves the macrolanguage `no`, while ECMA-402's default-locale
+    // invariant and Test262's CLDR alias data require a canonical host locale. Apple platforms
+    // can report `no` as the preferred language even when the regional locale is `nb-NO`.
+    if locale.id.language == locale!("no").id.language {
+        locale.id.language = locale!("nb").id.language;
+    }
 }
 
 /// Gets the `Locale` struct from a `JsValue`.
@@ -356,13 +374,16 @@ where
         lookup_matching_locale_by_best_fit::<S>(requested_locales, provider)
     };
 
-    let mut found_locale = if let Some(loc) = found_locale {
-        loc
+    let (mut found_locale, used_default_locale) = if let Some(loc) = found_locale {
+        (loc, false)
     } else {
         let default = default_locale(provider.locale_canonicalizer()?);
-        lookup_matching_locale_by_best_fit::<S>([default], provider).ok_or_else(|| {
-            JsNativeError::typ().with_message("could not find i18n data for Intl service")
-        })?
+        (
+            lookup_matching_locale_by_best_fit::<S>([default], provider).ok_or_else(|| {
+                JsNativeError::typ().with_message("could not find i18n data for Intl service")
+            })?,
+            true,
+        )
     };
 
     // From here, the spec differs significantly from the implementation,
@@ -427,6 +448,9 @@ where
     provider
         .locale_canonicalizer()?
         .canonicalize(&mut found_locale);
+    if used_default_locale {
+        canonicalize_default_language_alias(&mut found_locale);
+    }
     let mut locale_prefs = S::Preferences::from(&found_locale);
 
     options.preferences.validate(&found_locale.id, provider);
@@ -541,11 +565,33 @@ mod tests {
     use crate::{
         builtins::intl::{
             Service,
-            locale::utils::{lookup_matching_locale_by_best_fit, lookup_matching_locale_by_prefix},
+            locale::utils::{
+                canonicalize_default_locale, lookup_matching_locale_by_best_fit,
+                lookup_matching_locale_by_prefix,
+            },
             options::EmptyPreferences,
         },
         context::icu::IntlProvider,
     };
+
+    #[test]
+    fn host_default_locale_is_canonical_and_deterministic() {
+        let provider = IntlProvider::try_new_buffer(boa_icu_provider::buffer());
+        let canonicalizer = provider.locale_canonicalizer().unwrap();
+
+        assert_eq!(
+            canonicalize_default_locale(Some("no-NO"), canonicalizer),
+            locale!("nb-NO")
+        );
+        assert_eq!(
+            canonicalize_default_locale(Some("not_a_locale"), canonicalizer),
+            locale!("en-US")
+        );
+        assert_eq!(
+            canonicalize_default_locale(None, canonicalizer),
+            locale!("en-US")
+        );
+    }
 
     #[test]
     fn best_fit() {

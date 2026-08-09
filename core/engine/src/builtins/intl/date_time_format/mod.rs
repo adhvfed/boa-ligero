@@ -17,9 +17,7 @@ use crate::{
         },
         intl::{
             Service,
-            date_time_format::options::{
-                DateStyle, FormatMatcher, FormatOptions, SubsecondDigits, TimeStyle,
-            },
+            date_time_format::options::{DateStyle, FormatMatcher, FormatOptions, TimeStyle},
             locale::{canonicalize_locale_list, filter_locales, resolve_locale},
             options::{IntlOptions, coerce_options_to_object},
         },
@@ -86,15 +84,14 @@ pub(crate) struct DateTimeFormat {
     locale: Locale,
     calendar_algorithm: Option<CalendarAlgorithm>, // TODO: Potentially remove ?
     numbering_system: Option<NumberingSystem>,
-    hour_cycle: Option<IcuHourCycle>,
+    hour_cycle: Option<options::HourCycle>,
     date_style: Option<DateStyle>,
     time_style: Option<TimeStyle>,
-    fractional_second_digits: Option<SubsecondDigits>,
+    format_options: FormatOptions,
     time_zone: FormatTimeZone,
     fieldset: CompositeFieldSet,
     formatter: DateTimeFormatter<CompositeFieldSet>,
     bound_format: Option<JsFunction>,
-    resolved_options: Option<JsObject>,
 }
 
 impl Service for DateTimeFormat {
@@ -335,10 +332,6 @@ impl DateTimeFormat {
         //       a. Set dtf to ? UnwrapDateTimeFormat(dtf).
         // 3. Perform ? RequireInternalSlot(dtf, [[InitializedDateTimeFormat]]).
         let dtf_object = unwrap_date_time_format(this, context)?;
-        if let Some(cached) = dtf_object.borrow().data().resolved_options.clone() {
-            return Ok(cached.into());
-        }
-
         // 4. Let options be OrdinaryObjectCreate(%Object.prototype%).
         // 5. For each row of Table 15, except the header row, in table order, do
         //      a. Let p be the Property value of the current row.
@@ -401,28 +394,21 @@ impl DateTimeFormat {
                 Attribute::all(),
             );
 
-            if let Some(hc) = &dtf.hour_cycle {
+            if let Some(hc) = dtf
+                .hour_cycle
+                .filter(|_| dtf.format_options.has_hour() || dtf.time_style.is_some())
+            {
                 options.property(
                     js_string!("hourCycle"),
                     js_string!(hc.as_str()),
                     Attribute::all(),
                 );
-                //h11/h12 -> true, h23/h24 -> false , because its h12 conversion time
-                let hour12 = matches!(hc, IcuHourCycle::H11 | IcuHourCycle::H12);
-                options.property(js_string!("hour12"), hour12, Attribute::all());
+                options.property(js_string!("hour12"), hc.is_hour12(), Attribute::all());
             }
 
-            // Per Table 15, fractionalSecondDigits is only reported when neither
-            // dateStyle nor timeStyle is set; the constructor already guarantees this by
-            // rejecting explicit component options alongside a style, so the value is
-            // `None` whenever a style is present.
-            if let Some(fsd) = dtf.fractional_second_digits {
-                options.property(
-                    js_string!("fractionalSecondDigits"),
-                    fsd.digits(),
-                    Attribute::all(),
-                );
-            }
+            dtf.format_options.for_each_resolved_option(|name, value| {
+                options.property(js_string!(name), value, Attribute::all());
+            });
 
             if let Some(ds) = dtf.date_style {
                 let ds_str = match ds {
@@ -456,7 +442,6 @@ impl DateTimeFormat {
         };
 
         // 6. Return options.
-        dtf_object.borrow_mut().data_mut().resolved_options = Some(result.clone());
         Ok(result.into())
     }
 }
@@ -599,20 +584,13 @@ pub(crate) fn create_date_time_format(
     let hour_12 = get_option::<bool>(&options, js_string!("hour12"), context)?;
 
     // { [[Key]]: "hc", [[Property]]: "hourCycle", [[Values]]: « "h11", "h12", "h23", "h24" » }
-    preferences.hour_cycle =
-        get_option::<options::HourCycle>(&options, js_string!("hourCycle"), context)?
-            .map(|hc| {
-                // Handle steps 3.a-c here
-                // c. If hour12 is not undefined, set options.[[hc]] to null.
-                if hour_12.is_some() {
-                    Ok(None)
-                } else {
-                    IcuHourCycle::try_from(hc).map(Some)
-                }
-            })
-            .transpose()
-            .map_err(|_icu4x_error| js_error!(RangeError: "unknown hour cycle"))?
-            .flatten();
+    let requested_hour_cycle =
+        get_option::<options::HourCycle>(&options, js_string!("hourCycle"), context)?;
+    preferences.hour_cycle = match hour_12 {
+        Some(true) => Some(IcuHourCycle::H12),
+        Some(false) => Some(IcuHourCycle::H23),
+        None => requested_hour_cycle.map(options::HourCycle::to_icu),
+    };
 
     let mut intl_options = IntlOptions {
         matcher,
@@ -653,6 +631,16 @@ pub(crate) fn create_date_time_format(
         )
         .ok();
     }
+    let resolved_hour_cycle = match hour_12 {
+        Some(true) => Some(options::HourCycle::H12),
+        Some(false) => Some(options::HourCycle::H23),
+        None => requested_hour_cycle.or_else(|| {
+            intl_options
+                .preferences
+                .hour_cycle
+                .map(options::HourCycle::from_icu)
+        }),
+    };
     // 5. Set options to optionsResolution.[[Options]].
     // 6. Let r be optionsResolution.[[ResolvedLocale]].
     // 7. Set (deferred) dateTimeFormat.[[Locale]] to r.[[Locale]].
@@ -733,7 +721,7 @@ pub(crate) fn create_date_time_format(
     //         d. Set formatOptions.[[<prop>]] to value.
     //         e. If value is not undefined, then
     //                i. Set hasExplicitFormatComponents to true.
-    let mut format_options = FormatOptions::try_init(&options, preferences.hour_cycle, context)?;
+    let mut format_options = FormatOptions::try_init(&options, context)?;
 
     // TODO: how should formatMatcher be used?
     // 25. Let formatMatcher be ? GetOption(options, "formatMatcher", string, « "basic", "best fit" », "best fit").
@@ -827,15 +815,14 @@ pub(crate) fn create_date_time_format(
         locale: resolved_locale,
         calendar_algorithm: intl_options.preferences.calendar_algorithm,
         numbering_system: intl_options.preferences.numbering_system,
-        hour_cycle: intl_options.preferences.hour_cycle,
+        hour_cycle: resolved_hour_cycle,
         date_style,
         time_style,
-        fractional_second_digits: format_options.fractional_second_digits(),
+        format_options,
         time_zone,
         fieldset,
         formatter,
         bound_format: None,
-        resolved_options: None,
     })
 }
 

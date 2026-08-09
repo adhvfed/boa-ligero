@@ -116,3 +116,28 @@ fn dtf_ctor_observable_behavior() {
         TestAction::assert_eq("expected[1] === 'error-thrown'", true),
     ]);
 }
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn resolved_options_preserve_components_and_object_identity() {
+    run_test_actions([
+        TestAction::run(indoc! {"
+            const formatter = new Intl.DateTimeFormat('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: '2-digit',
+                hour: 'numeric',
+                hourCycle: 'h24',
+            });
+            const first = formatter.resolvedOptions();
+            const second = formatter.resolvedOptions();
+        "}),
+        TestAction::assert_eq("first !== second", true),
+        TestAction::assert_eq("first.year === 'numeric'", true),
+        TestAction::assert_eq("first.month === 'long'", true),
+        TestAction::assert_eq("first.day === '2-digit'", true),
+        TestAction::assert_eq("first.hour === 'numeric'", true),
+        TestAction::assert_eq("first.hourCycle === 'h24'", true),
+        TestAction::assert_eq("first.hour12 === false", true),
+    ]);
+}
