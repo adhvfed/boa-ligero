@@ -259,10 +259,7 @@ fn collect_osr_cold_sample(
     code: &str,
     diagnostic_limits: Option<boa_engine::jit::JitDiagnosticLimits>,
 ) -> OsrColdSample {
-    let context = &mut Context::builder()
-        .jit(true)
-        .build()
-        .expect("build JIT context");
+    let context = &mut interpreter_context();
     context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(context);
 
@@ -397,10 +394,7 @@ fn run_jit(
     // entry immediately. Script parsing and top-level setup remain outside the
     // timer, matching the existing runner protocol; the reported duration
     // includes JIT compilation and the complete first call.
-    let cold_context = &mut Context::builder()
-        .jit(true)
-        .build()
-        .expect("build JIT context");
+    let cold_context = &mut interpreter_context();
     cold_context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(cold_context);
     let cold_script = parse_script(code, cold_context);
@@ -433,10 +427,7 @@ fn run_jit(
 
     // The warm sample uses the production thresholds and a fresh context so
     // compilation is not accidentally amortized by the cold sample.
-    let context = &mut Context::builder()
-        .jit(true)
-        .build()
-        .expect("build JIT context");
+    let context = &mut interpreter_context();
     context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(context);
     let script = parse_script(code, context);
