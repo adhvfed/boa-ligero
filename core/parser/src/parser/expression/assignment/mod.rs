@@ -292,6 +292,19 @@ where
                         {
                             let assignop = p.as_assign_op().expect("assignop disappeared");
 
+                            #[cfg(feature = "annex-b")]
+                            if matches!(target, AssignTarget::Call(_))
+                                && matches!(
+                                    assignop,
+                                    AssignOp::BoolAnd | AssignOp::BoolOr | AssignOp::Coalesce
+                                )
+                            {
+                                return Err(Error::lex(LexError::Syntax(
+                                    "Invalid left-hand side in assignment".into(),
+                                    tok.span().start(),
+                                )));
+                            }
+
                             let mut rhs = self.parse(cursor, interner)?;
                             if (assignop == AssignOp::BoolAnd
                                 || assignop == AssignOp::BoolOr
