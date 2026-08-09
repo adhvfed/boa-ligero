@@ -360,6 +360,62 @@ fn iterator_prototype_iterator_self() {
 }
 
 #[test]
+fn iterator_prototype_dispose() {
+    run_test_actions([
+        TestAction::assert_eq("Iterator.prototype[Symbol.dispose].length", 0),
+        TestAction::assert_eq(
+            "Iterator.prototype[Symbol.dispose].name",
+            js_str!("[Symbol.dispose]"),
+        ),
+        TestAction::assert_eq("Iterator.prototype[Symbol.dispose]()", JsValue::undefined()),
+        TestAction::assert_eq(
+            "(() => {
+                let receiver;
+                const iterator = Object.create(Iterator.prototype, {
+                    return: { value() { receiver = this; return 42; } }
+                });
+                const result = iterator[Symbol.dispose]();
+                return receiver === iterator && result === undefined;
+            })()",
+            true,
+        ),
+        TestAction::assert_native_error(
+            "Iterator.prototype[Symbol.dispose].call({ return: 1 })",
+            JsNativeErrorKind::Type,
+            "value returned for property of object is not a function",
+        ),
+        TestAction::assert_eq(
+            "(() => {
+                const expected = {};
+                try {
+                    Iterator.prototype[Symbol.dispose].call({
+                        get return() { throw expected; }
+                    });
+                } catch (error) {
+                    return error === expected;
+                }
+                return false;
+            })()",
+            true,
+        ),
+        TestAction::assert_eq(
+            "(() => {
+                const expected = {};
+                try {
+                    Iterator.prototype[Symbol.dispose].call({
+                        return() { throw expected; }
+                    });
+                } catch (error) {
+                    return error === expected;
+                }
+                return false;
+            })()",
+            true,
+        ),
+    ]);
+}
+
+#[test]
 fn iterator_concat_basic() {
     run_test_actions([TestAction::assert_eq(
         "Iterator.concat([1,2],[3,4]).toArray().join(',')",

@@ -41,6 +41,7 @@ impl IntrinsicObject for Iterator {
             .build();
         let builder = BuiltInBuilder::with_intrinsic::<Self>(realm)
             .static_method(|v, _, _| Ok(v.clone()), JsSymbol::iterator(), 0)
+            .static_method(Self::dispose, JsSymbol::dispose(), 0)
             .static_method(Self::map, js_string!("map"), 1)
             .static_method(Self::filter, js_string!("filter"), 1)
             .static_method(Self::take, js_string!("take"), 1)
@@ -77,6 +78,20 @@ impl IntrinsicObject for Iterator {
 }
 
 impl Iterator {
+    /// `%IteratorPrototype% [ @@dispose ] ( )`
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-%iteratorprototype%-%symbol.dispose%
+    fn dispose(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+        if let Some(return_method) = this.get_method(js_string!("return"), context)? {
+            return_method.call(this, &[], context)?;
+        }
+
+        Ok(JsValue::undefined())
+    }
+
     /// `get Iterator.prototype.constructor`
     ///
     /// More information:
