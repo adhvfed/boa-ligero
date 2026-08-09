@@ -12,9 +12,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["float16", "xsum", "temporal"]
+default = ["float16", "jit", "xsum", "temporal"]
 
-# Enables the experimental Cranelift-based JIT tier (work in progress).
+# Enables the Cranelift-based JIT tier. This is a default feature; portable or
+# interpreter-only builds can omit defaults and select their required features.
 # See planning/js-performance-roadmap/09-cranelift-jit.md.
 jit = [
     "dep:cranelift-codegen",

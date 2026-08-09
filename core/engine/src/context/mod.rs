@@ -196,7 +196,11 @@ impl Default for Context {
 
 // ==== Public API ====
 impl Context {
-    /// Enable the experimental Cranelift tier for this context.
+    /// Enable the Cranelift tier for this context.
+    ///
+    /// The tier is enabled when a context is created unless the embedder uses
+    /// [`ContextBuilder::jit`] to opt out. Calling this after
+    /// [`Self::disable_jit`] creates a fresh backend.
     #[cfg(feature = "jit")]
     pub fn enable_jit(&mut self) {
         if self.jit_backend.is_none() {
@@ -204,7 +208,7 @@ impl Context {
         }
     }
 
-    /// Configure the hotness thresholds used by the experimental Cranelift
+    /// Configure the hotness thresholds used by the Cranelift
     /// tier. This has no effect while the tier is disabled.
     #[cfg(feature = "jit")]
     pub fn set_jit_thresholds(&mut self, thresholds: crate::jit::JitThresholds) {
@@ -213,13 +217,13 @@ impl Context {
         }
     }
 
-    /// Disable the experimental Cranelift tier for this context.
+    /// Disable the Cranelift tier for this context and release its backend.
     #[cfg(feature = "jit")]
     pub fn disable_jit(&mut self) {
         self.jit_backend = None;
     }
 
-    /// Check whether this context has the experimental Cranelift tier enabled.
+    /// Check whether this context has the Cranelift tier enabled.
     #[cfg(feature = "jit")]
     #[must_use]
     pub fn jit_enabled(&self) -> bool {
@@ -1144,6 +1148,8 @@ pub struct ContextBuilder {
     job_executor: Option<Rc<dyn JobExecutor>>,
     module_loader: Option<Rc<dyn DynModuleLoader>>,
     can_block: bool,
+    #[cfg(feature = "jit")]
+    jit: Option<bool>,
     #[cfg(feature = "intl")]
     icu: Option<icu::IntlProvider>,
     #[cfg(feature = "temporal")]
@@ -1176,6 +1182,9 @@ impl std::fmt::Debug for ContextBuilder {
                 &self.module_loader.as_ref().map(|_| ModuleLoader),
             )
             .field("can_block", &self.can_block);
+
+        #[cfg(feature = "jit")]
+        out.field("jit", &self.jit.unwrap_or(true));
 
         #[cfg(feature = "intl")]
         out.field("icu", &self.icu);
@@ -1308,6 +1317,18 @@ impl ContextBuilder {
         self
     }
 
+    /// Selects whether the new context owns a Cranelift JIT backend.
+    ///
+    /// JIT is enabled by default when Boa is built with the `jit` feature.
+    /// Passing `false` constructs an interpreter-only context without
+    /// allocating a backend.
+    #[cfg(feature = "jit")]
+    #[must_use]
+    pub const fn jit(mut self, enabled: bool) -> Self {
+        self.jit = Some(enabled);
+        self
+    }
+
     /// Specifies the initial instruction budget for the [`Context`].
     ///
     /// The default is unlimited. The budget is shared by nested ECMAScript
@@ -1346,6 +1367,9 @@ impl ContextBuilder {
             CANNOT_BLOCK_COUNTER.set(CANNOT_BLOCK_COUNTER.get() + 1);
         }
 
+        #[cfg(feature = "jit")]
+        let jit_enabled = self.jit.unwrap_or(true);
+
         let root_shape = RootShape::default();
 
         let host_hooks = self.host_hooks.unwrap_or(Rc::new(DefaultHooks));
@@ -1369,7 +1393,7 @@ impl ContextBuilder {
             interner: self.interner.unwrap_or_default(),
             vm,
             #[cfg(feature = "jit")]
-            jit_backend: None,
+            jit_backend: jit_enabled.then(crate::jit::JitBackend::new),
             #[cfg(feature = "jit")]
             active_jit_backend_id: 0,
             #[cfg(feature = "jit")]
@@ -1466,5 +1490,30 @@ where
         if let Some(cleanup) = self.cleanup.take() {
             cleanup(self.context);
         }
+    }
+}
+
+#[cfg(all(test, feature = "jit"))]
+mod jit_defaults_tests {
+    use super::{Context, ContextBuilder};
+
+    #[test]
+    fn contexts_enable_jit_by_default_and_allow_explicit_opt_out() {
+        assert!(Context::default().jit_enabled());
+        assert!(
+            ContextBuilder::new()
+                .jit(true)
+                .build()
+                .unwrap()
+                .jit_enabled()
+        );
+
+        let mut interpreter = ContextBuilder::new().jit(false).build().unwrap();
+        assert!(!interpreter.jit_enabled());
+
+        interpreter.enable_jit();
+        assert!(interpreter.jit_enabled());
+        interpreter.disable_jit();
+        assert!(!interpreter.jit_enabled());
     }
 }

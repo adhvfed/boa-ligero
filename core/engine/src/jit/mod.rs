@@ -7,9 +7,11 @@
 //! primitive arithmetic, dense numeric reads, monomorphic data loads, and
 //! guarded ordinary calls as native Cranelift code.
 //!
-//! The tier is opt-in through [`Context::enable_jit`] and is gated behind the
-//! `jit` feature. Unsupported operations and failed guards resume at an exact
-//! interpreter bytecode boundary.
+//! The tier is enabled for new contexts by default when Boa is built with the
+//! default `jit` feature. Embedders can construct an interpreter-only context
+//! with [`crate::ContextBuilder::jit`] or disable an existing backend with
+//! [`Context::disable_jit`]. Unsupported operations and failed guards resume
+//! at an exact interpreter bytecode boundary.
 
 use crate::Context;
 use crate::builtins::function::OrdinaryFunction;
@@ -5154,7 +5156,7 @@ mod tests {
         jit: bool,
         cache_hit: bool,
     ) -> OsrBudgetObservation {
-        let mut context = Context::default();
+        let mut context = Context::builder().jit(jit).build().unwrap();
         if jit {
             context.enable_jit_diagnostics(JitDiagnosticLimits::default());
             context.set_jit_thresholds(JitThresholds {
@@ -5462,7 +5464,7 @@ mod tests {
         jit: bool,
         cache_hit: bool,
     ) -> OsrLoopLimitObservation {
-        let mut context = Context::default();
+        let mut context = Context::builder().jit(jit).build().unwrap();
         if jit {
             context.enable_jit_diagnostics(JitDiagnosticLimits::default());
             context.set_jit_thresholds(JitThresholds {
@@ -7445,7 +7447,7 @@ mod tests {
     }
 
     fn warmed_sum_context(jit: bool) -> Context {
-        let mut context = Context::default();
+        let mut context = Context::builder().jit(jit).build().unwrap();
         if jit {
             context.enable_jit();
         }
@@ -7551,7 +7553,7 @@ mod tests {
     #[test]
     fn context_owned_jit_refunds_budget_before_guard_deopt() {
         let prepare = |jit: bool| {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             if jit {
                 enable_jit_without_admission_floor(&mut context);
             }
@@ -7657,7 +7659,7 @@ mod tests {
     #[test]
     fn context_owned_jit_preserves_call_continuation_budget() {
         let prepare = |jit: bool| {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             if jit {
                 enable_jit_without_admission_floor(&mut context);
             }
@@ -8150,7 +8152,7 @@ mod tests {
             ),
         ] {
             let prepare = |jit: bool| {
-                let mut context = Context::default();
+                let mut context = Context::builder().jit(jit).build().unwrap();
                 if jit {
                     context.enable_jit();
                 }
@@ -8180,7 +8182,7 @@ mod tests {
     #[test]
     fn context_owned_jit_bitor_matches_interpreter_sequence() {
         let prepare = |jit: bool| {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             if jit {
                 context.enable_jit();
             }
@@ -8403,7 +8405,7 @@ mod tests {
     #[test]
     fn context_owned_jit_global_object_guard_refunds_instruction_budget() {
         let prepare = |jit: bool| {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             if jit {
                 context.enable_jit();
             }
@@ -8530,7 +8532,7 @@ mod tests {
     #[test]
     fn context_owned_jit_binding_guard_refunds_instruction_budget() {
         let prepare = |jit: bool| {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             if jit {
                 context.enable_jit();
             }
@@ -8707,7 +8709,7 @@ mod tests {
         let src = "function sum(n) { var total = 0; for (var i = 0; i < n; i++) { total = total + i; } return total; } var answer = 0; for (var j = 0; j < 1000; j++) { answer = answer + sum(1000); } answer";
 
         let time = |jit: bool| -> (i32, std::time::Duration, Option<JitStats>) {
-            let mut c = Context::default();
+            let mut c = Context::builder().jit(jit).build().unwrap();
             let script =
                 crate::Script::parse(crate::Source::from_bytes(src), None, &mut c).unwrap();
             if jit {
@@ -8739,7 +8741,7 @@ mod tests {
         let src = "function sum(values, n) { var total = 0; for (var i = 0; i < n; i++) { total = total + values[i]; } return total; } var values = new Array(1000); for (var k = 0; k < 1000; k++) { values[k] = k; } var answer = 0; for (var j = 0; j < 1000; j++) { answer = answer + sum(values, 1000); } answer";
 
         let time = |jit: bool| -> (i32, std::time::Duration, Option<JitStats>) {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
                 .expect("parse dense-load benchmark");
             if jit {
@@ -8779,7 +8781,7 @@ mod tests {
         let src = "function sum(values, n) { var total = 0.5; for (var i = 0; i < n; i++) { total = total + values[i]; } return total; } var values = new Array(1000); for (var k = 0; k < 1000; k++) { values[k] = k + 0.25; } var answer = 0.5; for (var j = 0; j < 1000; j++) { answer = answer + sum(values, 1000); } answer";
 
         let time = |jit: bool| -> (f64, std::time::Duration, Option<JitStats>) {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
                 .expect("parse dense floating-load benchmark");
             if jit {
@@ -8819,7 +8821,7 @@ mod tests {
         let src = "function sum(object, n) { var total = 0; for (var i = 0; i < n; i++) { total = total + object.value; } return total; } var object = { value: 499 }; var answer = 0; for (var j = 0; j < 1000; j++) { answer = answer + sum(object, 1000); } answer";
 
         let time = |jit: bool| -> (i32, std::time::Duration, Option<JitStats>) {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
                 .expect("parse named-load benchmark");
             if jit {
@@ -8859,7 +8861,7 @@ mod tests {
         let src = "function sum(object, n) { var total = 0.5; for (var i = 0; i < n; i++) { total = total + object.value; } return total; } var object = { value: 499.25 }; var answer = 0.5; for (var j = 0; j < 1000; j++) { answer = answer + sum(object, 1000); } answer";
 
         let time = |jit: bool| -> (f64, std::time::Duration, Option<JitStats>) {
-            let mut context = Context::default();
+            let mut context = Context::builder().jit(jit).build().unwrap();
             let script = crate::Script::parse(crate::Source::from_bytes(src), None, &mut context)
                 .expect("parse named floating-load benchmark");
             if jit {

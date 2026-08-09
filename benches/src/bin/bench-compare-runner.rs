@@ -182,7 +182,7 @@ fn parse_jit_diagnostic_options(args: &[String]) -> Result<JitDiagnosticOptions<
 }
 
 fn run_interpreter(script_path: &str, code: &str, runs: usize, warmup: usize) {
-    let context = &mut Context::default();
+    let context = &mut interpreter_context();
     context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(context);
 
@@ -211,6 +211,13 @@ fn run_interpreter(script_path: &str, code: &str, runs: usize, warmup: usize) {
         "elapsed_ns={elapsed_ns} runs={runs} ns_per_run={} acc={acc} mode=interp",
         elapsed_ns / runs as u128
     );
+}
+
+fn interpreter_context() -> Context {
+    let builder = Context::builder();
+    #[cfg(feature = "jit")]
+    let builder = builder.jit(false);
+    builder.build().expect("build interpreter context")
 }
 
 fn register_runtime(context: &mut Context) {
@@ -252,7 +259,10 @@ fn collect_osr_cold_sample(
     code: &str,
     diagnostic_limits: Option<boa_engine::jit::JitDiagnosticLimits>,
 ) -> OsrColdSample {
-    let context = &mut Context::default();
+    let context = &mut Context::builder()
+        .jit(true)
+        .build()
+        .expect("build JIT context");
     context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(context);
 
@@ -387,7 +397,10 @@ fn run_jit(
     // entry immediately. Script parsing and top-level setup remain outside the
     // timer, matching the existing runner protocol; the reported duration
     // includes JIT compilation and the complete first call.
-    let cold_context = &mut Context::default();
+    let cold_context = &mut Context::builder()
+        .jit(true)
+        .build()
+        .expect("build JIT context");
     cold_context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(cold_context);
     let cold_script = parse_script(code, cold_context);
@@ -420,7 +433,10 @@ fn run_jit(
 
     // The warm sample uses the production thresholds and a fresh context so
     // compilation is not accidentally amortized by the cold sample.
-    let context = &mut Context::default();
+    let context = &mut Context::builder()
+        .jit(true)
+        .build()
+        .expect("build JIT context");
     context.set_optimizer_options(OptimizerOptions::empty());
     register_runtime(context);
     let script = parse_script(code, context);

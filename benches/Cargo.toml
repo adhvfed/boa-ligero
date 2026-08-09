@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-boa_engine = { workspace = true, features = ["intl_bundled"] }
-boa_runtime.workspace = true
+boa_engine = { workspace = true, features = ["intl_bundled", "temporal"] }
+boa_runtime = { workspace = true, default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

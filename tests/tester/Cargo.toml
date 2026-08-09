@@ -12,8 +12,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-boa_engine = { workspace = true, features = ["float16"] }
-boa_runtime = { workspace = true, features = ["test262"] }
+boa_engine = { workspace = true, features = ["float16", "temporal"] }
+boa_runtime = { workspace = true, default-features = false, features = ["test262"] }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = "0.9.34" # TODO: Track https://github.com/saphyr-rs/saphyr.
@@ -31,7 +31,8 @@ cow-utils.workspace = true
 
 [features]
 annex-b = ["boa_engine/annex-b", "boa_runtime/annex-b"]
-default = ["boa_engine/intl_bundled", "boa_engine/experimental", "annex-b"]
+default = ["boa_engine/intl_bundled", "boa_engine/experimental", "annex-b", "jit"]
+jit = ["boa_engine/jit", "boa_runtime/jit"]
 
 [lints]
 workspace = true
