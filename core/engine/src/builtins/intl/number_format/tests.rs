@@ -77,6 +77,45 @@ fn significant_digit_padding_uses_rounded_magnitude() {
     ]);
 }
 
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn currency_fraction_defaults_come_from_cldr() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"
+                const currencyOptions = currency => new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency
+                }).resolvedOptions();
+                JSON.stringify([
+                    currencyOptions("USD").minimumFractionDigits,
+                    currencyOptions("JPY").minimumFractionDigits,
+                    currencyOptions("KWD").minimumFractionDigits,
+                    currencyOptions("CLF").minimumFractionDigits,
+                    currencyOptions("XTS").minimumFractionDigits,
+                ]);
+            "#,
+            js_string!("[2,0,3,4,2]"),
+        ),
+        TestAction::assert_eq(
+            r#"
+                const notationOptions = notation => new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency: "JPY",
+                    notation
+                }).resolvedOptions();
+                JSON.stringify([
+                    notationOptions("scientific").minimumFractionDigits,
+                    notationOptions("scientific").maximumFractionDigits,
+                    notationOptions("compact").minimumFractionDigits,
+                    notationOptions("compact").maximumFractionDigits,
+                ]);
+            "#,
+            js_string!("[0,3,0,0]"),
+        ),
+    ]);
+}
+
 #[test]
 fn special_number_parts_are_tagged() {
     let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);

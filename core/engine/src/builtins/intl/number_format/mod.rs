@@ -10,8 +10,11 @@ use icu_decimal::{
     provider::{DecimalDigitsV1, DecimalSymbolsV1},
 };
 
+use icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1;
 use icu_locale::{Locale, extensions::unicode::Value};
-use icu_provider::{DataMarker, DataMarkerAttributes, DynamicDataProvider, buf::BufferMarker};
+use icu_provider::{
+    DataMarker, DataMarkerAttributes, DataProvider, DynamicDataProvider, buf::BufferMarker,
+};
 use num_bigint::BigInt;
 use num_traits::Num;
 use writeable::Writeable;
@@ -524,37 +527,53 @@ impl NumberFormat {
         // 14. Perform ? SetNumberFormatUnitOptions(numberFormat, options).
         let unit_options = UnitFormatOptions::from_options(&options, context)?;
 
-        // 15. Let style be numberFormat.[[Style]].
-        // 16. If style is "currency", then
-        let (min_fractional, max_fractional) = if unit_options.style() == Style::Currency {
-            // TODO: Missing support from ICU4X
-            // a. Let currency be numberFormat.[[Currency]].
-            // b. Let cDigits be CurrencyDigits(currency).
-            // c. Let mnfdDefault be cDigits.
-            // d. Let mxfdDefault be cDigits.
-            return Err(JsNativeError::typ().with_message("unimplemented").into());
-        } else {
-            // 17. Else,
-            (
-                // a. Let mnfdDefault be 0.
-                0,
-                // b. If style is "percent", then
-                if unit_options.style() == Style::Percent {
-                    // i. Let mxfdDefault be 0.
-                    0
-                } else {
-                    // c. Else,
-                    //    i. Let mxfdDefault be 3.
-                    3
-                },
-            )
-        };
-
-        // 18. Let notation be ? GetOption(options, "notation", string, « "standard", "scientific", "engineering", "compact" », "standard").
-        // 19. Set numberFormat.[[Notation]] to notation.
+        // Let style be numberFormat.[[Style]].
+        // Let notation be ? GetOption(options, "notation", string, « "standard", "scientific", "engineering", "compact" », "standard").
+        // Set numberFormat.[[Notation]] to notation.
         let notation = get_option(&options, js_string!("notation"), context)?.unwrap_or_default();
 
-        // 20. Perform ? SetNumberFormatDigitOptions(numberFormat, options, mnfdDefault, mxfdDefault, notation).
+        // If style is "currency" and notation is "standard", then
+        let (min_fractional, max_fractional) =
+            if let UnitFormatOptions::Currency { currency, .. } = &unit_options
+                && notation == NotationKind::Standard
+            {
+                // a. Let currency be numberFormat.[[Currency]].
+                // b. Let cDigits be CurrencyDigits(currency).
+                // c. Let mnfdDefault be cDigits.
+                // d. Let mxfdDefault be cDigits.
+                let response: icu_provider::DataResponse<CurrencyFractionsV1> = context
+                    .intl_provider()
+                    .load(icu_provider::DataRequest::default())
+                    .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
+                let fractions = response.payload.get();
+                let currency = currency.as_tinystr().to_unvalidated();
+                let digits = fractions
+                    .fractions
+                    .get_copied(&currency)
+                    .unwrap_or(fractions.default)
+                    .digits;
+                // CurrencyDigits must return an integer in the inclusive range 0 to 100.
+                // Treat malformed host-provided data as missing currency metadata.
+                let digits = if digits <= 100 { digits } else { 2 };
+                (digits, digits)
+            } else {
+                // Else,
+                (
+                    // a. Let mnfdDefault be 0.
+                    0,
+                    // b. If style is "percent", then
+                    if unit_options.style() == Style::Percent {
+                        // i. Let mxfdDefault be 0.
+                        0
+                    } else {
+                        // c. Else,
+                        //    i. Let mxfdDefault be 3.
+                        3
+                    },
+                )
+            };
+
+        // Perform ? SetNumberFormatDigitOptions(numberFormat, options, mnfdDefault, mxfdDefault, notation).
         let digit_options = DigitFormatOptions::from_options(
             &options,
             min_fractional,

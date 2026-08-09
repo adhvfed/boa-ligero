@@ -261,6 +261,10 @@ pub(crate) struct Currency {
 }
 
 impl Currency {
+    pub(crate) const fn as_tinystr(self) -> TinyAsciiStr<3> {
+        self.inner
+    }
+
     pub(crate) fn to_js_string(self) -> JsString {
         let bytes = self.inner.as_bytes();
         js_string!(&[

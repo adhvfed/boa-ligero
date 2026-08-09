@@ -93,7 +93,10 @@ impl DynamicDryDataProvider<BufferMarker> for LazyBufferProvider {
 
 /// A macro that creates a [`LazyBufferProvider`] from an icu4x crate.
 macro_rules! provider_from_icu_crate {
-    ($service:path) => {
+    ($service:ident) => {
+        provider_from_icu_crate!($service, $service::provider::MARKERS)
+    };
+    ($service:ident, $markers:expr) => {
         pastey::paste! {
             LazyBufferProvider {
                 provider: OnceCell::new(),
@@ -103,11 +106,14 @@ macro_rules! provider_from_icu_crate {
                     stringify!($service),
                     ".postcard",
                 )),
-                valid_markers: $service::provider::MARKERS,
+                valid_markers: $markers,
             }
         }
     };
 }
+
+const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] =
+    &[icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO];
 
 /// Boa's default buffer provider.
 static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBufferProvider>>> =
@@ -118,6 +124,7 @@ static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBuffe
             provider_from_icu_crate!(icu_datetime),
             provider_from_icu_crate!(icu_time),
             provider_from_icu_crate!(icu_decimal),
+            provider_from_icu_crate!(icu_experimental, EXPERIMENTAL_MARKERS),
             provider_from_icu_crate!(icu_list),
             provider_from_icu_crate!(icu_locale),
             provider_from_icu_crate!(icu_normalizer),
