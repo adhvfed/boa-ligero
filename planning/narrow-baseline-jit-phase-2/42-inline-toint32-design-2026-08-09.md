@@ -1,6 +1,7 @@
 # Inline `ToInt32` design — 2026-08-09
 
-Status: selected as a separately revertible refinement of `dca5f7fc`.
+Status: rejected after prototype measurement. No production code from this
+design is retained. The expanded differential coverage remains in `9e1aa2a9`.
 
 # Problem
 
@@ -51,3 +52,23 @@ positive and negative zero and subnormals take the small-exponent zero path.
 - Seven diagnostics-off release samples must keep exact sinks and zero deopts,
   improve the `int-arith` median by at least 15% over 19,448,875 ns, and keep
   the artifact within the existing resource limits.
+
+# Prototype outcome
+
+The bit-for-bit IR translation passed the complete edge suite and a new
+1,799-iteration interpreter/JIT differential across seven seeds. It produced
+the exact benchmark sink with zero deopts. It nevertheless failed the
+performance gate:
+
+- a diagnostics run measured 20,492,208 ns per `int-arith` call, slower than
+  the accepted helper median of 19,448,875 ns;
+- the native artifact grew from 1,104 to 1,816 bytes;
+- warm compilation time rose from the helper gate's roughly 0.35–0.43 ms range
+  to 0.69 ms in the diagnostic sample;
+- cold compilation plus execution rose to 32.45 ms.
+
+The duplicated branch-heavy conversion CFG costs more than the optimized Rust
+helper transition on this host. The prototype was removed in full. A future
+attempt should use an ISA conversion instruction, a single shared generated
+conversion stub, or a range-proven fast path with the helper as its uncommon
+fallback; repeating this inline CFG is not justified.
