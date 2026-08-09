@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use boa_icu_data::BoaNumberSpecialSymbolsV1;
+use boa_icu_data::{BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV1};
 use icu_decimal::provider::DecimalDigitsV1;
 use icu_provider::{
     DataError, DataErrorKind, DataIdentifierCow, DataMarker, DataMarkerAttributes, DataMarkerInfo,
@@ -154,6 +154,24 @@ impl DynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
                 ),
             });
         }
+        if marker.id == BoaCurrencyAccountingPatternsV1::INFO.id {
+            let Some(patterns) = self
+                .supplemental_numbers
+                .accounting_patterns()
+                .get(request.id.locale)
+            else {
+                return Err(DataErrorKind::IdentifierNotFound.with_req(marker, request));
+            };
+            let payload =
+                DataPayload::<BoaCurrencyAccountingPatternsV1>::from_owned(patterns.clone());
+            return Ok(DataResponse {
+                metadata: DataResponseMetadata::default(),
+                payload:
+                    <ExportMarker as UpcastDataPayload<BoaCurrencyAccountingPatternsV1>>::upcast(
+                        payload,
+                    ),
+            });
+        }
 
         match self.inner.load_data(marker, request) {
             Err(error)
@@ -188,6 +206,15 @@ impl IterableDynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
                 .map(DataIdentifierCow::from_locale)
                 .collect());
         }
+        if marker.id == BoaCurrencyAccountingPatternsV1::INFO.id {
+            return Ok(self
+                .supplemental_numbers
+                .accounting_patterns()
+                .keys()
+                .copied()
+                .map(DataIdentifierCow::from_locale)
+                .collect());
+        }
 
         let mut identifiers = self.inner.iter_ids_for_marker(marker)?;
         if marker.id == DecimalDigitsV1::INFO.id {
@@ -213,6 +240,7 @@ impl ExportableProvider for Ecma402SourceProvider<'_> {
     fn supported_markers(&self) -> BTreeSet<DataMarkerInfo> {
         let mut markers = self.inner.supported_markers();
         markers.insert(BoaNumberSpecialSymbolsV1::INFO);
+        markers.insert(BoaCurrencyAccountingPatternsV1::INFO);
         markers
     }
 }

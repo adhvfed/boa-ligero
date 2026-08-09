@@ -165,6 +165,48 @@ fn currency_style_uses_localized_symbols_and_patterns() {
 
 #[cfg(feature = "intl_bundled")]
 #[test]
+fn currency_style_uses_accounting_patterns() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"
+                JSON.stringify(["en-US", "ja-JP", "ko-KR", "zh-TW"].map(locale =>
+                    new Intl.NumberFormat(locale, {
+                        style: "currency",
+                        currency: "USD",
+                        currencySign: "accounting"
+                    }).format(-987)
+                ))
+            "#,
+            js_string!(r#"["($987.00)","($987.00)","(US$987.00)","(US$987.00)"]"#),
+        ),
+        TestAction::assert_eq(
+            r#"
+                JSON.stringify(new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency: "USD",
+                    currencySign: "accounting"
+                }).formatToParts(-987))
+            "#,
+            js_string!(
+                r#"[{"type":"literal","value":"("},{"type":"currency","value":"$"},{"type":"integer","value":"987"},{"type":"decimal","value":"."},{"type":"fraction","value":"00"},{"type":"literal","value":")"}]"#
+            ),
+        ),
+        TestAction::assert_eq(
+            r#"
+                new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency: "USD",
+                    currencySign: "accounting",
+                    signDisplay: "negative"
+                }).format(-0.0001)
+            "#,
+            js_string!("$0.00"),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
 fn currency_style_preserves_structured_parts() {
     run_test_actions([TestAction::assert_eq(
         r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).formatToParts(-1234.5))"#,

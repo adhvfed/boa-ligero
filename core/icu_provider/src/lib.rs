@@ -181,7 +181,7 @@ pub fn buffer() -> impl DynamicDryDataProvider<BufferMarker> {
 
 #[cfg(test)]
 mod tests {
-    use boa_icu_data::BoaNumberSpecialSymbolsV1;
+    use boa_icu_data::{BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV1};
     use icu_decimal::provider::DecimalDigitsV1;
     use icu_provider::prelude::*;
 
@@ -216,5 +216,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(response.payload.get().nan, "非數值");
+    }
+
+    #[test]
+    fn bundled_provider_includes_accounting_patterns() {
+        let provider = super::buffer();
+        let locale = "en".parse().unwrap();
+        let response: DataResponse<BoaCurrencyAccountingPatternsV1> = provider
+            .as_deserializing()
+            .load(DataRequest {
+                id: DataIdentifierBorrowed::for_locale(&locale),
+                ..DataRequest::default()
+            })
+            .unwrap();
+        let standard = response.payload.get().standard.as_ref().unwrap();
+        assert_eq!((&*standard.prefix, &*standard.suffix), ("(", ")"));
     }
 }

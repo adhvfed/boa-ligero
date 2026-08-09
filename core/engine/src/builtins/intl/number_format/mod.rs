@@ -1,7 +1,9 @@
 use std::cell::Cell;
 
 use boa_gc::{Finalize, Trace, custom_trace};
-use boa_icu_data::{BoaNumberSpecialSymbolsV1, NumberSpecialSymbols};
+use boa_icu_data::{
+    BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV1, NumberSpecialSymbols,
+};
 use fixed_decimal::{Decimal, FloatPrecision, Sign, SignDisplay};
 use icu_decimal::{
     CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences, FormattedDecimal,
@@ -58,7 +60,7 @@ use scientific::FormattedScientific;
 mod percent;
 use percent::FormattedPercent;
 mod currency;
-use currency::FormattedCurrency;
+use currency::{CurrencyFormatterOptions, FormattedCurrency};
 mod unit;
 use unit::{FormattedUnit, UnitData};
 
@@ -296,7 +298,10 @@ impl Formatter {
 enum StyleData {
     Plain,
     Percent(DataPayload<PercentEssentialsV1>),
-    Currency(DataPayload<CurrencyEssentialsV1>),
+    Currency {
+        essentials: DataPayload<CurrencyEssentialsV1>,
+        accounting_patterns: Option<DataPayload<BoaCurrencyAccountingPatternsV1>>,
+    },
     Unit(UnitData),
 }
 
@@ -378,7 +383,7 @@ impl NumberFormat {
         let is_percent = matches!(self.style_data, StyleData::Percent(_));
         let owns_sign = matches!(
             self.style_data,
-            StyleData::Percent(_) | StyleData::Currency(_)
+            StyleData::Percent(_) | StyleData::Currency { .. }
         );
         let mut style_sign = special_value_sign(value, self.sign_display);
         let mut unit_operands = None;
@@ -430,11 +435,14 @@ impl NumberFormat {
                 essentials.get(),
                 style_sign,
             )),
-            StyleData::Currency(essentials) => {
+            StyleData::Currency {
+                essentials,
+                accounting_patterns,
+            } => {
                 let UnitFormatOptions::Currency {
                     currency,
                     display,
-                    sign: _,
+                    sign,
                 } = &self.unit_options
                 else {
                     unreachable!("currency style data requires currency format options")
@@ -444,8 +452,12 @@ impl NumberFormat {
                     essentials.get(),
                     self.formatter.sign_formatter(),
                     style_sign,
-                    *currency,
-                    *display,
+                    CurrencyFormatterOptions {
+                        currency: *currency,
+                        display: *display,
+                        sign: *sign,
+                    },
+                    accounting_patterns.as_ref().map(DataPayload::get),
                 ))
             }
             StyleData::Unit(data) => {
@@ -809,7 +821,39 @@ impl NumberFormat {
                     .intl_provider()
                     .load(request)
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
-                StyleData::Currency(response.payload)
+                let accounting_patterns = if matches!(
+                    unit_options,
+                    UnitFormatOptions::Currency {
+                        sign: CurrencySign::Accounting,
+                        ..
+                    }
+                ) {
+                    match context.intl_provider().load(request) {
+                        Ok(response) => {
+                            let response: icu_provider::DataResponse<
+                                BoaCurrencyAccountingPatternsV1,
+                            > = response;
+                            Some(response.payload)
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind,
+                                DataErrorKind::MarkerNotFound | DataErrorKind::IdentifierNotFound
+                            ) =>
+                        {
+                            None
+                        }
+                        Err(error) => {
+                            return Err(js_error!(TypeError: "{}", error.to_string()));
+                        }
+                    }
+                } else {
+                    None
+                };
+                StyleData::Currency {
+                    essentials: response.payload,
+                    accounting_patterns,
+                }
             }
             Style::Unit => {
                 let UnitFormatOptions::Unit { unit, display } = &unit_options else {

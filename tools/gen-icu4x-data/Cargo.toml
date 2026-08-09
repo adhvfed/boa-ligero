@@ -11,6 +11,7 @@ description.workspace = true
 
 [dependencies]
 boa_icu_data = { workspace = true, features = ["datagen"] }
+clap = { workspace = true, features = ["derive"] }
 icu_provider_export = { workspace = true, features = [
     "blob_exporter",
     "rayon",

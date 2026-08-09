@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::{error::Error, fs::File};
 
+use clap::Parser;
 use icu_provider_export::blob_exporter::BlobExporter;
 use icu_provider_export::prelude::*;
 use icu_provider_source::{CoverageLevel, SourceDataProvider};
@@ -13,6 +14,13 @@ use source::Ecma402SourceProvider;
 
 /// Path to the directory where the exported data lives.
 const EXPORT_PATH: &str = "core/icu_provider/data";
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Regenerate only one service blob, preserving all other generated data.
+    #[arg(long)]
+    service: Option<String>,
+}
 
 const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
     icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
@@ -122,14 +130,23 @@ fn export_for_service(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    if let Some(service) = &args.service
+        && !SERVICES.iter().any(|(candidate, _)| candidate == service)
+    {
+        return Err(format!("unknown ICU data service `{service}`").into());
+    }
+
     simple_logger::SimpleLogger::new()
         .env()
         .with_level(log::LevelFilter::Info)
         .init()?;
 
-    // Removal will throw an error if the directory doesn't exist, hence
-    // why we can ignore the error.
-    let _unused = std::fs::remove_dir_all(EXPORT_PATH);
+    if args.service.is_none() {
+        // Removal will throw an error if the directory doesn't exist, hence
+        // why we can ignore the error.
+        let _unused = std::fs::remove_dir_all(EXPORT_PATH);
+    }
     std::fs::create_dir_all(EXPORT_PATH)?;
 
     let source = SourceDataProvider::new();
@@ -159,6 +176,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let supplemental_number_data = cldr::SupplementalNumberData::load()?;
     let provider = Ecma402SourceProvider::new(&source, &supplemental_number_data);
     for (service, keys) in SERVICES {
+        if args
+            .service
+            .as_deref()
+            .is_some_and(|requested| requested != *service)
+        {
+            continue;
+        }
         export_for_service(service, keys, &provider, driver.clone())?;
     }
 

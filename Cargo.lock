@@ -1772,6 +1772,7 @@ name = "gen-icu4x-data"
 version = "1.0.0-dev"
 dependencies = [
  "boa_icu_data",
+ "clap",
  "icu_casemap",
  "icu_collator",
  "icu_datetime",
