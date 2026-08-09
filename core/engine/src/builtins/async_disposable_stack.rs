@@ -1,29 +1,21 @@
 //! Boa's implementation of the ECMAScript `AsyncDisposableStack` object.
 
 use crate::{
-    Context, JsArgs, JsData, JsError, JsResult, JsString, JsValue, NativeFunction,
+    Context, JsArgs, JsData, JsResult, JsString, JsValue,
     builtins::{
         BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject,
-        resource_management::{DisposableResource, suppress_value},
+        resource_management::{AsyncDisposal, DisposableResource, begin_async_disposal},
     },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_error, js_string,
-    object::{
-        FunctionObjectBuilder, JsFunction, JsObject, builtins::JsPromise,
-        internal_methods::get_prototype_from_constructor,
-    },
+    object::{JsObject, builtins::JsPromise, internal_methods::get_prototype_from_constructor},
     property::Attribute,
     realm::Realm,
     string::StaticJsStrings,
     symbol::JsSymbol,
 };
-use boa_gc::{Finalize, Gc, GcRefCell, Trace};
-
-#[derive(Debug, Default, Trace, Finalize)]
-struct DisposalCompletion {
-    error: Option<JsValue>,
-}
+use boa_gc::{Finalize, Trace};
 
 /// The internal data of an `AsyncDisposableStack` instance.
 #[derive(Debug, Default, Trace, Finalize, JsData)]
@@ -224,7 +216,7 @@ impl AsyncDisposableStack {
             Ok(stack) => stack,
             Err(error) => return Ok(JsPromise::reject(error, context)?.into()),
         };
-        let mut resources = {
+        let resources = {
             let mut stack = stack.borrow_mut();
             let stack = stack.data_mut();
             if stack.disposed {
@@ -234,128 +226,17 @@ impl AsyncDisposableStack {
             std::mem::take(&mut stack.resources)
         };
 
-        let Some(first) = resources.pop() else {
+        if resources.is_empty() {
             return Ok(JsPromise::resolve(JsValue::undefined(), context)?.into());
-        };
-
-        // The first disposer runs before this method returns. Each later disposer is
-        // invoked by the reaction that resumes after the preceding await.
-        let mut promise = match first.invoke(context) {
-            Ok(value) => JsPromise::resolve(value, context)?,
-            Err(error) => JsPromise::reject(error, context)?,
-        };
-        let completion = Gc::new(GcRefCell::new(DisposalCompletion::default()));
-
-        while let Some(resource) = resources.pop() {
-            let on_fulfilled = Self::invoke_resource_handler(resource.clone(), context);
-            let on_rejected =
-                Self::resume_after_error_handler(resource, completion.clone(), context);
-            promise = promise.then_intrinsic(Some(on_fulfilled), Some(on_rejected), context);
         }
 
-        let on_fulfilled = Self::finish_handler(completion.clone(), false, context);
-        let on_rejected = Self::finish_handler(completion, true, context);
-        promise = promise.then_intrinsic(Some(on_fulfilled), Some(on_rejected), context);
-        Ok(promise.into())
-    }
-
-    fn invoke_resource_handler(resource: DisposableResource, context: &mut Context) -> JsFunction {
-        FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                |_, _, resource, context| resource.invoke(context),
-                resource,
-            ),
-        )
-        .name(js_string!())
-        .length(1)
-        .build()
-    }
-
-    fn resume_after_error_handler(
-        resource: DisposableResource,
-        completion: Gc<GcRefCell<DisposalCompletion>>,
-        context: &mut Context,
-    ) -> JsFunction {
-        #[derive(Trace, Finalize)]
-        struct Captures {
-            resource: DisposableResource,
-            completion: Gc<GcRefCell<DisposalCompletion>>,
+        match begin_async_disposal(resources, None, context) {
+            Ok(AsyncDisposal::Pending(promise)) => Ok(promise.into()),
+            Ok(AsyncDisposal::Complete) => {
+                Ok(JsPromise::resolve(JsValue::undefined(), context)?.into())
+            }
+            Err(error) => Ok(JsPromise::reject(error, context)?.into()),
         }
-
-        FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                |_, args, captures, context| {
-                    Self::record_error(
-                        &captures.completion,
-                        args.get_or_undefined(0).clone(),
-                        context,
-                    )?;
-                    captures.resource.invoke(context)
-                },
-                Captures {
-                    resource,
-                    completion,
-                },
-            ),
-        )
-        .name(js_string!())
-        .length(1)
-        .build()
-    }
-
-    fn finish_handler(
-        completion: Gc<GcRefCell<DisposalCompletion>>,
-        record_argument: bool,
-        context: &mut Context,
-    ) -> JsFunction {
-        #[derive(Trace, Finalize)]
-        struct Captures {
-            completion: Gc<GcRefCell<DisposalCompletion>>,
-            #[unsafe_ignore_trace]
-            record_argument: bool,
-        }
-
-        FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                |_, args, captures, context| {
-                    if captures.record_argument {
-                        Self::record_error(
-                            &captures.completion,
-                            args.get_or_undefined(0).clone(),
-                            context,
-                        )?;
-                    }
-                    match captures.completion.borrow().error.clone() {
-                        Some(error) => Err(JsError::from_opaque(error)),
-                        None => Ok(JsValue::undefined()),
-                    }
-                },
-                Captures {
-                    completion,
-                    record_argument,
-                },
-            ),
-        )
-        .name(js_string!())
-        .length(1)
-        .build()
-    }
-
-    fn record_error(
-        completion: &Gc<GcRefCell<DisposalCompletion>>,
-        error: JsValue,
-        context: &mut Context,
-    ) -> JsResult<()> {
-        let suppressed = completion.borrow_mut().error.take();
-        let error = match suppressed {
-            None => error,
-            Some(suppressed) => suppress_value(error, suppressed, context)?,
-        };
-        completion.borrow_mut().error = Some(error);
-        Ok(())
     }
 }
 
