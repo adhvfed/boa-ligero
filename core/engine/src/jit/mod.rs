@@ -8123,6 +8123,45 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_bitor_matches_interpreter_sequence() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "function churn(seed, count) { let state = seed; let checksum = 0; for (let index = 0; index < count; index++) { state = state * -1.75 + index * 0.125; let converted = state | 0; checksum = (checksum + converted) | 0; state = converted / 3.25; } return checksum; } let warm = 0; for (let index = 0; index < 80; index++) { warm = churn(0.25, 8); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let source = "[churn(0.1, 257), churn(-0.1, 257), churn(2147483647.75, 257), churn(-2147483648.75, 257), churn(4294967297.5, 257), churn(9007199254740992, 257), churn(-9007199254740992, 257)].join(',')";
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let expected =
+            crate::Script::parse(crate::Source::from_bytes(source), None, &mut interpreter)
+                .expect("parse interpreter sequence")
+                .evaluate(&mut interpreter)
+                .expect("evaluate interpreter sequence");
+        let result = crate::Script::parse(crate::Source::from_bytes(source), None, &mut context)
+            .expect("parse JIT sequence")
+            .evaluate(&mut context)
+            .expect("evaluate JIT sequence");
+
+        assert_eq!(result, expected);
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_reads_current_global_declarative_binding() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
