@@ -479,6 +479,13 @@ fn run_test_suite(
     versioned: bool,
     execution_options: ExecutionOptions,
 ) -> Result<()> {
+    // Test262 exercises deeply nested parser and runtime paths. Rayon's default
+    // worker stack is smaller than the main-thread stack on our supported
+    // platforms, which can make the parallel runner abort even when the same
+    // test completes serially. Keep this policy local to the tester so embedders
+    // retain control over the threads on which Boa runs.
+    const TEST262_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
     if let Some(path) = output {
         if path.exists() {
             if !path.is_dir() {
@@ -541,7 +548,15 @@ fn run_test_suite(
         if verbose != 0 {
             println!("Test suite loaded, starting tests...");
         }
-        let results = suite.run(&harness, verbose, parallel, edition, execution_options);
+        let results = if parallel {
+            rayon::ThreadPoolBuilder::new()
+                .stack_size(TEST262_WORKER_STACK_SIZE)
+                .build()
+                .wrap_err("could not create the Test262 worker pool")?
+                .install(|| suite.run(&harness, verbose, true, edition, execution_options))
+        } else {
+            suite.run(&harness, verbose, false, edition, execution_options)
+        };
         if let Some(selected_feature) = selected_feature
             && results.stats.total == 0
         {
