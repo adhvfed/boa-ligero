@@ -44,12 +44,15 @@ use crate::{js_error, value::JsVariant};
 
 mod options;
 pub(crate) use options::*;
+mod scientific;
+use scientific::FormattedScientific;
 
 #[cfg(test)]
 mod tests;
 
 enum FormattedNumber<'a, T> {
     Decimal(FormattedDecimal<'a>),
+    Scientific(FormattedScientific<'a>),
     Compact(T),
     Special(FormattedSign<'a, SpecialValue>),
 }
@@ -84,6 +87,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
     fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
         match self {
             FormattedNumber::Decimal(d) => d.write_to(sink),
+            FormattedNumber::Scientific(s) => s.write_to(sink),
             FormattedNumber::Compact(c) => c.write_to(sink),
             FormattedNumber::Special(s) => s.write_to(sink),
         }
@@ -92,6 +96,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
     fn write_to_parts<S: writeable::PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
         match self {
             FormattedNumber::Decimal(d) => d.write_to_parts(sink),
+            FormattedNumber::Scientific(s) => s.write_to_parts(sink),
             FormattedNumber::Compact(c) => c.write_to_parts(sink),
             FormattedNumber::Special(s) => s.write_to_parts(sink),
         }
@@ -100,6 +105,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
     fn writeable_length_hint(&self) -> writeable::LengthHint {
         match self {
             FormattedNumber::Decimal(d) => d.writeable_length_hint(),
+            FormattedNumber::Scientific(s) => s.writeable_length_hint(),
             FormattedNumber::Compact(c) => c.writeable_length_hint(),
             FormattedNumber::Special(s) => s.writeable_length_hint(),
         }
@@ -108,6 +114,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
     fn writeable_borrow(&self) -> Option<&str> {
         match self {
             FormattedNumber::Decimal(d) => d.writeable_borrow(),
+            FormattedNumber::Scientific(s) => s.writeable_borrow(),
             FormattedNumber::Compact(c) => c.writeable_borrow(),
             FormattedNumber::Special(s) => s.writeable_borrow(),
         }
@@ -116,6 +123,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
     fn write_to_string(&self) -> std::borrow::Cow<'_, str> {
         match self {
             FormattedNumber::Decimal(d) => d.write_to_string(),
+            FormattedNumber::Scientific(s) => s.write_to_string(),
             FormattedNumber::Compact(c) => c.write_to_string(),
             FormattedNumber::Special(s) => s.write_to_string(),
         }
@@ -147,8 +155,11 @@ impl IntlMathematicalValue {
 #[derive(Debug)]
 enum Formatter {
     Standard(DecimalFormatter),
-    Scientific(DecimalFormatter),
-    Engineering(DecimalFormatter),
+    Scientific {
+        significand: DecimalFormatter,
+        exponent: DecimalFormatter,
+        notation: NotationKind,
+    },
     Compact {
         inner: CompactDecimalFormatter,
         sign_formatter: Box<DecimalFormatter>,
@@ -161,12 +172,20 @@ impl Formatter {
         &'l self,
         value: &'l IntlMathematicalValue,
         sign_display: SignDisplay,
+        exponent: i16,
     ) -> FormattedNumber<'l, impl Writeable> {
         match value {
             IntlMathematicalValue::Finite(decimal) => match self {
-                Formatter::Standard(fmt)
-                | Formatter::Scientific(fmt)
-                | Formatter::Engineering(fmt) => FormattedNumber::Decimal(fmt.format(decimal)),
+                Formatter::Standard(fmt) => FormattedNumber::Decimal(fmt.format(decimal)),
+                Formatter::Scientific {
+                    significand,
+                    exponent: exponent_formatter,
+                    ..
+                } => FormattedNumber::Scientific(FormattedScientific::new(
+                    significand.format(decimal),
+                    exponent,
+                    exponent_formatter,
+                )),
                 Formatter::Compact { inner, .. } => FormattedNumber::Compact(inner.format(decimal)),
             },
             IntlMathematicalValue::Infinity { negative } => {
@@ -194,10 +213,17 @@ impl Formatter {
 
     fn sign_formatter(&self) -> &DecimalFormatter {
         match self {
-            Self::Standard(formatter)
-            | Self::Scientific(formatter)
-            | Self::Engineering(formatter) => formatter,
+            Self::Standard(formatter) => formatter,
+            Self::Scientific { significand, .. } => significand,
             Self::Compact { sign_formatter, .. } => sign_formatter,
+        }
+    }
+
+    const fn notation(&self) -> NotationKind {
+        match self {
+            Self::Standard(_) => NotationKind::Standard,
+            Self::Scientific { notation, .. } => *notation,
+            Self::Compact { .. } => NotationKind::Compact,
         }
     }
 }
@@ -226,6 +252,44 @@ unsafe impl Trace for NumberFormat {
 }
 
 impl NumberFormat {
+    fn exponent_for_magnitude(&self, magnitude: i16) -> i16 {
+        match self.formatter.notation() {
+            NotationKind::Scientific => magnitude,
+            NotationKind::Engineering => magnitude.div_euclid(3) * 3,
+            NotationKind::Standard | NotationKind::Compact => 0,
+        }
+    }
+
+    /// [`ComputeExponent ( numberFormat, x )`][spec].
+    ///
+    /// The provisional formatting step is required for values such as `999.9`
+    /// that cross an exponent boundary after rounding.
+    ///
+    /// [spec]: https://tc39.es/ecma402/#sec-computeexponent
+    fn compute_exponent(&self, value: &Decimal) -> i16 {
+        if value.is_zero() {
+            return 0;
+        }
+
+        let magnitude = value.nonzero_magnitude_start();
+        let exponent = self.exponent_for_magnitude(magnitude);
+        let Some(scale) = exponent.checked_neg() else {
+            return exponent;
+        };
+
+        let mut rounded = value.clone();
+        rounded.multiply_pow10(scale);
+        self.digit_options.format_fixed_decimal(&mut rounded);
+
+        if rounded.is_zero()
+            || rounded.nonzero_magnitude_start() == magnitude.saturating_sub(exponent)
+        {
+            exponent
+        } else {
+            self.exponent_for_magnitude(magnitude.saturating_add(1))
+        }
+    }
+
     /// [`FormatNumeric ( numberFormat, x )`][full] and [`FormatNumericToParts ( numberFormat, x )`][parts].
     ///
     /// The returned struct implements `Writable`, allowing to either write the number as a full
@@ -238,14 +302,27 @@ impl NumberFormat {
         value: &'l mut IntlMathematicalValue,
     ) -> impl Writeable + 'l {
         // TODO: Missing support from ICU4X for Percent/Currency/Unit formatting.
-        // TODO: Missing support from ICU4X for Scientific/Engineering notation.
 
-        if let IntlMathematicalValue::Finite(value) = value {
+        let exponent = if let IntlMathematicalValue::Finite(value) = value {
+            let exponent = if matches!(
+                self.formatter.notation(),
+                NotationKind::Scientific | NotationKind::Engineering
+            ) {
+                self.compute_exponent(value)
+            } else {
+                0
+            };
+            if let Some(scale) = exponent.checked_neg() {
+                value.multiply_pow10(scale);
+            }
             self.digit_options.format_fixed_decimal(value);
             value.apply_sign_display(self.sign_display);
-        }
+            exponent
+        } else {
+            0
+        };
 
-        self.formatter.format(value, self.sign_display)
+        self.formatter.format(value, self.sign_display, exponent)
     }
 }
 
@@ -589,7 +666,6 @@ impl NumberFormat {
             };
 
             let formatter = match (notation, compact_display) {
-                // TODO: change when scientific/engineering have their own formatters.
                 (NotationKind::Standard, _) => Formatter::Standard(
                     DecimalFormatter::try_new_with_buffer_provider(
                         &inspector,
@@ -598,22 +674,23 @@ impl NumberFormat {
                     )
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
                 ),
-                (NotationKind::Scientific, _) => Formatter::Scientific(
-                    DecimalFormatter::try_new_with_buffer_provider(
-                        &inspector,
-                        preferences,
-                        options,
-                    )
-                    .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
-                ),
-                (NotationKind::Engineering, _) => Formatter::Engineering(
-                    DecimalFormatter::try_new_with_buffer_provider(
-                        &inspector,
-                        preferences,
-                        options,
-                    )
-                    .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
-                ),
+                (notation @ (NotationKind::Scientific | NotationKind::Engineering), _) => {
+                    Formatter::Scientific {
+                        significand: DecimalFormatter::try_new_with_buffer_provider(
+                            &inspector,
+                            preferences,
+                            options,
+                        )
+                        .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                        exponent: DecimalFormatter::try_new_with_buffer_provider(
+                            &inspector,
+                            preferences,
+                            GroupingStrategy::Never.into(),
+                        )
+                        .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?,
+                        notation,
+                    }
+                }
                 (NotationKind::Compact, CompactDisplay::Long) => Formatter::Compact {
                     inner: CompactDecimalFormatter::try_new_long_with_buffer_provider(
                         &inspector,
@@ -918,8 +995,7 @@ impl NumberFormat {
 
         let (notation, compact_display) = match &nf.formatter {
             Formatter::Standard(_) => (NotationKind::Standard, None),
-            Formatter::Scientific(_) => (NotationKind::Scientific, None),
-            Formatter::Engineering(_) => (NotationKind::Engineering, None),
+            Formatter::Scientific { notation, .. } => (*notation, None),
             Formatter::Compact { display, .. } => (NotationKind::Compact, Some(*display)),
         };
 

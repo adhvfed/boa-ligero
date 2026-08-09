@@ -33,6 +33,50 @@ fn numbering_system_preferences_reach_the_formatter() {
     )]);
 }
 
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn scientific_notation_formats_values_and_parts() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { notation: "engineering" }).format(0.000345)"#,
+            js_string!("345E-6"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { notation: "scientific" }).format(0.000345)"#,
+            js_string!("3.45E-4"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { notation: "scientific", maximumSignificantDigits: 3 }).format(999.9)"#,
+            js_string!("1E3"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { notation: "scientific", minimumSignificantDigits: 2, maximumSignificantDigits: 3 }).format(999.9)"#,
+            js_string!("1.0E3"),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("en-US", { notation: "scientific" }).formatToParts(0.0345))"#,
+            js_string!(
+                r#"[{"type":"integer","value":"3"},{"type":"decimal","value":"."},{"type":"fraction","value":"45"},{"type":"exponentSeparator","value":"E"},{"type":"exponentMinusSign","value":"-"},{"type":"exponentInteger","value":"2"}]"#
+            ),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn significant_digit_padding_uses_rounded_magnitude() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { minimumSignificantDigits: 2, maximumSignificantDigits: 3 }).format(9.999)"#,
+            js_string!("10"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { minimumSignificantDigits: 2, maximumSignificantDigits: 3 }).format(0.9999)"#,
+            js_string!("1.0"),
+        ),
+    ]);
+}
+
 #[test]
 fn special_number_parts_are_tagged() {
     let mut parts = PartsCollector::new(UnmarkedStyle::Ignore);

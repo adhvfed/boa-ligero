@@ -810,9 +810,13 @@ impl DigitFormatOptions {
             rounding_mode: SignedRoundingMode,
         ) -> i16 {
             let msb = number.nonzero_magnitude_start();
-            let min_msb = msb - i16::from(min_precision) + 1;
             let max_msb = msb - i16::from(max_precision) + 1;
             round(number, max_msb, rounding_mode, BaseMultiple::MultiplesOf1);
+            // Rounding can carry into a new magnitude (for example, 9.999 to
+            // three significant digits becomes 10). Minimum precision is a
+            // property of the rounded result, so derive its padding boundary
+            // from that result rather than the input magnitude.
+            let min_msb = number.nonzero_magnitude_start() - i16::from(min_precision) + 1;
             number.trim_end();
             number.pad_end(min_msb);
             max_msb
