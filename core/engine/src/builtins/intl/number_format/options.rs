@@ -1002,7 +1002,7 @@ impl RoundingIncrement {
 
     /// Gets the numeric value of this `RoundingIncrement`.
     pub(crate) fn to_u16(self) -> u16 {
-        u16::from(self.magnitude_offset + 1)
+        10u16.pow(u32::from(self.magnitude_offset))
             * match self.multiple {
                 BaseMultiple::MultiplesOf1 => 1,
                 BaseMultiple::MultiplesOf2 => 2,

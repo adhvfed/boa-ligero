@@ -28,6 +28,7 @@ fn u16_to_rounding_increment_sunny_day() {
 
     for (num, increment) in valid_cases {
         assert_eq!(RoundingIncrement::from_u16(num), Some(increment));
+        assert_eq!(increment.to_u16(), num);
     }
 }
 
