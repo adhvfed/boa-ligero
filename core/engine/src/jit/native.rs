@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use boa_ast::scope::BindingLocatorScope;
 
 use crate::builtins::function::OrdinaryFunction;
+use crate::builtins::number::f64_to_int32;
 use crate::object::internal_methods::InternalMethodCallContext;
 use crate::object::shape::slot::SlotAttributes;
 use crate::vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator};
@@ -123,16 +124,17 @@ pub(super) fn loop_admission_profile(
         if pc >= header_pc && pc <= backedge_pc {
             region.push((pc as usize, iterator.pc(), instruction));
             let instruction = &region.last().expect("just pushed").2;
-            let property_or_call = matches!(
+            let region_excluded = matches!(
                 instruction,
                 Instruction::Call { .. }
+                    | Instruction::BitOr { .. }
                     | Instruction::GetLengthProperty { .. }
                     | Instruction::GetPropertyByName { .. }
                     | Instruction::GetPropertyByNameWithThis { .. }
                     | Instruction::GetPropertyByValue { .. }
                     | Instruction::GetPropertyByValuePush { .. }
             );
-            if property_or_call || !is_supported(code, opcode, instruction) {
+            if region_excluded || !is_supported(code, opcode, instruction) {
                 return Err(NativeRejection::new(
                     JitCompileBlockerKind::UnsupportedOpcode,
                     Some(opcode),
@@ -961,7 +963,9 @@ fn select_mode(instructions: &DecodedInstructions) -> NativeMode {
     if instructions.instructions.iter().any(|(_, _, instruction)| {
         matches!(
             instruction,
-            Instruction::StoreFloat { .. } | Instruction::StoreDouble { .. }
+            Instruction::StoreFloat { .. }
+                | Instruction::StoreDouble { .. }
+                | Instruction::BitOr { .. }
         )
     }) {
         NativeMode::F64
@@ -1137,6 +1141,7 @@ fn register_uses(instruction: &Instruction) -> Vec<usize> {
         | Instruction::Sub { lhs, rhs, .. }
         | Instruction::Div { lhs, rhs, .. }
         | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::BitOr { lhs, rhs, .. }
         | Instruction::JumpIfNotLessThan { lhs, rhs, .. }
         | Instruction::JumpIfNotLessThanOrEqual { lhs, rhs, .. }
         | Instruction::JumpIfNotGreaterThan { lhs, rhs, .. }
@@ -1269,6 +1274,7 @@ fn output_definition(
         | Instruction::Sub { dst, .. }
         | Instruction::Div { dst, .. }
         | Instruction::Mul { dst, .. }
+        | Instruction::BitOr { dst, .. }
         | Instruction::Inc { dst, .. }
         | Instruction::PopIntoRegister { dst }
         | Instruction::GetPropertyByName { dst, .. }
@@ -1327,6 +1333,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::Sub, Instruction::Sub { .. })
         | (Opcode::Div, Instruction::Div { .. })
         | (Opcode::Mul, Instruction::Mul { .. })
+        | (Opcode::BitOr, Instruction::BitOr { .. })
         | (Opcode::Inc, Instruction::Inc { .. })
         | (Opcode::Jump, Instruction::Jump { .. })
         | (Opcode::JumpIfNotLessThan, Instruction::JumpIfNotLessThan { .. })
@@ -1399,6 +1406,7 @@ struct Helpers {
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
+    bit_or_f64: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
     store_i32_if_defined: Helper,
@@ -1757,6 +1765,11 @@ impl<'a> NativeCompiler<'a> {
                 },
                 &[ptr, types::I32, types::I32, ptr],
                 types::I64,
+            ),
+            bit_or_f64: make(
+                jit_bit_or_f64 as *const () as usize,
+                &[types::F64, types::F64],
+                types::F64,
             ),
             call_ordinary: make(
                 jit_call_ordinary as *const () as usize,
@@ -2345,6 +2358,31 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().return_(&[status]);
 
                 bcx.switch_to_block(called);
+            }
+            Instruction::BitOr { dst, lhs, rhs } => {
+                let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
+                    return false;
+                };
+                let Some(rhs) = self.use_register(bcx, register(*rhs)) else {
+                    return false;
+                };
+                let result = match self.mode {
+                    NativeMode::I32 => bcx.ins().bor(lhs, rhs),
+                    NativeMode::F64 => {
+                        let helper = bcx
+                            .ins()
+                            .iconst(helpers.ptr, helpers.bit_or_f64.address as i64);
+                        let call = bcx.ins().call_indirect(
+                            helpers.bit_or_f64.signature,
+                            helper,
+                            &[lhs, rhs],
+                        );
+                        bcx.inst_results(call)[0]
+                    }
+                };
+                if !self.define_register(bcx, register(*dst), result) {
+                    return false;
+                }
             }
             Instruction::Add { dst, lhs, rhs } => {
                 let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
@@ -4306,6 +4344,10 @@ extern "C" fn jit_diagnostic_named_property_i32_guarded(
         counters.named_loads = counters.named_loads.saturating_add(1);
     }
     result
+}
+
+extern "C" fn jit_bit_or_f64(lhs: f64, rhs: f64) -> f64 {
+    f64::from(f64_to_int32(lhs) | f64_to_int32(rhs))
 }
 
 extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {

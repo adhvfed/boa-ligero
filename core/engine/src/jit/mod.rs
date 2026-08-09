@@ -3947,7 +3947,7 @@ mod tests {
             );
         }
 
-        let shim_code = first_function_code("function bitwise(value) { return value | 0; }");
+        let shim_code = first_function_code("function bitwise(value) { return value & 255; }");
         for stage in [
             JitModuleFailureStage::ShimDeclare,
             JitModuleFailureStage::ShimDefine,
@@ -6779,7 +6779,7 @@ mod tests {
 
     #[test]
     fn jit_loop_diagnostics_observe_denied_dormant_frames_and_respect_zero_cap() {
-        let source = "function blocked(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = (total + i) | 0; } return total; } let answer = 0; for (let call = 0; call < 40; call++) answer = blocked(10); answer";
+        let source = "function blocked(limit) { let total = 0; for (let i = 0; i < limit; i++) { total = (total + i) & 255; } return total; } let answer = 0; for (let call = 0; call < 40; call++) answer = blocked(10); answer";
         let run = |loop_records| {
             let mut context = Context::default();
             context.enable_jit_diagnostics(JitDiagnosticLimits {
@@ -6802,7 +6802,7 @@ mod tests {
         let blocked = retained
             .loop_records
             .iter()
-            .find(|record| record.first_blocking_opcode.as_deref() == Some("BitOr"))
+            .find(|record| record.first_blocking_opcode.as_deref() == Some("BitAnd"))
             .expect("blocked callee loop record");
         assert_eq!(blocked.backedges, 400, "record: {blocked:?}");
         assert!(blocked.closed_entry_backedges > 0, "record: {blocked:?}");
@@ -8003,6 +8003,123 @@ mod tests {
             record.kind == JitDiagnosticExitKind::Deopt
                 && record.reason == JitExitReason::IntegerOverflow
         }));
+    }
+
+    #[test]
+    fn context_owned_jit_bitor_matches_number_to_int32_edges() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function bitOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left | right; } return result; } function multiplyOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = (left * right) | 0; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitOr(index, 0) + multiplyOr(index, 3); } [bitOr(2147483648, 0), bitOr(-2147483649, 0), bitOr(1.9, 0), bitOr(-0, 0), bitOr(NaN, 0), bitOr(Infinity, 0), bitOr(9007199254740992, 0), multiplyOr(2147483647, 2147483647)].join(',')",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "-2147483648,2147483647,1,0,0,0,0,0"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.native_entries >= 2, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.compile_records.iter().any(|record| {
+            record.outcome == JitCompileOutcome::Native
+                && record.first_blocking_opcode.is_none()
+                && record.native_backward_branches > 0
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_bitor_replays_non_number_coercions() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function bitOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left | right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitOr(index, 0); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("warm up");
+
+        boa_gc::force_collect();
+
+        let coercions = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let calls = 0; let coercible = { valueOf() { calls++; return 5.9; } }; let mixedThrows = false; try { bitOr(1n, 2); } catch (error) { mixedThrows = error instanceof TypeError; } [bitOr('3', 0), bitOr(coercible, 0), calls, String(bitOr(1n, 2n)), mixedThrows].join(',')",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse coercions");
+        let result = coercions
+            .evaluate(&mut context)
+            .expect("evaluate coercions");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "3,5,2,3,true"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 4, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.exit_records.iter().any(|record| {
+            record.kind == JitDiagnosticExitKind::Deopt
+                && record.reason == JitExitReason::ArgumentType
+        }));
+    }
+
+    #[test]
+    fn context_owned_jit_bitor_guard_preserves_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::default();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "function bitOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left | right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitOr(index, 0); } warm",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let expected = evaluate_with_instruction_budget(&mut interpreter, "bitOr('7', 2)", 1_000)
+            .expect("interpreter coercion");
+        let result = evaluate_with_instruction_budget(&mut context, "bitOr('7', 2)", 1_000)
+            .expect("JIT coercion fallback");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "BitOr argument fallback must not double-charge its entry guard"
+        );
     }
 
     #[test]
