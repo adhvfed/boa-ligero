@@ -704,7 +704,7 @@ impl NumberFormat {
                     nf_clone,
                 ),
             )
-            .length(2)
+            .length(1)
             .build();
 
             nf.data_mut().bound_format = Some(bound_format.clone());
