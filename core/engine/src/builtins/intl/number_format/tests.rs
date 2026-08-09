@@ -118,6 +118,48 @@ fn currency_fraction_defaults_come_from_cldr() {
 
 #[cfg(feature = "intl_bundled")]
 #[test]
+fn currency_style_uses_localized_symbols_and_patterns() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(-1234.5)"#,
+            js_string!("-$1,234.50"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("de-DE", { style: "currency", currency: "USD" }).format(-1234.5)"#,
+            js_string!("-1.234,50\u{a0}$"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ko-KR", { style: "currency", currency: "USD" }).format(1234.5)"#,
+            js_string!("US$1,234.50"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ko-KR", { style: "currency", currency: "USD", currencyDisplay: "narrowSymbol" }).format(1234.5)"#,
+            js_string!("$1,234.50"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", currencyDisplay: "code" }).format(1234.5)"#,
+            js_string!("USD\u{a0}1,234.50"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "currency", currency: "ZZZ" }).format(1)"#,
+            js_string!("ZZZ\u{a0}1.00"),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn currency_style_preserves_structured_parts() {
+    run_test_actions([TestAction::assert_eq(
+        r#"JSON.stringify(new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).formatToParts(-1234.5))"#,
+        js_string!(
+            r#"[{"type":"minusSign","value":"-"},{"type":"currency","value":"$"},{"type":"integer","value":"1"},{"type":"group","value":","},{"type":"integer","value":"234"},{"type":"decimal","value":"."},{"type":"fraction","value":"50"}]"#
+        ),
+    )]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
 fn percent_style_scales_values_and_uses_locale_patterns() {
     run_test_actions([
         TestAction::assert_eq(

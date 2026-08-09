@@ -11,7 +11,8 @@ use icu_decimal::{
 };
 
 use icu_experimental::dimension::provider::{
-    currency::fractions::CurrencyFractionsV1, percent::PercentEssentialsV1,
+    currency::{essentials::CurrencyEssentialsV1, fractions::CurrencyFractionsV1},
+    percent::PercentEssentialsV1,
 };
 use icu_locale::{Locale, extensions::unicode::Value};
 use icu_provider::{
@@ -54,6 +55,8 @@ mod scientific;
 use scientific::FormattedScientific;
 mod percent;
 use percent::FormattedPercent;
+mod currency;
+use currency::FormattedCurrency;
 
 #[cfg(test)]
 mod tests;
@@ -141,6 +144,7 @@ impl<T: Writeable> Writeable for FormattedNumeric<'_, T> {
 enum FormattedNumber<'a, T> {
     Plain(FormattedNumeric<'a, T>),
     Percent(FormattedPercent<'a, FormattedNumeric<'a, T>>),
+    Currency(FormattedCurrency<'a, FormattedNumeric<'a, T>>),
 }
 
 impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
@@ -148,6 +152,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             Self::Plain(number) => number.write_to(sink),
             Self::Percent(number) => number.write_to(sink),
+            Self::Currency(number) => number.write_to(sink),
         }
     }
 
@@ -155,6 +160,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             Self::Plain(number) => number.write_to_parts(sink),
             Self::Percent(number) => number.write_to_parts(sink),
+            Self::Currency(number) => number.write_to_parts(sink),
         }
     }
 
@@ -162,6 +168,7 @@ impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
         match self {
             Self::Plain(number) => number.writeable_length_hint(),
             Self::Percent(number) => number.writeable_length_hint(),
+            Self::Currency(number) => number.writeable_length_hint(),
         }
     }
 }
@@ -276,12 +283,19 @@ impl Formatter {
     }
 }
 
+#[derive(Debug)]
+enum StyleData {
+    Plain,
+    Percent(DataPayload<PercentEssentialsV1>),
+    Currency(DataPayload<CurrencyEssentialsV1>),
+}
+
 #[derive(Debug, Finalize, JsData)]
 // Safety: `NumberFormat` only contains non-traceable types.
 pub(crate) struct NumberFormat {
     locale: Locale,
     formatter: Formatter,
-    percent_essentials: Option<DataPayload<PercentEssentialsV1>>,
+    style_data: StyleData,
     numbering_system: NumberingSystem,
     unit_options: UnitFormatOptions,
     digit_options: DigitFormatOptions,
@@ -350,10 +364,11 @@ impl NumberFormat {
         &'l self,
         value: &'l mut IntlMathematicalValue,
     ) -> impl Writeable + 'l {
-        // TODO: Missing support from ICU4X for Currency/Unit formatting.
+        // TODO: Missing support from ICU4X for Unit formatting.
 
-        let is_percent = self.percent_essentials.is_some();
-        let mut percent_sign = special_value_sign(value, self.sign_display);
+        let is_percent = matches!(self.style_data, StyleData::Percent(_));
+        let has_style_pattern = !matches!(self.style_data, StyleData::Plain);
+        let mut style_sign = special_value_sign(value, self.sign_display);
 
         let exponent = if let IntlMathematicalValue::Finite(value) = value {
             if is_percent {
@@ -372,8 +387,8 @@ impl NumberFormat {
             }
             self.digit_options.format_fixed_decimal(value);
             value.apply_sign_display(self.sign_display);
-            if is_percent {
-                percent_sign = value.sign();
+            if has_style_pattern {
+                style_sign = value.sign();
                 value.set_sign(Sign::None);
             }
             exponent
@@ -383,7 +398,7 @@ impl NumberFormat {
 
         let number = self.formatter.format(
             value,
-            if is_percent {
+            if has_style_pattern {
                 SignDisplay::Never
             } else {
                 self.sign_display
@@ -391,14 +406,31 @@ impl NumberFormat {
             exponent,
         );
 
-        if let Some(essentials) = &self.percent_essentials {
-            FormattedNumber::Percent(FormattedPercent::new(
+        match &self.style_data {
+            StyleData::Plain => FormattedNumber::Plain(number),
+            StyleData::Percent(essentials) => FormattedNumber::Percent(FormattedPercent::new(
                 number,
                 essentials.get(),
-                percent_sign,
-            ))
-        } else {
-            FormattedNumber::Plain(number)
+                style_sign,
+            )),
+            StyleData::Currency(essentials) => {
+                let UnitFormatOptions::Currency {
+                    currency,
+                    display,
+                    sign: _,
+                } = &self.unit_options
+                else {
+                    unreachable!("currency style data requires currency format options")
+                };
+                FormattedNumber::Currency(FormattedCurrency::new(
+                    number,
+                    essentials.get(),
+                    self.formatter.sign_formatter(),
+                    style_sign,
+                    *currency,
+                    *display,
+                ))
+            }
         }
     }
 }
@@ -724,18 +756,27 @@ impl NumberFormat {
         let sign_display =
             get_option(&options, js_string!("signDisplay"), context)?.unwrap_or(SignDisplay::Auto);
 
-        let percent_essentials = if unit_options.style() == Style::Percent {
-            let data_locale = icu_provider::DataLocale::from(&locale);
-            let response: icu_provider::DataResponse<PercentEssentialsV1> = context
-                .intl_provider()
-                .load(icu_provider::DataRequest {
-                    id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
-                    ..icu_provider::DataRequest::default()
-                })
-                .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
-            Some(response.payload)
-        } else {
-            None
+        let data_locale = icu_provider::DataLocale::from(&locale);
+        let request = icu_provider::DataRequest {
+            id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
+            ..icu_provider::DataRequest::default()
+        };
+        let style_data = match unit_options.style() {
+            Style::Percent => {
+                let response: icu_provider::DataResponse<PercentEssentialsV1> = context
+                    .intl_provider()
+                    .load(request)
+                    .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
+                StyleData::Percent(response.payload)
+            }
+            Style::Currency => {
+                let response: icu_provider::DataResponse<CurrencyEssentialsV1> = context
+                    .intl_provider()
+                    .load(request)
+                    .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
+                StyleData::Currency(response.payload)
+            }
+            Style::Decimal | Style::Unit => StyleData::Plain,
         };
 
         let mut options = DecimalFormatterOptions::default();
@@ -852,7 +893,7 @@ impl NumberFormat {
             locale,
             numbering_system,
             formatter,
-            percent_essentials,
+            style_data,
             unit_options,
             digit_options,
             use_grouping,

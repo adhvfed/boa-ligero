@@ -11,6 +11,7 @@ use icu_provider_source::{CoverageLevel, SourceDataProvider};
 const EXPORT_PATH: &str = "core/icu_provider/data";
 
 const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
+    icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
     icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
     icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
 ];
