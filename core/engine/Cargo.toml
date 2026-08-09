@@ -215,7 +215,7 @@ temporal_rs = { workspace = true, optional = true }
 timezone_provider = { workspace = true, optional = true }
 iana-time-zone = { workspace = true, optional = true }
 cranelift-codegen = { version = "0.130.2", optional = true }
-cranelift-frontend = { version = "0.130.2", optional = true }
+cranelift-frontend = { version = "0.134.3", optional = true }
 cranelift-jit = { version = "0.130.2", optional = true }
 cranelift-module = { version = "0.130.2", optional = true }
 cranelift-native = { version = "0.130.2", optional = true }
