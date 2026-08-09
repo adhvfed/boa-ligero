@@ -22,11 +22,11 @@ use super::{
     options::{IntlOptions, coerce_options_to_object},
 };
 use crate::{
-    Context, JsArgs, JsData, JsNativeError, JsObject, JsResult, JsString, JsSymbol, JsValue,
-    NativeFunction,
+    Context, JsArgs, JsData, JsExpect, JsNativeError, JsObject, JsResult, JsString, JsSymbol,
+    JsValue, NativeFunction,
     builtins::{
-        BuiltInConstructor, BuiltInObject, IntrinsicObject, builder::BuiltInBuilder,
-        options::get_option,
+        Array, BuiltInConstructor, BuiltInObject, IntrinsicObject, OrdinaryObject,
+        builder::BuiltInBuilder, options::get_option,
     },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_string,
@@ -47,10 +47,136 @@ pub(crate) use options::*;
 #[cfg(test)]
 mod tests;
 
-pub(crate) enum FormattedNumber<'a, T> {
+enum FormattedNumber<'a, T> {
     Decimal(FormattedDecimal<'a>),
     Compact(T),
-    Special(FormattedSign<'a, &'static str>),
+    Special(FormattedSign<'a, SpecialValue>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpecialValue {
+    Infinity,
+    NaN,
+}
+
+impl Writeable for SpecialValue {
+    fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
+        sink.write_str(match self {
+            Self::Infinity => "∞",
+            Self::NaN => "NaN",
+        })
+    }
+
+    fn write_to_parts<S: writeable::PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
+        let part = writeable::Part {
+            category: "number",
+            value: match self {
+                Self::Infinity => "infinity",
+                Self::NaN => "nan",
+            },
+        };
+        sink.with_part(part, |sink| self.write_to(sink))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NumberPart {
+    kind: &'static str,
+    value: String,
+}
+
+#[derive(Debug)]
+struct PartsCollector {
+    parts: Vec<NumberPart>,
+    active_part: Option<&'static str>,
+    compact: bool,
+}
+
+impl PartsCollector {
+    fn new(compact: bool) -> Self {
+        Self {
+            parts: Vec::new(),
+            active_part: None,
+            compact,
+        }
+    }
+
+    fn push(&mut self, kind: &'static str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+
+        if let Some(last) = self.parts.last_mut()
+            && last.kind == kind
+        {
+            last.value.push_str(value);
+        } else {
+            self.parts.push(NumberPart {
+                kind,
+                value: value.to_owned(),
+            });
+        }
+    }
+
+    fn push_unmarked(&mut self, value: &str) {
+        if !self.compact {
+            self.push("literal", value);
+            return;
+        }
+
+        let mut start = 0;
+        let mut whitespace = None;
+        for (index, character) in value.char_indices() {
+            let is_whitespace = character.is_whitespace();
+            if whitespace.is_some_and(|current| current != is_whitespace) {
+                self.push(
+                    if whitespace == Some(true) {
+                        "literal"
+                    } else {
+                        "compact"
+                    },
+                    &value[start..index],
+                );
+                start = index;
+            }
+            whitespace = Some(is_whitespace);
+        }
+
+        self.push(
+            if whitespace == Some(true) {
+                "literal"
+            } else {
+                "compact"
+            },
+            &value[start..],
+        );
+    }
+}
+
+impl core::fmt::Write for PartsCollector {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        if let Some(kind) = self.active_part {
+            self.push(kind, value);
+        } else {
+            self.push_unmarked(value);
+        }
+        Ok(())
+    }
+}
+
+impl writeable::PartsWrite for PartsCollector {
+    type SubPartsWrite = Self;
+
+    fn with_part(
+        &mut self,
+        part: writeable::Part,
+        mut write: impl FnMut(&mut Self::SubPartsWrite) -> core::fmt::Result,
+    ) -> core::fmt::Result {
+        let previous = self.active_part.replace(part.value);
+        let result = write(self);
+        self.active_part = previous;
+        result
+    }
 }
 
 impl<T: Writeable> Writeable for FormattedNumber<'_, T> {
@@ -149,7 +275,10 @@ impl Formatter {
                     (false, SignDisplay::Always | SignDisplay::ExceptZero) => Sign::Positive,
                     (false, _) => Sign::None,
                 };
-                FormattedNumber::Special(self.sign_formatter().format_sign(sign, "∞"))
+                FormattedNumber::Special(
+                    self.sign_formatter()
+                        .format_sign(sign, SpecialValue::Infinity),
+                )
             }
             IntlMathematicalValue::NaN => {
                 let sign = if sign_display == SignDisplay::Always {
@@ -157,7 +286,7 @@ impl Formatter {
                 } else {
                     Sign::None
                 };
-                FormattedNumber::Special(self.sign_formatter().format_sign(sign, "NaN"))
+                FormattedNumber::Special(self.sign_formatter().format_sign(sign, SpecialValue::NaN))
             }
         }
     }
@@ -206,7 +335,7 @@ impl NumberFormat {
     pub(crate) fn format<'l>(
         &'l self,
         value: &'l mut IntlMathematicalValue,
-    ) -> FormattedNumber<'l, impl Writeable> {
+    ) -> impl Writeable + 'l {
         // TODO: Missing support from ICU4X for Percent/Currency/Unit formatting.
         // TODO: Missing support from ICU4X for Scientific/Engineering notation.
 
@@ -248,6 +377,7 @@ impl IntrinsicObject for NumberFormat {
                 None,
                 Attribute::CONFIGURABLE,
             )
+            .method(Self::format_to_parts, js_string!("formatToParts"), 1)
             .method(Self::resolved_options, js_string!("resolvedOptions"), 0)
             .build();
     }
@@ -263,7 +393,7 @@ impl BuiltInObject for NumberFormat {
 
 impl BuiltInConstructor for NumberFormat {
     const CONSTRUCTOR_ARGUMENTS: usize = 0;
-    const PROTOTYPE_STORAGE_SLOTS: usize = 4;
+    const PROTOTYPE_STORAGE_SLOTS: usize = 5;
     const CONSTRUCTOR_STORAGE_SLOTS: usize = 1;
 
     const STANDARD_CONSTRUCTOR: fn(&StandardConstructors) -> &StandardConstructor =
@@ -713,6 +843,53 @@ impl NumberFormat {
 
         // 5. Return nf.[[BoundFormat]].
         Ok(bound_format.into())
+    }
+
+    /// [`Intl.NumberFormat.prototype.formatToParts ( value )`][spec].
+    ///
+    /// [spec]: https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formattoparts
+    fn format_to_parts(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let nf be the this value.
+        // 2. Perform ? RequireInternalSlot(nf, [[InitializedNumberFormat]]).
+        let nf = unwrap_number_format(this, context)?;
+
+        // 3. If value is not provided, let value be undefined.
+        // 4. Let x be ? ToIntlMathematicalValue(value).
+        let mut value = to_intl_mathematical_value(args.get_or_undefined(0), context)?;
+
+        // 5. Return FormatNumericToParts(nf, x).
+        let nf = nf.borrow();
+        let nf = nf.data();
+        let mut parts = PartsCollector::new(matches!(nf.formatter, Formatter::Compact { .. }));
+        nf.format(&mut value)
+            .write_to_parts(&mut parts)
+            .map_err(|error| JsNativeError::typ().with_message(error.to_string()))?;
+
+        let result = Array::array_create(0, None, context)
+            .js_expect("creating an empty array with the default prototype must not fail")?;
+
+        for (index, part) in parts.parts.into_iter().enumerate() {
+            let object = context
+                .intrinsics()
+                .templates()
+                .ordinary_object()
+                .create(OrdinaryObject, vec![]);
+            object
+                .create_data_property_or_throw(js_string!("type"), js_string!(part.kind), context)
+                .js_expect("creating a property on a fresh ordinary object must not fail")?;
+            object
+                .create_data_property_or_throw(js_string!("value"), js_string!(part.value), context)
+                .js_expect("creating a property on a fresh ordinary object must not fail")?;
+            result
+                .create_data_property_or_throw(index, object, context)
+                .js_expect("creating an indexed property on a fresh array must not fail")?;
+        }
+
+        Ok(result.into())
     }
 
     /// [`Intl.NumberFormat.prototype.resolvedOptions ( )`][spec].
