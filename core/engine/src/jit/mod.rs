@@ -8042,6 +8042,53 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_bitxor_matches_number_semantics() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function bitXor(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left ^ right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitXor(index, 7); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        setup.evaluate(&mut context).expect("warm up");
+
+        boa_gc::force_collect();
+
+        let cases = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let calls = 0; let coercible = { valueOf() { calls++; return 5.9; } }; let mixedThrows = false; try { bitXor(1n, 2); } catch (error) { mixedThrows = error instanceof TypeError; } [bitXor(2147483648, -1), bitXor(Infinity, 7), bitXor(coercible, 3), calls, String(bitXor(5n, 3n)), mixedThrows].join(',')",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse cases");
+        let result = cases.evaluate(&mut context).expect("evaluate cases");
+        assert_eq!(
+            result
+                .as_string()
+                .expect("string result")
+                .to_std_string_escaped(),
+            "2147483647,7,6,2,6,true"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 3, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.compile_records.iter().any(|record| {
+            record.outcome == JitCompileOutcome::Native
+                && record.first_blocking_opcode.is_none()
+                && record.native_backward_branches > 0
+        }));
+    }
+
+    #[test]
     fn context_owned_jit_bitor_replays_non_number_coercions() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
@@ -8089,37 +8136,45 @@ mod tests {
     }
 
     #[test]
-    fn context_owned_jit_bitor_guard_preserves_instruction_budget() {
-        let prepare = |jit: bool| {
-            let mut context = Context::default();
-            if jit {
-                context.enable_jit();
-            }
-            let script = crate::Script::parse(
-                crate::Source::from_bytes(
-                    "function bitOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left | right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitOr(index, 0); } warm",
-                ),
-                None,
-                &mut context,
-            )
-            .expect("parse warmup");
-            script.evaluate(&mut context).expect("warm up");
-            context
-        };
+    fn context_owned_jit_bitwise_number_guards_preserve_instruction_budget() {
+        for (name, warmup, call) in [
+            (
+                "BitOr",
+                "function bitOr(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left | right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitOr(index, 0); } warm",
+                "bitOr('7', 2)",
+            ),
+            (
+                "BitXor",
+                "function bitXor(left, right) { let result = 0; for (let index = 0; index < 2; index++) { result = left ^ right; } return result; } let warm = 0; for (let index = 0; index < 80; index++) { warm = bitXor(index, 0); } warm",
+                "bitXor('7', 2)",
+            ),
+        ] {
+            let prepare = |jit: bool| {
+                let mut context = Context::default();
+                if jit {
+                    context.enable_jit();
+                }
+                let script =
+                    crate::Script::parse(crate::Source::from_bytes(warmup), None, &mut context)
+                        .expect("parse warmup");
+                script.evaluate(&mut context).expect("warm up");
+                context
+            };
 
-        let mut interpreter = prepare(false);
-        let mut context = prepare(true);
-        let expected = evaluate_with_instruction_budget(&mut interpreter, "bitOr('7', 2)", 1_000)
-            .expect("interpreter coercion");
-        let result = evaluate_with_instruction_budget(&mut context, "bitOr('7', 2)", 1_000)
-            .expect("JIT coercion fallback");
+            let mut interpreter = prepare(false);
+            let mut context = prepare(true);
+            let expected = evaluate_with_instruction_budget(&mut interpreter, call, 1_000)
+                .expect("interpreter coercion");
+            let result = evaluate_with_instruction_budget(&mut context, call, 1_000)
+                .expect("JIT coercion fallback");
 
-        assert_eq!(result, expected);
-        assert_eq!(
-            context.instruction_budget_remaining(),
-            interpreter.instruction_budget_remaining(),
-            "BitOr argument fallback must not double-charge its entry guard"
-        );
+            assert_eq!(result, expected, "{name}");
+            assert_eq!(
+                context.instruction_budget_remaining(),
+                interpreter.instruction_budget_remaining(),
+                "{name} argument fallback must not double-charge its entry guard"
+            );
+        }
     }
 
     #[test]

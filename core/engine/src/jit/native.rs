@@ -127,7 +127,9 @@ pub(super) fn loop_admission_profile(
             let region_excluded = matches!(
                 instruction,
                 Instruction::Call { .. }
+                    | Instruction::BitAnd { .. }
                     | Instruction::BitOr { .. }
+                    | Instruction::BitXor { .. }
                     | Instruction::GetLengthProperty { .. }
                     | Instruction::GetPropertyByName { .. }
                     | Instruction::GetPropertyByNameWithThis { .. }
@@ -966,6 +968,7 @@ fn select_mode(instructions: &DecodedInstructions) -> NativeMode {
             Instruction::StoreFloat { .. }
                 | Instruction::StoreDouble { .. }
                 | Instruction::BitOr { .. }
+                | Instruction::BitXor { .. }
         )
     }) {
         NativeMode::F64
@@ -1142,6 +1145,7 @@ fn register_uses(instruction: &Instruction) -> Vec<usize> {
         | Instruction::Div { lhs, rhs, .. }
         | Instruction::Mul { lhs, rhs, .. }
         | Instruction::BitOr { lhs, rhs, .. }
+        | Instruction::BitXor { lhs, rhs, .. }
         | Instruction::JumpIfNotLessThan { lhs, rhs, .. }
         | Instruction::JumpIfNotLessThanOrEqual { lhs, rhs, .. }
         | Instruction::JumpIfNotGreaterThan { lhs, rhs, .. }
@@ -1275,6 +1279,7 @@ fn output_definition(
         | Instruction::Div { dst, .. }
         | Instruction::Mul { dst, .. }
         | Instruction::BitOr { dst, .. }
+        | Instruction::BitXor { dst, .. }
         | Instruction::Inc { dst, .. }
         | Instruction::PopIntoRegister { dst }
         | Instruction::GetPropertyByName { dst, .. }
@@ -1334,6 +1339,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::Div, Instruction::Div { .. })
         | (Opcode::Mul, Instruction::Mul { .. })
         | (Opcode::BitOr, Instruction::BitOr { .. })
+        | (Opcode::BitXor, Instruction::BitXor { .. })
         | (Opcode::Inc, Instruction::Inc { .. })
         | (Opcode::Jump, Instruction::Jump { .. })
         | (Opcode::JumpIfNotLessThan, Instruction::JumpIfNotLessThan { .. })
@@ -1407,6 +1413,7 @@ struct Helpers {
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
     bit_or_f64: Helper,
+    bit_xor_f64: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
     store_i32_if_defined: Helper,
@@ -1768,6 +1775,11 @@ impl<'a> NativeCompiler<'a> {
             ),
             bit_or_f64: make(
                 jit_bit_or_f64 as *const () as usize,
+                &[types::F64, types::F64],
+                types::F64,
+            ),
+            bit_xor_f64: make(
+                jit_bit_xor_f64 as *const () as usize,
                 &[types::F64, types::F64],
                 types::F64,
             ),
@@ -2359,7 +2371,7 @@ impl<'a> NativeCompiler<'a> {
 
                 bcx.switch_to_block(called);
             }
-            Instruction::BitOr { dst, lhs, rhs } => {
+            Instruction::BitOr { dst, lhs, rhs } | Instruction::BitXor { dst, lhs, rhs } => {
                 let Some(lhs) = self.use_register(bcx, register(*lhs)) else {
                     return false;
                 };
@@ -2367,16 +2379,21 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 };
                 let result = match self.mode {
-                    NativeMode::I32 => bcx.ins().bor(lhs, rhs),
+                    NativeMode::I32 => match instruction {
+                        Instruction::BitOr { .. } => bcx.ins().bor(lhs, rhs),
+                        Instruction::BitXor { .. } => bcx.ins().bxor(lhs, rhs),
+                        _ => unreachable!("the enclosing pattern is a binary bitwise opcode"),
+                    },
                     NativeMode::F64 => {
-                        let helper = bcx
-                            .ins()
-                            .iconst(helpers.ptr, helpers.bit_or_f64.address as i64);
-                        let call = bcx.ins().call_indirect(
-                            helpers.bit_or_f64.signature,
-                            helper,
-                            &[lhs, rhs],
-                        );
+                        let helper = match instruction {
+                            Instruction::BitOr { .. } => helpers.bit_or_f64,
+                            Instruction::BitXor { .. } => helpers.bit_xor_f64,
+                            _ => unreachable!("the enclosing pattern is a binary bitwise opcode"),
+                        };
+                        let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+                        let call =
+                            bcx.ins()
+                                .call_indirect(helper.signature, helper_address, &[lhs, rhs]);
                         bcx.inst_results(call)[0]
                     }
                 };
@@ -4348,6 +4365,10 @@ extern "C" fn jit_diagnostic_named_property_i32_guarded(
 
 extern "C" fn jit_bit_or_f64(lhs: f64, rhs: f64) -> f64 {
     f64::from(f64_to_int32(lhs) | f64_to_int32(rhs))
+}
+
+extern "C" fn jit_bit_xor_f64(lhs: f64, rhs: f64) -> f64 {
+    f64::from(f64_to_int32(lhs) ^ f64_to_int32(rhs))
 }
 
 extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {
