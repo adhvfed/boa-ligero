@@ -24,7 +24,7 @@ pub(in crate::parser) use self::{
 };
 use crate::{
     Error,
-    lexer::TokenKind,
+    lexer::{Token, TokenKind},
     parser::{AllowAwait, AllowYield, Cursor, OrAbrupt, ParseResult, TokenParser},
     source::ReadChar,
 };
@@ -80,12 +80,19 @@ where
                     .map(Into::into)
             }
             TokenKind::Keyword((Keyword::Await, false)) => {
-                // Check if this is `await using`
-                // Per spec, there must be [no LineTerminator here] between `await` and `using`
-                if let Some(next_tok) = cursor.peek_no_skip_line_term(1, interner)?
-                    && next_tok.kind() != &TokenKind::LineTerminator
-                    && matches!(next_tok.kind(), TokenKind::Keyword((Keyword::Using, false)))
-                {
+                let current = usize::from(cursor.peek_is_line_terminator(0, interner).or_abrupt()?);
+                let using_follows = matches!(
+                    cursor
+                        .peek_no_skip_line_term(current + 1, interner)?
+                        .map(Token::kind),
+                    Some(TokenKind::Keyword((Keyword::Using, false)))
+                ) && cursor
+                    .peek_no_skip_line_term(current + 2, interner)?
+                    .is_some_and(|token| {
+                        token.kind() != &TokenKind::LineTerminator
+                            && allowed_token_after_using(Some(token))
+                    });
+                if using_follows {
                     return LexicalDeclaration::new(
                         true,
                         self.allow_yield,

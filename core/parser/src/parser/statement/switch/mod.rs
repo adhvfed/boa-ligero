@@ -22,6 +22,22 @@ const CASE_BREAK_TOKENS: [TokenKind; 3] = [
     TokenKind::Keyword((Keyword::Default, false)),
 ];
 
+fn contains_using_declaration(list: &ast::StatementList) -> bool {
+    list.statements().iter().any(|item| {
+        matches!(
+            item,
+            ast::StatementListItem::Declaration(declaration)
+                if matches!(
+                    declaration.as_ref(),
+                    ast::Declaration::Lexical(
+                        ast::declaration::LexicalDeclaration::Using(_)
+                            | ast::declaration::LexicalDeclaration::AwaitUsing(_)
+                    )
+                )
+        )
+    })
+}
+
 /// Switch statement parsing.
 ///
 /// More information:
@@ -175,6 +191,13 @@ where
                     )
                     .parse(cursor, interner)?;
 
+                    if contains_using_declaration(&statement_list) {
+                        return Err(Error::general(
+                            "using declarations are not allowed directly in switch clauses",
+                            token.span().start(),
+                        ));
+                    }
+
                     cases.push(statement::Case::new(cond, statement_list));
                 }
                 TokenKind::Keyword((Keyword::Default, false)) => {
@@ -198,6 +221,13 @@ where
                         false,
                     )
                     .parse(cursor, interner)?;
+
+                    if contains_using_declaration(&statement_list) {
+                        return Err(Error::general(
+                            "using declarations are not allowed directly in switch clauses",
+                            token.span().start(),
+                        ));
+                    }
 
                     cases.push(statement::Case::default(statement_list));
 

@@ -421,6 +421,24 @@ where
         )
         .parse(cursor, interner)?;
 
+        if body.statements().iter().any(|item| {
+            matches!(
+                item,
+                boa_ast::StatementListItem::Declaration(declaration)
+                    if matches!(
+                        declaration.as_ref(),
+                        boa_ast::Declaration::Lexical(
+                            boa_ast::declaration::LexicalDeclaration::Using(_)
+                        )
+                    )
+            )
+        }) {
+            return Err(Error::general(
+                "using declarations are not allowed at the top level of a script",
+                Position::new(1, 1),
+            ));
+        }
+
         if !self.direct_eval {
             // It is a Syntax Error if StatementList Contains super unless the source text containing super is eval
             // code that is being processed by a direct eval.

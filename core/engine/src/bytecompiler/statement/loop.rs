@@ -48,7 +48,7 @@ impl ByteCompiler<'_> {
                     };
 
                     let names = bound_names(decl.declaration());
-                    if decl.declaration().is_const() {
+                    if decl.declaration().is_immutable() {
                     } else {
                         let mut indices = Vec::with_capacity(names.len());
                         for name in &names {
@@ -197,7 +197,10 @@ impl ByteCompiler<'_> {
         // For let/const with a local identifier binding, emit iterator_value
         // directly into the binding's persistent register to avoid a Move.
         if let IterableLoopInitializer::Let(Binding::Identifier(ident))
-        | IterableLoopInitializer::Const(Binding::Identifier(ident)) = for_in_loop.initializer()
+        | IterableLoopInitializer::Const(Binding::Identifier(ident))
+        | IterableLoopInitializer::Using(Binding::Identifier(ident))
+        | IterableLoopInitializer::AwaitUsing(Binding::Identifier(ident)) =
+            for_in_loop.initializer()
             && let ident = ident.to_js_string(self.interner())
             && let binding = self.lexical_scope.get_identifier_reference(ident)
             && binding.local()
@@ -227,7 +230,9 @@ impl ByteCompiler<'_> {
                     }
                 },
                 IterableLoopInitializer::Let(declaration)
-                | IterableLoopInitializer::Const(declaration) => match declaration {
+                | IterableLoopInitializer::Const(declaration)
+                | IterableLoopInitializer::Using(declaration)
+                | IterableLoopInitializer::AwaitUsing(declaration) => match declaration {
                     Binding::Identifier(ident) => {
                         let ident = ident.to_js_string(self.interner());
                         self.emit_binding(BindingOpcode::InitLexical, ident, &value);
@@ -313,7 +318,9 @@ impl ByteCompiler<'_> {
         // For let/const with a local identifier binding, emit iterator_value
         // directly into the binding's persistent register to avoid a Move.
         let handler_index = if let IterableLoopInitializer::Let(Binding::Identifier(ident))
-        | IterableLoopInitializer::Const(Binding::Identifier(ident)) =
+        | IterableLoopInitializer::Const(Binding::Identifier(ident))
+        | IterableLoopInitializer::Using(Binding::Identifier(ident))
+        | IterableLoopInitializer::AwaitUsing(Binding::Identifier(ident)) =
             for_of_loop.initializer()
             && let ident = ident.to_js_string(self.interner())
             && let ident = self.lexical_scope.get_identifier_reference(ident)
@@ -368,7 +375,9 @@ impl ByteCompiler<'_> {
                     }
                 }
                 IterableLoopInitializer::Let(declaration)
-                | IterableLoopInitializer::Const(declaration) => match declaration {
+                | IterableLoopInitializer::Const(declaration)
+                | IterableLoopInitializer::Using(declaration)
+                | IterableLoopInitializer::AwaitUsing(declaration) => match declaration {
                     Binding::Identifier(ident) => {
                         let ident = ident.to_js_string(self.interner());
                         self.emit_binding(BindingOpcode::InitLexical, ident, &value);

@@ -131,6 +131,12 @@ impl LexicalDeclaration {
     pub const fn is_const(&self) -> bool {
         matches!(self, Self::Const(_))
     }
+
+    /// Returns `true` if the declaration creates immutable bindings.
+    #[must_use]
+    pub const fn is_immutable(&self) -> bool {
+        matches!(self, Self::Const(_) | Self::Using(_) | Self::AwaitUsing(_))
+    }
 }
 
 impl From<LexicalDeclaration> for Declaration {

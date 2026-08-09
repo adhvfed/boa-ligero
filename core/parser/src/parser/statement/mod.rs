@@ -426,9 +426,42 @@ where
     type Output = ast::StatementListItem;
 
     fn parse(self, cursor: &mut Cursor<R>, interner: &mut Interner) -> ParseResult<Self::Output> {
-        let tok = cursor.peek(0, interner).or_abrupt()?;
+        let tok_kind = cursor.peek(0, interner).or_abrupt()?.kind().clone();
+        let using_binding_follows =
+            if matches!(&tok_kind, TokenKind::Keyword((Keyword::Using, false))) {
+                let skip_n = if cursor.peek_is_line_terminator(0, interner).or_abrupt()? {
+                    2
+                } else {
+                    1
+                };
+                cursor
+                    .peek_no_skip_line_term(skip_n, interner)?
+                    .is_some_and(|tok| {
+                        tok.kind() != &TokenKind::LineTerminator
+                            && allowed_token_after_using(Some(tok))
+                    })
+            } else {
+                false
+            };
+        let await_using_binding_follows =
+            if matches!(&tok_kind, TokenKind::Keyword((Keyword::Await, false))) {
+                let current = usize::from(cursor.peek_is_line_terminator(0, interner).or_abrupt()?);
+                matches!(
+                    cursor
+                        .peek_no_skip_line_term(current + 1, interner)?
+                        .map(Token::kind),
+                    Some(TokenKind::Keyword((Keyword::Using, false)))
+                ) && cursor
+                    .peek_no_skip_line_term(current + 2, interner)?
+                    .is_some_and(|tok| {
+                        tok.kind() != &TokenKind::LineTerminator
+                            && allowed_token_after_using(Some(tok))
+                    })
+            } else {
+                false
+            };
 
-        match tok.kind().clone() {
+        match tok_kind {
             TokenKind::Keyword((Keyword::Function | Keyword::Class | Keyword::Const, _)) => {
                 Declaration::new(self.allow_yield, self.allow_await)
                     .parse(cursor, interner)
@@ -440,14 +473,7 @@ where
             // ordinary identifier, so it must fall through to `Statement`.
             //
             // Per spec: <https://tc39.es/proposal-explicit-resource-management/#prod-UsingDeclaration>
-            TokenKind::Keyword((Keyword::Using, false))
-                if cursor
-                    .peek_no_skip_line_term(1, interner)?
-                    .is_some_and(|tok| {
-                        tok.kind() != &TokenKind::LineTerminator
-                            && allowed_token_after_using(Some(tok))
-                    }) =>
-            {
+            TokenKind::Keyword((Keyword::Using, false)) if using_binding_follows => {
                 Declaration::new(self.allow_yield, self.allow_await)
                     .parse(cursor, interner)
                     .map(ast::StatementListItem::from)
@@ -459,18 +485,12 @@ where
                     .parse(cursor, interner)
                     .map(ast::StatementListItem::from)
             }
+            TokenKind::Keyword((Keyword::Await, false)) if await_using_binding_follows => {
+                Declaration::new(self.allow_yield, self.allow_await)
+                    .parse(cursor, interner)
+                    .map(ast::StatementListItem::from)
+            }
             TokenKind::Keyword((Keyword::Await, false)) => {
-                // Check if this is `await using`
-                // Per spec, there must be [no LineTerminator here] between `await` and `using`
-                if let Some(next_tok) = cursor.peek_no_skip_line_term(1, interner)?
-                    && next_tok.kind() != &TokenKind::LineTerminator
-                    && matches!(next_tok.kind(), TokenKind::Keyword((Keyword::Using, false)))
-                {
-                    return Declaration::new(self.allow_yield, self.allow_await)
-                        .parse(cursor, interner)
-                        .map(ast::StatementListItem::from);
-                }
-                // Otherwise, parse as a statement (await expression)
                 Statement::new(self.allow_yield, self.allow_await, self.allow_return)
                     .parse(cursor, interner)
                     .map(ast::StatementListItem::from)

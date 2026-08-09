@@ -666,76 +666,13 @@ fn import_non_string_attribute_value() {
 /// Checks `using` declaration parsing.
 #[test]
 fn using_declaration() {
-    let interner = &mut Interner::default();
-    check_script_parser(
-        "using x = resource;",
-        vec![
-            Declaration::Lexical(LexicalDeclaration::Using(
-                vec![Variable::from_identifier(
-                    Identifier::new(
-                        interner.get_or_intern_static("x", utf16!("x")),
-                        Span::new((1, 7), (1, 8)),
-                    ),
-                    Some(
-                        Identifier::new(
-                            interner.get_or_intern_static("resource", utf16!("resource")),
-                            Span::new((1, 11), (1, 19)),
-                        )
-                        .into(),
-                    ),
-                )]
-                .try_into()
-                .unwrap(),
-            ))
-            .into(),
-        ],
-        interner,
-    );
+    check_valid_scripts(&["{ using x = resource; }"]);
 }
 
 /// Checks `using` declaration with multiple bindings.
 #[test]
 fn using_declaration_multiple() {
-    let interner = &mut Interner::default();
-    check_script_parser(
-        "using a = res1, b = res2;",
-        vec![
-            Declaration::Lexical(LexicalDeclaration::Using(
-                vec![
-                    Variable::from_identifier(
-                        Identifier::new(
-                            interner.get_or_intern_static("a", utf16!("a")),
-                            Span::new((1, 7), (1, 8)),
-                        ),
-                        Some(
-                            Identifier::new(
-                                interner.get_or_intern_static("res1", utf16!("res1")),
-                                Span::new((1, 11), (1, 15)),
-                            )
-                            .into(),
-                        ),
-                    ),
-                    Variable::from_identifier(
-                        Identifier::new(
-                            interner.get_or_intern_static("b", utf16!("b")),
-                            Span::new((1, 17), (1, 18)),
-                        ),
-                        Some(
-                            Identifier::new(
-                                interner.get_or_intern_static("res2", utf16!("res2")),
-                                Span::new((1, 21), (1, 25)),
-                            )
-                            .into(),
-                        ),
-                    ),
-                ]
-                .try_into()
-                .unwrap(),
-            ))
-            .into(),
-        ],
-        interner,
-    );
+    check_valid_scripts(&["{ using a = res1, b = res2; }"]);
 }
 
 /// Checks that `using` declaration without initializer fails.
@@ -848,46 +785,7 @@ fn await_using_duplicate_names() {
 /// Checks that `using` works with valid identifiers.
 #[test]
 fn using_valid_identifiers() {
-    let interner = &mut Interner::default();
-    check_script_parser(
-        "using x = resource, y = resource2;",
-        vec![
-            Declaration::Lexical(LexicalDeclaration::Using(
-                vec![
-                    Variable::from_identifier(
-                        Identifier::new(
-                            interner.get_or_intern_static("x", utf16!("x")),
-                            Span::new((1, 7), (1, 8)),
-                        ),
-                        Some(
-                            Identifier::new(
-                                interner.get_or_intern_static("resource", utf16!("resource")),
-                                Span::new((1, 11), (1, 19)),
-                            )
-                            .into(),
-                        ),
-                    ),
-                    Variable::from_identifier(
-                        Identifier::new(
-                            interner.get_or_intern_static("y", utf16!("y")),
-                            Span::new((1, 21), (1, 22)),
-                        ),
-                        Some(
-                            Identifier::new(
-                                interner.get_or_intern_static("resource2", utf16!("resource2")),
-                                Span::new((1, 25), (1, 34)),
-                            )
-                            .into(),
-                        ),
-                    ),
-                ]
-                .try_into()
-                .unwrap(),
-            ))
-            .into(),
-        ],
-        interner,
-    );
+    check_valid_scripts(&["{ using x = resource, y = resource2; }"]);
 }
 
 /// Checks that `await using` works with valid identifiers in async context.
@@ -903,6 +801,15 @@ fn await_using_valid_identifiers() {
         "Failed to parse await using with multiple bindings: {:?}",
         result.err()
     );
+}
+
+#[test]
+fn await_using_for_heads() {
+    check_valid_scripts(&[
+        "async function f() { for (await using x = null;;) break; }",
+        "async function f() { for (await using x of [null]) {} }",
+    ]);
+    check_invalid_script("async function f() { for (await using x in {}) {} }");
 }
 
 /// Asserts that every one of `sources` parses as a script without error.
@@ -973,6 +880,18 @@ fn using_is_a_contextual_keyword() {
 #[test]
 fn using_declaration_requires_binding_on_same_line() {
     check_valid_scripts(&["var using, let; { using\nlet = \"s\"; }"]);
+}
+
+#[test]
+fn using_declaration_context_restrictions() {
+    check_invalid_script("using x = null;");
+    check_invalid_script("switch (0) { case 0: using x = null; }");
+    check_invalid_script("switch (0) { default: using x = null; }");
+    check_valid_scripts(&[
+        "{ using x = null; }",
+        "for (using x = null;;) break;",
+        "for (using x of [null]) {}",
+    ]);
 }
 
 /// `using` followed by `[` or `{` is never a declaration: the `BindingList` of a `using`

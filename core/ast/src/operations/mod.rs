@@ -2551,6 +2551,12 @@ impl<'ast> Visitor<'ast> for AnnexBFunctionDeclarationNamesVisitor<'_> {
             let bound_names = bound_names(node);
             self.0.retain(|name| !bound_names.contains(name));
         }
+        if let IterableLoopInitializer::Using(node) | IterableLoopInitializer::AwaitUsing(node) =
+            node.initializer()
+        {
+            let bound_names = bound_names(node);
+            self.0.retain(|name| !bound_names.contains(name));
+        }
 
         ControlFlow::Continue(())
     }
@@ -2566,6 +2572,12 @@ impl<'ast> Visitor<'ast> for AnnexBFunctionDeclarationNamesVisitor<'_> {
             self.0.retain(|name| !bound_names.contains(name));
         }
         if let IterableLoopInitializer::Const(node) = node.initializer() {
+            let bound_names = bound_names(node);
+            self.0.retain(|name| !bound_names.contains(name));
+        }
+        if let IterableLoopInitializer::Using(node) | IterableLoopInitializer::AwaitUsing(node) =
+            node.initializer()
+        {
             let bound_names = bound_names(node);
             self.0.retain(|name| !bound_names.contains(name));
         }

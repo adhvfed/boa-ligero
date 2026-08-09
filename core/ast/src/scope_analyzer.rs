@@ -988,7 +988,7 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
             Some(ForLoopInitializer::Lexical(decl)) => {
                 let mut scope = Scope::new(self.scope.clone(), false);
                 let names = bound_names(&decl.declaration);
-                if decl.declaration.is_const() {
+                if decl.declaration.is_immutable() {
                     for name in &names {
                         let name = name.to_js_string(self.interner);
                         scope.create_immutable_binding(name, true);
@@ -1024,7 +1024,9 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
     fn visit_for_in_loop_mut(&mut self, node: &'ast mut ForInLoop) -> ControlFlow<Self::BreakTy> {
         let initializer_bound_names = match node.initializer() {
             IterableLoopInitializer::Let(declaration)
-            | IterableLoopInitializer::Const(declaration) => bound_names(declaration),
+            | IterableLoopInitializer::Const(declaration)
+            | IterableLoopInitializer::Using(declaration)
+            | IterableLoopInitializer::AwaitUsing(declaration) => bound_names(declaration),
             _ => Vec::new(),
         };
         if initializer_bound_names.is_empty() {
@@ -1057,7 +1059,9 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
                 }
                 Some(scope)
             }
-            IterableLoopInitializer::Const(declaration) => {
+            IterableLoopInitializer::Const(declaration)
+            | IterableLoopInitializer::Using(declaration)
+            | IterableLoopInitializer::AwaitUsing(declaration) => {
                 let scope = Scope::new(self.scope.clone(), false);
                 match declaration {
                     Binding::Identifier(ident) => {
@@ -1091,7 +1095,9 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
     fn visit_for_of_loop_mut(&mut self, node: &'ast mut ForOfLoop) -> ControlFlow<Self::BreakTy> {
         let initializer_bound_names = match node.initializer() {
             IterableLoopInitializer::Let(declaration)
-            | IterableLoopInitializer::Const(declaration) => bound_names(declaration),
+            | IterableLoopInitializer::Const(declaration)
+            | IterableLoopInitializer::Using(declaration)
+            | IterableLoopInitializer::AwaitUsing(declaration) => bound_names(declaration),
             _ => Vec::new(),
         };
         if initializer_bound_names.is_empty() {
@@ -1124,7 +1130,9 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
                 }
                 Some(scope)
             }
-            IterableLoopInitializer::Const(declaration) => {
+            IterableLoopInitializer::Const(declaration)
+            | IterableLoopInitializer::Using(declaration)
+            | IterableLoopInitializer::AwaitUsing(declaration) => {
                 let scope = Scope::new(self.scope.clone(), false);
                 match declaration {
                     Binding::Identifier(ident) => {
@@ -1806,21 +1814,17 @@ fn global_declaration_instantiation(
                         drop(env.create_mutable_binding(name, false));
                     }
                 }
-                // `using`/`await using` are bound here exactly like `let`. Boa's bytecompiler
-                // currently lowers them as plain lexical bindings without a disposal stack, and
-                // omitting them here left the declaration with no binding at all, which made
-                // `PutLexicalValue` index an empty environment and panic.
-                Declaration::Lexical(
-                    LexicalDeclaration::Let(declaration)
-                    | LexicalDeclaration::Using(declaration)
-                    | LexicalDeclaration::AwaitUsing(declaration),
-                ) => {
+                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Const(declaration)) => {
+                Declaration::Lexical(
+                    LexicalDeclaration::Const(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         env.create_immutable_binding(name, true);
@@ -1859,7 +1863,12 @@ where
     // 3. For each element d of declarations, do
     for d in &declarations {
         // i. If IsConstantDeclaration of d is true, then
-        if let LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::Const(d)) = d {
+        if let LexicallyScopedDeclaration::LexicalDeclaration(
+            LexicalDeclaration::Const(d)
+            | LexicalDeclaration::Using(d)
+            | LexicalDeclaration::AwaitUsing(d),
+        ) = d
+        {
             // a. For each element dn of the BoundNames of d, do
             for dn in bound_names::<'_, VariableList>(d) {
                 // 1. Perform ! env.CreateImmutableBinding(dn, true).
@@ -2238,19 +2247,17 @@ fn function_declaration_instantiation(
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                // `using`/`await using` bind like `let`; see the note in
-                // `global_declaration_instantiation`.
-                Declaration::Lexical(
-                    LexicalDeclaration::Let(declaration)
-                    | LexicalDeclaration::Using(declaration)
-                    | LexicalDeclaration::AwaitUsing(declaration),
-                ) => {
+                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Const(declaration)) => {
+                Declaration::Lexical(
+                    LexicalDeclaration::Const(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         lex_env.create_immutable_binding(name, true);
@@ -2319,7 +2326,11 @@ fn module_instantiation(module: &Module, env: &Scope, interner: &Interner) {
                     drop(env.create_mutable_binding(name, false));
                 }
             }
-            LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::Const(c)) => {
+            LexicallyScopedDeclaration::LexicalDeclaration(
+                LexicalDeclaration::Const(c)
+                | LexicalDeclaration::Using(c)
+                | LexicalDeclaration::AwaitUsing(c),
+            ) => {
                 for name in bound_names(c) {
                     let name = name.to_js_string(interner);
                     env.create_immutable_binding(name, true);
@@ -2327,18 +2338,6 @@ fn module_instantiation(module: &Module, env: &Scope, interner: &Interner) {
             }
             LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::Let(l)) => {
                 for name in bound_names(l) {
-                    let name = name.to_js_string(interner);
-                    drop(env.create_mutable_binding(name, false));
-                }
-            }
-            LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::Using(u)) => {
-                for name in bound_names(u) {
-                    let name = name.to_js_string(interner);
-                    drop(env.create_mutable_binding(name, false));
-                }
-            }
-            LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::AwaitUsing(au)) => {
-                for name in bound_names(au) {
                     let name = name.to_js_string(interner);
                     drop(env.create_mutable_binding(name, false));
                 }
@@ -2562,19 +2561,17 @@ pub(crate) fn eval_declaration_instantiation_scope(
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                // `using`/`await using` bind like `let`; see the note in
-                // `global_declaration_instantiation`.
-                Declaration::Lexical(
-                    LexicalDeclaration::Let(declaration)
-                    | LexicalDeclaration::Using(declaration)
-                    | LexicalDeclaration::AwaitUsing(declaration),
-                ) => {
+                Declaration::Lexical(LexicalDeclaration::Let(declaration)) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         drop(lex_env.create_mutable_binding(name, false));
                     }
                 }
-                Declaration::Lexical(LexicalDeclaration::Const(declaration)) => {
+                Declaration::Lexical(
+                    LexicalDeclaration::Const(declaration)
+                    | LexicalDeclaration::Using(declaration)
+                    | LexicalDeclaration::AwaitUsing(declaration),
+                ) => {
                     for name in bound_names(declaration) {
                         let name = name.to_js_string(interner);
                         lex_env.create_immutable_binding(name, true);

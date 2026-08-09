@@ -9,13 +9,13 @@
 
 use crate::{
     Error,
-    lexer::{Error as LexError, TokenKind},
+    lexer::{Error as LexError, Token, TokenKind},
     parser::{
         AllowAwait, AllowReturn, AllowYield, Cursor, OrAbrupt, ParseResult, TokenParser,
         expression::{AssignmentExpression, Expression},
         statement::{
             Statement,
-            declaration::{LexicalDeclaration, allowed_token_after_let},
+            declaration::{LexicalDeclaration, allowed_token_after_let, allowed_token_after_using},
             variable::VariableDeclarationList,
         },
     },
@@ -131,6 +131,35 @@ where
                     .parse(cursor, interner)?
                     .into(),
             ),
+            TokenKind::Keyword((Keyword::Using, false))
+                if allowed_token_after_using(cursor.peek(1, interner)?)
+                    && !(matches!(
+                        cursor.peek(1, interner)?.map(Token::kind),
+                        Some(TokenKind::Keyword((Keyword::Of, false)))
+                    ) && matches!(
+                        cursor.peek(2, interner)?.map(Token::kind),
+                        Some(TokenKind::Keyword((Keyword::Of, false)))
+                    )) =>
+            {
+                Some(
+                    LexicalDeclaration::new(false, self.allow_yield, self.allow_await, true)
+                        .parse(cursor, interner)?
+                        .into(),
+                )
+            }
+            TokenKind::Keyword((Keyword::Await, false))
+                if self.allow_await.0
+                    && matches!(
+                        cursor.peek(1, interner)?.map(Token::kind),
+                        Some(TokenKind::Keyword((Keyword::Using, false)))
+                    ) =>
+            {
+                Some(
+                    LexicalDeclaration::new(false, self.allow_yield, self.allow_await, true)
+                        .parse(cursor, interner)?
+                        .into(),
+                )
+            }
             TokenKind::Keyword((Keyword::Async, false)) if !r#await => {
                 if matches!(
                     cursor.peek(1, interner).or_abrupt()?.kind(),
@@ -190,6 +219,22 @@ where
                 }
 
                 let in_loop = kw == &Keyword::In;
+                if in_loop
+                    && matches!(
+                        &init,
+                        ForLoopInitializer::Lexical(initializer)
+                            if matches!(
+                                initializer.declaration(),
+                                ast::declaration::LexicalDeclaration::Using(_)
+                                    | ast::declaration::LexicalDeclaration::AwaitUsing(_)
+                            )
+                    )
+                {
+                    return Err(Error::general(
+                        "using declarations are not allowed in for-in loops",
+                        position,
+                    ));
+                }
                 let init = initializer_to_iterable_loop_initializer(
                     init,
                     position,
@@ -221,7 +266,10 @@ where
                 // Checks are only applicable to lexical bindings.
                 if matches!(
                     &init,
-                    IterableLoopInitializer::Const(_) | IterableLoopInitializer::Let(_)
+                    IterableLoopInitializer::Const(_)
+                        | IterableLoopInitializer::Let(_)
+                        | IterableLoopInitializer::Using(_)
+                        | IterableLoopInitializer::AwaitUsing(_)
                 ) {
                     // It is a Syntax Error if the BoundNames of ForDeclaration contains "let".
                     // It is a Syntax Error if any element of the BoundNames of ForDeclaration also occurs in the VarDeclaredNames of Statement.
@@ -390,10 +438,14 @@ fn initializer_to_iterable_loop_initializer(
                         ast::declaration::LexicalDeclaration::Const(_) => {
                             IterableLoopInitializer::Const(decl.binding().clone())
                         }
-                        ast::declaration::LexicalDeclaration::Let(_)
-                        | ast::declaration::LexicalDeclaration::Using(_)
-                        | ast::declaration::LexicalDeclaration::AwaitUsing(_) => {
+                        ast::declaration::LexicalDeclaration::Let(_) => {
                             IterableLoopInitializer::Let(decl.binding().clone())
+                        }
+                        ast::declaration::LexicalDeclaration::Using(_) => {
+                            IterableLoopInitializer::Using(decl.binding().clone())
+                        }
+                        ast::declaration::LexicalDeclaration::AwaitUsing(_) => {
+                            IterableLoopInitializer::AwaitUsing(decl.binding().clone())
                         }
                     })
                 }
