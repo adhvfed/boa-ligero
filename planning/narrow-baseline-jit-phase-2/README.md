@@ -356,6 +356,10 @@ showing that another boundary dominates.
   — retained exact Number XOR semantics, correctness and performance gates,
   the fully removed `BitAnd` regression, and the next representation/call
   architecture boundaries.
+- [Default-JIT runtime-control design, 2026-08-09](45-default-jit-runtime-control-design-2026-08-09.md)
+  — default-feature and default-context enablement, explicit CLI/embedder/
+  Test262 interpreter controls, worker propagation, compatibility boundaries,
+  and the acceptance matrix for the policy change.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
