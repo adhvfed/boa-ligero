@@ -19,6 +19,7 @@ icu_provider_source = { workspace = true, features = [
     "use_wasm",
     "unstable"
 ] }
+icu_provider.workspace = true
 log.workspace = true
 simple_logger.workspace = true
 

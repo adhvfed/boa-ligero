@@ -177,3 +177,28 @@ where
 pub fn buffer() -> impl DynamicDryDataProvider<BufferMarker> {
     Wrapper(&*PROVIDER)
 }
+
+#[cfg(test)]
+mod tests {
+    use icu_decimal::provider::DecimalDigitsV1;
+    use icu_provider::prelude::*;
+
+    #[test]
+    fn bundled_provider_includes_explicit_numbering_system_digits() {
+        let provider = super::buffer();
+        for numbering_system in ["ahom", "mathsans", "wcho"] {
+            let attributes = DataMarkerAttributes::try_from_str(numbering_system).unwrap();
+            provider
+                .load_data(
+                    DecimalDigitsV1::INFO,
+                    DataRequest {
+                        id: DataIdentifierBorrowed::for_marker_attributes(attributes),
+                        ..DataRequest::default()
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("missing digits for numbering system {numbering_system}: {error}")
+                });
+        }
+    }
+}

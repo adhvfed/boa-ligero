@@ -7,6 +7,9 @@ use icu_provider_export::blob_exporter::BlobExporter;
 use icu_provider_export::prelude::*;
 use icu_provider_source::{CoverageLevel, SourceDataProvider};
 
+mod source;
+use source::Ecma402SourceProvider;
+
 /// Path to the directory where the exported data lives.
 const EXPORT_PATH: &str = "core/icu_provider/data";
 
@@ -100,7 +103,7 @@ const SERVICES: &[(&str, &[DataMarkerInfo])] = &[
 fn export_for_service(
     service: &str,
     markers: &[DataMarkerInfo],
-    provider: &SourceDataProvider,
+    provider: &Ecma402SourceProvider<'_>,
     driver: ExportDriver,
 ) -> Result<(), Box<dyn Error>> {
     log::info!("Generating ICU4X data for service `{service}` with markers: {markers:#?}");
@@ -127,8 +130,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _unused = std::fs::remove_dir_all(EXPORT_PATH);
     std::fs::create_dir_all(EXPORT_PATH)?;
 
-    let provider = &SourceDataProvider::new();
-    let locales = provider
+    let source = SourceDataProvider::new();
+    let locales = source
         .locales_for_coverage_levels([CoverageLevel::Modern])?
         .into_iter()
         .map(DataLocaleFamily::with_descendants)
@@ -144,16 +147,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let driver = ExportDriver::new(
         locales,
         DeduplicationStrategy::None.into(),
-        LocaleFallbacker::try_new_unstable(provider)?,
+        LocaleFallbacker::try_new_unstable(&source)?,
     )
     .with_additional_collations([String::from("search*")])
     .with_marker_attributes_filter("units", |attributes| {
         is_sanctioned_unit_attribute(attributes.as_str())
     })
     .with_recommended_segmenter_models();
-
+    let provider = Ecma402SourceProvider::new(&source);
     for (service, keys) in SERVICES {
-        export_for_service(service, keys, provider, driver.clone())?;
+        export_for_service(service, keys, &provider, driver.clone())?;
     }
 
     Ok(())
