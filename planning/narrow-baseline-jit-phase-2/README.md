@@ -348,6 +348,9 @@ showing that another boundary dominates.
 - [Inline `ToInt32` design, 2026-08-09](42-inline-toint32-design-2026-08-09.md)
   — a correct but slower bit-for-bit Cranelift prototype, rejected after its
   larger branch-heavy artifact lost to the compact Rust helper.
+- [Number bitwise-family design, 2026-08-09](43-number-bitwise-family-design-2026-08-09.md)
+  — a measured `BitAnd`/`BitXor` extension of the accepted exact Number
+  conversion contract.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
