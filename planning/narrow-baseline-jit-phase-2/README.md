@@ -345,6 +345,9 @@ showing that another boundary dominates.
 - [Number `BitOr` checkpoint, 2026-08-09](41-number-bitor-checkpoint-2026-08-09.md)
   — accepted Number semantics, coercion and budget closure, and the measured
   integer-arithmetic improvement.
+- [Inline `ToInt32` design, 2026-08-09](42-inline-toint32-design-2026-08-09.md)
+  — a bit-for-bit Cranelift translation selected to remove the remaining Rust
+  helper transitions from Number bitwise loops.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
