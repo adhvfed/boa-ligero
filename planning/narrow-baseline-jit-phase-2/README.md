@@ -360,6 +360,10 @@ showing that another boundary dominates.
   — default-feature and default-context enablement, explicit CLI/embedder/
   Test262 interpreter controls, worker propagation, compatibility boundaries,
   and the acceptance matrix for the policy change.
+- [Default-JIT runtime-control checkpoint, 2026-08-09](46-default-jit-runtime-control-checkpoint-2026-08-09.md)
+  — the landed mode architecture, exact interpreter/JIT Test262 parity,
+  feature-propagation and cold-measurement defects caught during verification,
+  and the remaining cross-platform/browser/security evidence.
 
 Phase 1 remains the semantic contract: [exit/deopt/GC](../narrow-baseline-jit/03-exit-deopt-gc.md),
 [native lowering](../narrow-baseline-jit/04-native-lowering.md), and
