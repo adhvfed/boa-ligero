@@ -1,7 +1,8 @@
 # Global-object binding-read design — 2026-08-09
 
-Status: selected for a bounded prototype. This is a binding/cache slice, not a
-general environment or global-operation compiler.
+Status: accepted and implemented by `a5ec76e8`. This is a binding/cache slice,
+not a general environment or global-operation compiler. Results are recorded
+in the [implementation checkpoint](39-global-object-binding-read-checkpoint-2026-08-09.md).
 
 # Measured problem
 
@@ -65,7 +66,8 @@ Permanent differential coverage must include:
 - same-shape replacement with a different ordinary function;
 - numeric same-representation mutation and representation mismatch replay;
 - deletion/missing-property `ReferenceError`;
-- accessor properties and prototype slots taking interpreter replay;
+- accessor properties taking interpreter replay and prototype data slots
+  reading their current value;
 - shape invalidation, forced GC, realm separation, and unstable environment
   fallback;
 - exact successful and guard-fallback instruction-budget parity;
