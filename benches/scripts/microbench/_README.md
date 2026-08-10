@@ -11,16 +11,22 @@ cargo bench --bench scripts -- microbench
 
 Each script is run as a Criterion benchmark group named after its path.
 
-## Running with reference engines (node / bun)
+## Running against V8
 
 ```
-./tools/bench-compare.sh                  # all microbenches, all engines
-./tools/bench-compare.sh property-access  # filter by name
+cargo build --release -p boa_benches --bin bench-compare-runner --features jit
+tools/bench-compare/compare.sh property-mono
+tools/bench-compare/compare.sh --binding --json /tmp/boa-v8.json
 ```
 
-The comparison tool runs the same JS in node/bun using a wrapper that
-loops `main()` and reports elapsed time. Numbers are then printed
-side-by-side.
+The comparison tool runs the same JS under Boa, V8, and V8 `--jitless` in
+fresh, order-alternated process pairs. It validates the observable result sink
+and reports p50/p95/p99/max, median absolute deviation, and coefficient of
+variation. `--binding` uses nine processes per engine, 200 measured calls, 80
+warmups, includes Boa's tiered/JIT mode, and fails noisy measurements.
+
+`tools/bench-compare/suite.json` names the headline set. New scripts must be
+classified explicitly, so benchmark coverage cannot change silently.
 
 ## Design rules
 

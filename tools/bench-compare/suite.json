@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "benchmarks": {
+    "array-numeric-sum": { "category": "arrays", "headline": true },
+    "closure-capture": { "category": "calls", "headline": true },
+    "float-arith": { "category": "arithmetic", "headline": true },
+    "fn-call-flat": { "category": "calls", "headline": true },
+    "global-counter": { "category": "globals", "headline": true },
+    "int-arith": { "category": "arithmetic", "headline": true },
+    "method-call-mono": { "category": "calls", "headline": true },
+    "object-create-literal": {
+      "category": "allocation",
+      "headline": false,
+      "reason": "historical V8 dead-code-elimination concern; retain as a diagnostic"
+    },
+    "property-mega": {
+      "category": "properties",
+      "headline": false,
+      "reason": "historical V8 dead-code-elimination concern; retain as a diagnostic"
+    },
+    "property-mono": { "category": "properties", "headline": true },
+    "property-poly2": {
+      "category": "properties",
+      "headline": false,
+      "reason": "historical V8 dead-code-elimination concern; retain as a diagnostic"
+    },
+    "property-poly4": { "category": "properties", "headline": true },
+    "property-set-mono": { "category": "properties", "headline": true },
+    "readonly-indexed-scan": { "category": "browser-collections", "headline": true },
+    "recursion-fib": {
+      "category": "calls",
+      "headline": false,
+      "reason": "historical V8 specialization concern; retain as a diagnostic"
+    },
+    "string-concat": {
+      "category": "strings",
+      "headline": false,
+      "reason": "historical rope-flattening/dead-code-elimination concern; retain as a diagnostic"
+    },
+    "jit-resource-saturation": {
+      "category": "jit-resources",
+      "headline": false,
+      "enabled": false,
+      "reason": "resource-governor gate, not a warm throughput benchmark"
+    },
+    "one-shot-ineligible-loop": {
+      "category": "jit-cold",
+      "headline": false,
+      "enabled": false,
+      "reason": "single-call JIT admission fixture"
+    },
+    "one-shot-loop": {
+      "category": "jit-cold",
+      "headline": false,
+      "enabled": false,
+      "reason": "single-call OSR fixture"
+    }
+  }
+}

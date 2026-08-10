@@ -1,4 +1,8 @@
-# Microbench Baseline — Ignition-Parity Target
+# Historical Microbenchmark Baseline
+
+> This 2026-05-19 snapshot predates the paired-process harness. It is retained
+> as historical evidence, but its single process sample is not a binding
+> performance result. Capture the next baseline with `compare.sh --binding`.
 
 Captured on 2026-05-19 against Node v25.2.1, Bun (latest), and Boa at commit
 `a5dd302c` (`perf(vm): drop the to_object clone on IC-hit property writes`).
@@ -18,24 +22,23 @@ Captured on 2026-05-19 against Node v25.2.1, Bun (latest), and Boa at commit
 | Boa vs Node `--jitless` — geomean (all 15)      | 6.68× slower (inflated by DCE-suspect benches)                        |
 | Boa vs Node (full JIT) — geomean (fair subset)  | ~150× slower (expected — that's the JIT gap, not the interpreter gap) |
 
-## Ignition-parity target
+## Current parity targets
 
-> **Done with Phase 1 when:** geomean over the **fair subset** is within
-> **1.5× of Node `--jitless`**, with **no individual fair benchmark worse
-> than 2.5×**.
+Interpreter: p50 geomean over the headline suite must be no slower than V8
+`--jitless`, with no headline workload worse than 1.25x. Tiered/JIT mode must
+be no slower than ordinary V8 on the same geomean, again with no headline
+workload worse than 1.25x. Cold execution and browser-shaped workloads are
+separate gates; warm microbench parity cannot substitute for either.
 
 Rationale:
 
 - Node `--jitless` runs only Ignition (the interpreter tier). It is the right
   comparison point — V8 with JIT is a different problem (Phase 2).
-- 1.5× geomean is achievable: we're at 3.43× now, and the remaining
-  Ignition levers on the list (CallFrame restructure, `MaybeUninit` frame
-  init, slow-path outlining for `JsValue::{add,sub,…}` and `get/set_by_name`,
-  borrowed-fast-path mirroring for `…WithThis` variants) plausibly add up
-  to a 2.3× speedup if each lands cleanly.
-- 2.5× worst-case is a stretch on `method-call-mono` (currently 6.55×) —
-  it implies fixing the polymorphic-call dispatch path specifically. May
-  warrant its own targeted lever.
+- The interpreter comparison isolates VM quality from the native tier.
+- The ordinary V8 comparison is the product goal; V8 `--jitless` is a useful
+  diagnostic reference, not the finish line.
+- `tools/bench-compare/suite.json` owns headline membership explicitly. A
+  benchmark cannot enter or leave the geomean as an accidental side effect.
 
 ## Per-benchmark results
 
@@ -81,13 +84,13 @@ Ignition-parity geomean.
 ## How to reproduce
 
 ```bash
-cargo build --release -p boa_benches --bin bench-compare-runner
-RUNS=100 WARMUP=10 bash tools/bench-compare/compare.sh
+cargo build --release -p boa_benches --bin bench-compare-runner --features jit
+tools/bench-compare/compare.sh --binding --json /tmp/boa-v8.json
 ```
 
 ## How to update this baseline
 
-When a perf-significant change lands, rerun the harness and update the
-"Headline numbers" table. Keep the "Ignition-parity target" line stable —
-that's the moving goalpost we're aiming at, not the line of best fit
-through whatever we shipped.
+When a performance change lands, rerun the binding harness and preserve the raw
+JSON with the change's before/after evidence. Update committed summaries only
+after the report passes sink validation and the 5% inter-process CV ceiling.
+Targets do not move to fit the implementation.
