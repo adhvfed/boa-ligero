@@ -181,7 +181,7 @@ pub fn buffer() -> impl DynamicDryDataProvider<BufferMarker> {
 
 #[cfg(test)]
 mod tests {
-    use boa_icu_data::{BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV1};
+    use boa_icu_data::{BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV2};
     use icu_decimal::provider::DecimalDigitsV1;
     use icu_provider::prelude::*;
 
@@ -208,10 +208,14 @@ mod tests {
     fn bundled_provider_includes_supplemental_number_symbols() {
         let provider = super::buffer();
         let locale = "zh-Hant".parse().unwrap();
-        let response: DataResponse<BoaNumberSpecialSymbolsV1> = provider
+        let numbering_system = DataMarkerAttributes::try_from_str("latn").unwrap();
+        let response: DataResponse<BoaNumberSpecialSymbolsV2> = provider
             .as_deserializing()
             .load(DataRequest {
-                id: DataIdentifierBorrowed::for_locale(&locale),
+                id: DataIdentifierBorrowed::for_marker_attributes_and_locale(
+                    numbering_system,
+                    &locale,
+                ),
                 ..DataRequest::default()
             })
             .unwrap();

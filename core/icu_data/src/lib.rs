@@ -16,13 +16,15 @@ use yoke::Yokeable;
 use zerofrom::ZeroFrom;
 
 icu_provider::data_marker!(
-    /// Locale-specific spellings of non-finite numbers.
-    BoaNumberSpecialSymbolsV1,
-    "boa/number/special/symbols/v1",
+    /// Locale- and numbering-system-specific symbols used by number formatting.
+    BoaNumberSpecialSymbolsV2,
+    "boa/number/special/symbols/v2",
     NumberSpecialSymbols<'static>,
+    #[cfg(feature = "datagen")]
+    attributes_domain = "numbering_system"
 );
 
-/// Locale-specific spellings of non-finite numbers used by number formatting.
+/// Locale- and numbering-system-specific symbols used by number formatting.
 #[derive(Debug, Clone, PartialEq, Yokeable, ZeroFrom)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 #[cfg_attr(feature = "datagen", derive(serde::Serialize, databake::Bake))]
@@ -35,6 +37,10 @@ pub struct NumberSpecialSymbols<'data> {
     /// The localized representation of `NaN`.
     #[cfg_attr(feature = "serde", serde(borrow))]
     pub nan: Cow<'data, str>,
+
+    /// The localized separator between a significand and its exponent.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    pub exponential: Cow<'data, str>,
 
     /// The localized sign used to mark an approximate number.
     #[cfg_attr(feature = "serde", serde(borrow))]
@@ -138,6 +144,6 @@ icu_provider::data_struct!(
 
 /// All supplemental markers currently defined by this crate.
 pub const MARKERS: &[DataMarkerInfo] = &[
-    BoaNumberSpecialSymbolsV1::INFO,
+    BoaNumberSpecialSymbolsV2::INFO,
     BoaCurrencyAccountingPatternsV1::INFO,
 ];

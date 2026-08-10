@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use boa_gc::{Finalize, Trace, custom_trace};
 use boa_icu_data::{
-    BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV1, NumberSpecialSymbols,
+    BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV2, NumberSpecialSymbols,
 };
 use fixed_decimal::{Decimal, FloatPrecision, Sign, SignDisplay};
 use icu_decimal::{
@@ -252,6 +252,7 @@ impl Formatter {
                     significand.format(decimal),
                     exponent,
                     exponent_formatter,
+                    special_symbols.map_or("E", |symbols| &*symbols.exponential),
                 )),
                 Formatter::Compact { inner, .. } => {
                     FormattedNumeric::Compact(inner.format(decimal))
@@ -313,7 +314,7 @@ pub(crate) struct NumberFormat {
     locale: Locale,
     formatter: Formatter,
     style_data: StyleData,
-    special_symbols: Option<DataPayload<BoaNumberSpecialSymbolsV1>>,
+    special_symbols: Option<DataPayload<BoaNumberSpecialSymbolsV2>>,
     numbering_system: NumberingSystem,
     unit_options: UnitFormatOptions,
     digit_options: DigitFormatOptions,
@@ -846,8 +847,6 @@ impl NumberFormat {
             id: icu_provider::DataIdentifierBorrowed::for_locale(&data_locale),
             ..icu_provider::DataRequest::default()
         };
-        let special_symbols =
-            load_optional_payload::<BoaNumberSpecialSymbolsV1>(context.intl_provider(), request)?;
         let style_data = match unit_options.style() {
             Style::Percent => {
                 let response: icu_provider::DataResponse<PercentEssentialsV1> = context
@@ -1016,6 +1015,20 @@ impl NumberFormat {
 
             (formatter, nu)
         };
+
+        let numbering_system_attributes =
+            DataMarkerAttributes::try_from_str(numbering_system.as_str())
+                .expect("resolved numbering systems are valid ICU marker attributes");
+        let special_symbols = load_optional_payload::<BoaNumberSpecialSymbolsV2>(
+            context.intl_provider(),
+            icu_provider::DataRequest {
+                id: icu_provider::DataIdentifierBorrowed::for_marker_attributes_and_locale(
+                    numbering_system_attributes,
+                    &data_locale,
+                ),
+                ..icu_provider::DataRequest::default()
+            },
+        )?;
 
         Ok(NumberFormat {
             locale,

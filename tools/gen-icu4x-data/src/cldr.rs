@@ -13,7 +13,7 @@ use boa_icu_data::{
     CurrencyAccountingPattern, CurrencyAccountingPatterns, CurrencyAccountingPlaceholderOrder,
     NumberSpecialSymbols,
 };
-use icu_provider::DataLocale;
+use icu_provider::{DataIdentifierCow, DataLocale, DataMarkerAttributes};
 use icu_provider_source::SourceDataProvider;
 use serde::Deserialize;
 use zip::ZipArchive;
@@ -43,6 +43,7 @@ struct Numbers {
 struct Symbols {
     infinity: String,
     nan: String,
+    exponential: String,
     #[serde(rename = "approximatelySign")]
     approximately_sign: String,
     #[serde(rename = "minusSign")]
@@ -61,9 +62,9 @@ struct CurrencyFormats {
     accounting_alpha_next_to_number: Option<String>,
 }
 
-/// Supplemental number-format data indexed by its exact CLDR locale.
+/// Supplemental number-format data indexed by CLDR locale and numbering system.
 pub(crate) struct SupplementalNumberData {
-    special_symbols: HashMap<DataLocale, NumberSpecialSymbols<'static>>,
+    special_symbols: HashMap<DataIdentifierCow<'static>, NumberSpecialSymbols<'static>>,
     accounting_patterns: HashMap<DataLocale, CurrencyAccountingPatterns<'static>>,
 }
 
@@ -90,20 +91,14 @@ impl SupplementalNumberData {
                 );
             };
             let numbers = &locale_resource.numbers;
-            let key = format!("symbols-numberSystem-{}", numbers.default_numbering_system);
-            let Some(symbols) = numbers.sections.get(&key) else {
-                return Err(format!("CLDR locale {locale_name} is missing {key}").into());
+            let default_symbols_key =
+                format!("symbols-numberSystem-{}", numbers.default_numbering_system);
+            let Some(default_symbols) = numbers.sections.get(&default_symbols_key) else {
+                return Err(
+                    format!("CLDR locale {locale_name} is missing {default_symbols_key}").into(),
+                );
             };
-            let symbols: Symbols = serde_json::from_value(symbols.clone())?;
-            let misc_key = format!(
-                "miscPatterns-numberSystem-{}",
-                numbers.default_numbering_system
-            );
-            let Some(misc_patterns) = numbers.sections.get(&misc_key) else {
-                return Err(format!("CLDR locale {locale_name} is missing {misc_key}").into());
-            };
-            let misc_patterns: MiscPatterns = serde_json::from_value(misc_patterns.clone())?;
-            let range_separator = range_pattern_infix(&misc_patterns.range)?;
+            let default_symbols: Symbols = serde_json::from_value(default_symbols.clone())?;
             let currency_key = format!(
                 "currencyFormats-numberSystem-{}",
                 numbers.default_numbering_system
@@ -118,22 +113,38 @@ impl SupplementalNumberData {
             } else {
                 DataLocale::try_from_str(locale_name)?
             };
-            special_symbols.insert(
-                locale,
-                NumberSpecialSymbols {
-                    infinity: Cow::Owned(symbols.infinity),
-                    nan: Cow::Owned(symbols.nan),
-                    approximately_sign: Cow::Owned(symbols.approximately_sign),
-                    // ICU's Portuguese (Portugal) number-range convention is
-                    // intentionally more specific than CLDR's generic number
-                    // range pattern.
-                    range_separator: Cow::Owned(if locale_name == "pt-PT" {
-                        " - ".to_owned()
-                    } else {
-                        range_separator
-                    }),
-                },
-            );
+            for (section, value) in &numbers.sections {
+                let Some(numbering_system) = section.strip_prefix("symbols-numberSystem-") else {
+                    continue;
+                };
+                let symbols: Symbols = serde_json::from_value(value.clone())?;
+                let misc_key = format!("miscPatterns-numberSystem-{numbering_system}");
+                let Some(misc_patterns) = numbers.sections.get(&misc_key) else {
+                    return Err(format!("CLDR locale {locale_name} is missing {misc_key}").into());
+                };
+                let misc_patterns: MiscPatterns = serde_json::from_value(misc_patterns.clone())?;
+                let range_separator = range_pattern_infix(&misc_patterns.range)?;
+                let attributes = DataMarkerAttributes::try_from_str(numbering_system)
+                    .map_err(|_| format!("invalid numbering system {numbering_system:?}"))?
+                    .to_owned();
+                special_symbols.insert(
+                    DataIdentifierCow::from_owned(attributes, locale),
+                    NumberSpecialSymbols {
+                        infinity: Cow::Owned(symbols.infinity),
+                        nan: Cow::Owned(symbols.nan),
+                        exponential: Cow::Owned(symbols.exponential),
+                        approximately_sign: Cow::Owned(symbols.approximately_sign),
+                        // ICU's Portuguese (Portugal) number-range convention is
+                        // intentionally more specific than CLDR's generic number
+                        // range pattern.
+                        range_separator: Cow::Owned(if locale_name == "pt-PT" {
+                            " - ".to_owned()
+                        } else {
+                            range_separator
+                        }),
+                    },
+                );
+            }
             let alpha_pattern = currency_formats
                 .accounting_alpha_next_to_number
                 .as_deref()
@@ -143,7 +154,7 @@ impl SupplementalNumberData {
                 CurrencyAccountingPatterns {
                     standard: negative_accounting_pattern(&currency_formats.accounting)?,
                     alpha_next_to_number: negative_accounting_pattern(alpha_pattern)?,
-                    minus_sign: Cow::Owned(symbols.minus_sign),
+                    minus_sign: Cow::Owned(default_symbols.minus_sign),
                 },
             );
         }
@@ -156,7 +167,7 @@ impl SupplementalNumberData {
 
     pub(crate) const fn special_symbols(
         &self,
-    ) -> &HashMap<DataLocale, NumberSpecialSymbols<'static>> {
+    ) -> &HashMap<DataIdentifierCow<'static>, NumberSpecialSymbols<'static>> {
         &self.special_symbols
     }
 
@@ -399,19 +410,30 @@ fn cldr_archive_path() -> Result<PathBuf, Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    fn symbols<'a>(
+        data: &'a SupplementalNumberData,
+        locale: &str,
+        numbering_system: &str,
+    ) -> &'a NumberSpecialSymbols<'static> {
+        let locale = DataLocale::try_from_str(locale).unwrap();
+        let attributes = DataMarkerAttributes::try_from_str(numbering_system)
+            .unwrap()
+            .to_owned();
+        data.special_symbols()
+            .get(&DataIdentifierCow::from_owned(attributes, locale))
+            .unwrap()
+    }
+
     #[test]
     fn extracts_typed_accounting_patterns() {
         let data = SupplementalNumberData::load().unwrap();
-        let en_symbols = data
-            .special_symbols()
-            .get(&DataLocale::try_from_str("en").unwrap())
-            .unwrap();
+        let en_symbols = symbols(&data, "en", "latn");
         assert_eq!(&*en_symbols.approximately_sign, "~");
+        assert_eq!(&*en_symbols.exponential, "E");
         assert_eq!(&*en_symbols.range_separator, "–");
-        let pt_pt_symbols = data
-            .special_symbols()
-            .get(&DataLocale::try_from_str("pt-PT").unwrap())
-            .unwrap();
+        let ar_symbols = symbols(&data, "ar", "arab");
+        assert_eq!(&*ar_symbols.exponential, "أس");
+        let pt_pt_symbols = symbols(&data, "pt-PT", "latn");
         assert_eq!(&*pt_pt_symbols.range_separator, " - ");
 
         let en = data

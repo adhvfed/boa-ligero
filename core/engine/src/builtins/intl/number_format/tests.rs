@@ -75,6 +75,20 @@ fn scientific_notation_formats_values_and_parts() {
                 r#"[{"type":"integer","value":"3"},{"type":"decimal","value":"."},{"type":"fraction","value":"45"},{"type":"exponentSeparator","value":"E"},{"type":"exponentMinusSign","value":"-"},{"type":"exponentInteger","value":"2"}]"#
             ),
         ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ar-EG", { notation: "scientific", maximumFractionDigits: 3 }).format(12345)"#,
+            js_string!("١٫٢٣٥أس٤"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ar", { numberingSystem: "arab", notation: "scientific", maximumFractionDigits: 3 }).format(12345)"#,
+            js_string!("١٫٢٣٥أس٤"),
+        ),
+        TestAction::assert_eq(
+            r#"JSON.stringify(new Intl.NumberFormat("ar-EG", { notation: "scientific", maximumFractionDigits: 3 }).formatToParts(12345))"#,
+            js_string!(
+                r#"[{"type":"integer","value":"١"},{"type":"decimal","value":"٫"},{"type":"fraction","value":"٢٣٥"},{"type":"exponentSeparator","value":"أس"},{"type":"exponentInteger","value":"٤"}]"#
+            ),
+        ),
     ]);
 }
 

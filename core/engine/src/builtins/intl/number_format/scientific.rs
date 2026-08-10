@@ -15,6 +15,7 @@ pub(super) struct FormattedScientific<'a> {
     significand: FormattedDecimal<'a>,
     exponent: Decimal,
     exponent_formatter: &'a DecimalFormatter,
+    exponent_separator: &'a str,
 }
 
 impl<'a> FormattedScientific<'a> {
@@ -22,11 +23,13 @@ impl<'a> FormattedScientific<'a> {
         significand: FormattedDecimal<'a>,
         exponent: i16,
         exponent_formatter: &'a DecimalFormatter,
+        exponent_separator: &'a str,
     ) -> Self {
         Self {
             significand,
             exponent: Decimal::from(exponent),
             exponent_formatter,
+            exponent_separator,
         }
     }
 }
@@ -71,7 +74,7 @@ impl<S: PartsWrite + ?Sized> PartsWrite for ExponentParts<'_, S> {
 impl Writeable for FormattedScientific<'_> {
     fn write_to<W: core::fmt::Write + ?Sized>(&self, sink: &mut W) -> core::fmt::Result {
         self.significand.write_to(sink)?;
-        sink.write_char('E')?;
+        sink.write_str(self.exponent_separator)?;
         self.exponent_formatter
             .format(&self.exponent)
             .write_to(sink)
@@ -79,7 +82,9 @@ impl Writeable for FormattedScientific<'_> {
 
     fn write_to_parts<S: PartsWrite + ?Sized>(&self, sink: &mut S) -> core::fmt::Result {
         self.significand.write_to_parts(sink)?;
-        sink.with_part(EXPONENT_SEPARATOR, |sink| sink.write_str("E"))?;
+        sink.with_part(EXPONENT_SEPARATOR, |sink| {
+            sink.write_str(self.exponent_separator)
+        })?;
         self.exponent_formatter
             .format(&self.exponent)
             .write_to_parts(&mut ExponentParts { sink })
@@ -87,7 +92,7 @@ impl Writeable for FormattedScientific<'_> {
 
     fn writeable_length_hint(&self) -> LengthHint {
         self.significand.writeable_length_hint()
-            + LengthHint::exact(1)
+            + LengthHint::exact(self.exponent_separator.len())
             + self
                 .exponent_formatter
                 .format(&self.exponent)
