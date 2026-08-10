@@ -46,7 +46,19 @@ impl<'a> RangeFormatter<'a> {
         };
         let insertion_index = if self.style == Style::Currency {
             let leading = leading_affix_len(&parts);
-            if parts[..leading].iter().all(|part| part.kind == "literal") {
+            let trailing = trailing_affix_len(&parts);
+            let leading_wrapper = &parts[..leading];
+            let trailing_wrapper = &parts[parts.len() - trailing..];
+            if leading_wrapper.iter().all(|part| part.kind == "literal")
+                && leading_wrapper.iter().any(|leading_part| {
+                    leading_part.value.chars().any(|character| {
+                        is_bidi_control(character)
+                            && trailing_wrapper
+                                .iter()
+                                .any(|part| part.value.contains(character))
+                    })
+                })
+            {
                 leading
             } else {
                 0
@@ -198,6 +210,10 @@ fn is_percent_unit(part: &FormattedPart) -> bool {
             .value
             .chars()
             .any(|character| matches!(character, '%' | '٪'))
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}')
 }
 
 fn has_common_affix(start: &[FormattedPart], end: &[FormattedPart]) -> bool {
@@ -458,6 +474,47 @@ mod tests {
         assert_eq!(
             parts,
             [RangePart::new(part("unit", "meter"), RangeSource::Shared)]
+        );
+    }
+
+    #[test]
+    fn approximation_stays_inside_mirrored_bidi_wrappers_only() {
+        let hebrew = RangeFormatter::new("–", "~", Style::Currency).format(
+            vec![
+                part("literal", "\u{200f}"),
+                part("integer", "1"),
+                part("literal", "\u{a0}\u{200f}"),
+                part("currency", "$"),
+            ],
+            vec![
+                part("literal", "\u{200f}"),
+                part("integer", "1"),
+                part("literal", "\u{a0}\u{200f}"),
+                part("currency", "$"),
+            ],
+        );
+        assert_eq!(
+            hebrew.iter().map(|part| &*part.value).collect::<String>(),
+            "\u{200f}~1\u{a0}\u{200f}$"
+        );
+
+        let arabic = RangeFormatter::new("–", "~", Style::Currency).format(
+            vec![
+                part("literal", "\u{200f}"),
+                part("integer", "١"),
+                part("literal", "\u{a0}"),
+                part("currency", "US$"),
+            ],
+            vec![
+                part("literal", "\u{200f}"),
+                part("integer", "١"),
+                part("literal", "\u{a0}"),
+                part("currency", "US$"),
+            ],
+        );
+        assert_eq!(
+            arabic.iter().map(|part| &*part.value).collect::<String>(),
+            "~\u{200f}١\u{a0}US$"
         );
     }
 }

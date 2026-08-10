@@ -132,6 +132,10 @@ fn number_ranges_preserve_and_collapse_affixes_by_role() {
             r#"new Intl.NumberFormat("he-IL", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).formatRange(1, 1)"#,
             js_string!("\u{200f}~1\u{a0}\u{200f}$"),
         ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ar-EG", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).formatRange(1, 1)"#,
+            js_string!("~\u{200f}١\u{a0}US$"),
+        ),
     ]);
 }
 
