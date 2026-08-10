@@ -622,6 +622,8 @@ pub struct JitCompileRecord {
     pub entry_pc: u32,
     /// Whether the selected artifact charges a finite instruction budget.
     pub budgeted: bool,
+    /// Whether the selected artifact charges a finite loop-iteration limit.
+    pub loop_metered: bool,
     /// Artifact selected for the cache entry.
     pub outcome: JitCompileOutcome,
     /// First native-eligibility blocker, if the shim was selected.
@@ -1113,7 +1115,14 @@ impl JitDiagnosticState {
 
     fn snapshot(&self) -> JitDiagnosticSnapshot {
         let mut compile_records = self.compile_records.clone();
-        compile_records.sort_by_key(|record| (record.code_id, record.entry_pc, record.budgeted));
+        compile_records.sort_by_key(|record| {
+            (
+                record.code_id,
+                record.entry_pc,
+                record.budgeted,
+                record.loop_metered,
+            )
+        });
         let mut admission_records = self.admission_records.clone();
         admission_records.sort_by_key(|record| record.code_id);
         let mut exit_records = self.exit_records.clone();
@@ -1196,15 +1205,27 @@ struct JitCacheKey {
     code_id: u64,
     entry_point: JitEntryPoint,
     budgeted: bool,
+    loop_metered: bool,
     diagnostic: bool,
 }
 
 impl JitCacheKey {
+    #[cfg(test)]
     const fn function(code_id: u64, budgeted: bool, diagnostic: bool) -> Self {
+        Self::function_with_loop_mode(code_id, budgeted, false, diagnostic)
+    }
+
+    const fn function_with_loop_mode(
+        code_id: u64,
+        budgeted: bool,
+        loop_metered: bool,
+        diagnostic: bool,
+    ) -> Self {
         Self {
             code_id,
             entry_point: JitEntryPoint::Function,
             budgeted,
+            loop_metered,
             diagnostic,
         }
     }
@@ -1225,6 +1246,10 @@ impl JitCacheKey {
                 representation,
             },
             budgeted,
+            // OSR still charges exact iterations on every backedge. Its
+            // batching contract can become a separate optimization without
+            // weakening function-entry accounting in the meantime.
+            loop_metered: true,
             diagnostic,
         }
     }
@@ -1534,6 +1559,12 @@ impl JitBackend {
             .set("use_colocated_libcalls", "false")
             .expect("valid flag");
         flags.set("is_pic", "false").expect("valid flag");
+        // Cranelift defaults to `none`, which preserves deliberately simple
+        // lowering but also leaves loop phis, redundant coercions, and dead
+        // guards in generated code. This backend admits only hot functions and
+        // already accounts compilation time, so optimize retained artifacts
+        // for execution speed.
+        flags.set("opt_level", "speed").expect("valid flag");
         let isa = isa_builder.finish(settings::Flags::new(flags)).ok()?;
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         Some(Self {
@@ -2690,9 +2721,11 @@ impl JitBackend {
 
         let target = if let Some(target_code_id) = ordinary_target {
             let budgeted = context.instruction_budget_remaining().is_some();
-            let cached_native = match self.cache.get(&JitCacheKey::function(
+            let loop_metered = context.runtime_limits().loop_iteration_limit() != u64::MAX;
+            let cached_native = match self.cache.get(&JitCacheKey::function_with_loop_mode(
                 target_code_id,
                 budgeted,
+                loop_metered,
                 self.diagnostics.is_some(),
             )) {
                 Some(FunctionEntryState::Ready(entry)) => Some(entry.native),
@@ -2724,10 +2757,16 @@ impl JitBackend {
         &mut self,
         code: &CodeBlock,
         charge_instruction_budget: bool,
+        charge_loop_iterations: bool,
     ) -> Option<CachedEntry> {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
-        let cache_key = JitCacheKey::function(code.debug_id, charge_instruction_budget, diagnostic);
+        let cache_key = JitCacheKey::function_with_loop_mode(
+            code.debug_id,
+            charge_instruction_budget,
+            charge_loop_iterations,
+            diagnostic,
+        );
 
         if let Some(state) = self.cache.get(&cache_key).copied() {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
@@ -2767,7 +2806,12 @@ impl JitBackend {
         self.cache
             .insert(cache_key, FunctionEntryState::TerminalFailure);
         let started = Instant::now();
-        let result = self.compile_codeblock_with_kind(code, charge_instruction_budget, diagnostic);
+        let result = self.compile_codeblock_with_kind(
+            code,
+            charge_instruction_budget,
+            charge_loop_iterations,
+            diagnostic,
+        );
         let compile_ns = started.elapsed().as_nanos();
         self.stats.compile_time_ns = self.stats.compile_time_ns.saturating_add(compile_ns);
         let (entry, native, code_bytes, native_profile, rejection) = match result {
@@ -2823,6 +2867,7 @@ impl JitBackend {
                 code_id: code.debug_id,
                 entry_pc: 0,
                 budgeted: charge_instruction_budget,
+                loop_metered: charge_loop_iterations,
                 outcome: if native {
                     JitCompileOutcome::Native
                 } else {
@@ -2873,7 +2918,8 @@ impl JitBackend {
         context: &mut Context,
     ) -> Option<u64> {
         let charge_instruction_budget = context.instruction_budget_remaining().is_some();
-        let cached = self.cached_entry(code, charge_instruction_budget)?;
+        let charge_loop_iterations = context.runtime_limits().loop_iteration_limit() != u64::MAX;
+        let cached = self.cached_entry(code, charge_instruction_budget, charge_loop_iterations)?;
         if cached.native {
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         }
@@ -3034,7 +3080,7 @@ impl JitBackend {
     #[must_use]
     #[cfg(test)]
     fn compile_codeblock(&mut self, code: &CodeBlock) -> extern "C" fn(*mut Context) -> u64 {
-        match self.compile_codeblock_with_kind(code, false, false) {
+        match self.compile_codeblock_with_kind(code, false, false, false) {
             FunctionCompileResult::Compiled { entry, .. } => entry,
             FunctionCompileResult::ModuleFailure(stage) => {
                 panic!("test-only compilation failed at {stage:?}")
@@ -3046,15 +3092,23 @@ impl JitBackend {
         &mut self,
         code: &CodeBlock,
         charge_instruction_budget: bool,
+        charge_loop_iterations: bool,
         instrument_storage: bool,
     ) -> FunctionCompileResult {
         let collect_diagnostic_metadata = self.diagnostics.is_some();
         match native::compile(
             self,
             code,
-            charge_instruction_budget,
-            collect_diagnostic_metadata,
-            instrument_storage,
+            native::NativeCompileOptions {
+                accounting: native::NativeAccounting {
+                    instruction_budget: charge_instruction_budget,
+                    loop_iterations: charge_loop_iterations,
+                },
+                diagnostics: native::NativeDiagnostics {
+                    collect_metadata: collect_diagnostic_metadata,
+                    instrument_storage,
+                },
+            },
         ) {
             native::NativeCompileResult::Compiled {
                 entry,
@@ -3482,11 +3536,11 @@ mod tests {
         assert_eq!(backend.cache.len(), MAX_FUNCTION_ENTRY_STATES);
 
         let retained = backend
-            .cached_entry(&ready_code, false)
+            .cached_entry(&ready_code, false, false)
             .expect("ready entry remains reusable at capacity");
         assert_eq!(retained.entry as usize, ready.entry as usize);
-        assert!(backend.cached_entry(&failed_code, false).is_none());
-        assert!(backend.cached_entry(&unseen_code, false).is_none());
+        assert!(backend.cached_entry(&failed_code, false, false).is_none());
+        assert!(backend.cached_entry(&unseen_code, false, false).is_none());
         assert_eq!(backend.cache.len(), MAX_FUNCTION_ENTRY_STATES);
         assert_eq!(backend.stats().cache_hits, 2);
         assert_eq!(backend.stats().cache_misses, 1);
@@ -3589,7 +3643,14 @@ mod tests {
         let mut keys = std::collections::HashSet::new();
         for budgeted in [false, true] {
             for diagnostic in [false, true] {
-                assert!(keys.insert(JitCacheKey::function(7, budgeted, diagnostic)));
+                for loop_metered in [false, true] {
+                    assert!(keys.insert(JitCacheKey::function_with_loop_mode(
+                        7,
+                        budgeted,
+                        loop_metered,
+                        diagnostic,
+                    )));
+                }
                 for representation in [JitOsrRepresentation::I32, JitOsrRepresentation::F64] {
                     assert!(keys.insert(JitCacheKey::loop_region(
                         7,
@@ -3602,7 +3663,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(keys.len(), 12);
+        assert_eq!(keys.len(), 16);
     }
 
     #[test]
@@ -3622,6 +3683,7 @@ mod tests {
                 code_id,
                 entry_pc: 0,
                 budgeted: false,
+                loop_metered: false,
                 outcome: JitCompileOutcome::Native,
                 blocker: None,
                 first_blocking_opcode: None,
@@ -3763,8 +3825,8 @@ mod tests {
             .expect("diagnostics")
             .resources
             .retained_code_bytes = MAX_RETAINED_CODE_BYTES;
-        assert!(bytes.cached_entry(&ready_code, false).is_some());
-        assert!(bytes.cached_entry(&unseen_code, false).is_none());
+        assert!(bytes.cached_entry(&ready_code, false, false).is_some());
+        assert!(bytes.cached_entry(&unseen_code, false, false).is_none());
         assert_eq!(bytes.stats().resources.code_bytes, 1);
         assert_eq!(
             bytes.diagnostic_snapshot().expect("diagnostics").resources,
@@ -3773,12 +3835,16 @@ mod tests {
 
         let mut cumulative = JitBackend::new();
         cumulative.stats.resources.compile_time_ns = MAX_CUMULATIVE_COMPILE_NS;
-        assert!(cumulative.cached_entry(&unseen_code, false).is_none());
+        assert!(
+            cumulative
+                .cached_entry(&unseen_code, false, false)
+                .is_none()
+        );
         assert_eq!(cumulative.stats().resources.compile_time, 1);
 
         let mut slow = JitBackend::new();
         assert!(slow.record_compilation_result(1, MAX_COMPILE_ATTEMPT_NS + 1, false));
-        assert!(slow.cached_entry(&unseen_code, false).is_none());
+        assert!(slow.cached_entry(&unseen_code, false, false).is_none());
         assert_eq!(slow.stats().resources.slow_attempt, 1);
 
         let mut overrun = JitBackend::new();
@@ -3790,7 +3856,7 @@ mod tests {
             MAX_RETAINED_CODE_BYTES - 1
         );
         assert_eq!(overrun.stats().resources.payload_overrun_retirements, 1);
-        assert!(overrun.cached_entry(&ready_code, false).is_none());
+        assert!(overrun.cached_entry(&ready_code, false, false).is_none());
     }
 
     /// D1 acceptance item 10: dropping a backend releases the executable code
@@ -3807,7 +3873,7 @@ mod tests {
         let mut backend = JitBackend::new();
         backend.admission_min_straight_line_instructions = 0;
         assert!(
-            backend.cached_entry(&code, false).is_some(),
+            backend.cached_entry(&code, false, false).is_some(),
             "the witness is only meaningful for a backend that emitted code"
         );
         let accounted = backend.stats().resources.retained_code_bytes;
@@ -3934,7 +4000,7 @@ mod tests {
             let mut backend = JitBackend::new();
             backend.fail_next_module_stage_for_test(stage);
             assert!(
-                backend.cached_entry(&native_code, false).is_none(),
+                backend.cached_entry(&native_code, false, false).is_none(),
                 "{stage:?}"
             );
             assert!(matches!(
@@ -3952,7 +4018,7 @@ mod tests {
             );
             let attempts = backend.stats().compilation_failures;
             assert!(
-                backend.cached_entry(&native_code, false).is_none(),
+                backend.cached_entry(&native_code, false, false).is_none(),
                 "{stage:?}"
             );
             assert_eq!(backend.stats().compilation_failures, attempts, "{stage:?}");
@@ -3973,7 +4039,7 @@ mod tests {
             let mut backend = JitBackend::new();
             backend.fail_next_module_stage_for_test(stage);
             assert!(
-                backend.cached_entry(&shim_code, false).is_none(),
+                backend.cached_entry(&shim_code, false, false).is_none(),
                 "{stage:?}"
             );
             assert!(matches!(
@@ -4156,12 +4222,12 @@ mod tests {
         );
 
         let mut disabled = JitBackend::new();
-        let _ = disabled.cached_entry(&native_code, false);
+        let _ = disabled.cached_entry(&native_code, false, false);
         assert_eq!(disabled.diagnostic_snapshot(), None);
 
         let mut native_backend = JitBackend::new();
         native_backend.enable_diagnostics(JitDiagnosticLimits::default());
-        let _ = native_backend.cached_entry(&native_code, false);
+        let _ = native_backend.cached_entry(&native_code, false, false);
         let native_snapshot = native_backend
             .diagnostic_snapshot()
             .expect("diagnostics enabled");
@@ -4187,7 +4253,7 @@ mod tests {
 
         let mut shim_backend = JitBackend::new();
         shim_backend.enable_diagnostics(JitDiagnosticLimits::default());
-        let _ = shim_backend.cached_entry(&unsupported_code, false);
+        let _ = shim_backend.cached_entry(&unsupported_code, false, false);
         let shim_snapshot = shim_backend
             .diagnostic_snapshot()
             .expect("diagnostics enabled");
@@ -4219,8 +4285,8 @@ mod tests {
             loop_records: 0,
             storage_records: 0,
         });
-        let _ = bounded.cached_entry(&native_code, false);
-        let _ = bounded.cached_entry(&unsupported_code, false);
+        let _ = bounded.cached_entry(&native_code, false, false);
+        let _ = bounded.cached_entry(&unsupported_code, false, false);
         let bounded = bounded.diagnostic_snapshot().expect("diagnostics enabled");
         assert_eq!(bounded.compile_records.len(), 1);
         assert_eq!(bounded.dropped_compile_records, 1);
@@ -7447,6 +7513,7 @@ mod tests {
         )
         .expect("parse warmup");
         warmup.evaluate(&mut context).expect("warm up");
+        let unmetered_compilations = context.jit_stats().expect("JIT was enabled").compilations;
 
         context.runtime_limits_mut().set_loop_iteration_limit(3);
         let limited =
@@ -7462,6 +7529,11 @@ mod tests {
         );
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(
+            stats.compilations,
+            unmetered_compilations + 1,
+            "changing loop-accounting mode must compile a distinct guarded artifact: {stats:?}"
+        );
     }
 
     fn warmed_sum_context(jit: bool) -> Context {

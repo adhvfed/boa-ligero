@@ -745,16 +745,32 @@ impl NativeRejection {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct NativeCompileOptions {
+    pub(super) accounting: NativeAccounting,
+    pub(super) diagnostics: NativeDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeAccounting {
+    pub(super) instruction_budget: bool,
+    pub(super) loop_iterations: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeDiagnostics {
+    pub(super) collect_metadata: bool,
+    pub(super) instrument_storage: bool,
+}
+
 pub(super) fn compile(
     backend: &mut JitBackend,
     code: &CodeBlock,
-    charge_instruction_budget: bool,
-    collect_diagnostic_metadata: bool,
-    instrument_storage: bool,
+    options: NativeCompileOptions,
 ) -> NativeCompileResult {
     let eligibility_blocker = eligibility_blocker(code);
     if let Some(kind) = eligibility_blocker {
-        let bytecode_instructions = if collect_diagnostic_metadata {
+        let bytecode_instructions = if options.diagnostics.collect_metadata {
             match decode(code, true, MAX_FUNCTION_BYTECODE_INSTRUCTIONS) {
                 Ok(instructions) => instructions.instructions.len(),
                 Err(rejection) => rejection.bytecode_instructions as usize,
@@ -773,7 +789,7 @@ pub(super) fn compile(
 
     let instructions = match decode(
         code,
-        collect_diagnostic_metadata,
+        options.diagnostics.collect_metadata,
         MAX_FUNCTION_BYTECODE_INSTRUCTIONS,
     ) {
         Ok(instructions) => instructions,
@@ -782,14 +798,7 @@ pub(super) fn compile(
     let bytecode_instructions = instructions.instructions.len();
     let profile = instructions.static_profile();
     let mode = select_mode(&instructions);
-    let Some(mut compiler) = NativeCompiler::new(
-        backend,
-        code,
-        instructions,
-        mode,
-        charge_instruction_budget,
-        instrument_storage,
-    ) else {
+    let Some(mut compiler) = NativeCompiler::new(backend, code, instructions, mode, options) else {
         return NativeCompileResult::Rejected(NativeRejection::new(
             JitCompileBlockerKind::RegisterAnalysis,
             None,
@@ -962,19 +971,104 @@ impl NativeMode {
 }
 
 fn select_mode(instructions: &DecodedInstructions) -> NativeMode {
-    if instructions.instructions.iter().any(|(_, _, instruction)| {
+    let contains_float_literal = instructions.instructions.iter().any(|(_, _, instruction)| {
         matches!(
             instruction,
-            Instruction::StoreFloat { .. }
-                | Instruction::StoreDouble { .. }
-                | Instruction::BitOr { .. }
-                | Instruction::BitXor { .. }
+            Instruction::StoreFloat { .. } | Instruction::StoreDouble { .. }
         )
-    }) {
+    });
+    let contains_argument = instructions
+        .instructions
+        .iter()
+        .any(|(_, _, instruction)| matches!(instruction, Instruction::GetArgument { .. }));
+    let contains_bitwise = instructions.instructions.iter().any(|(_, _, instruction)| {
+        matches!(
+            instruction,
+            Instruction::BitOr { .. } | Instruction::BitXor { .. }
+        )
+    });
+    let bitwise_coercions_are_proven_i32 =
+        !contains_bitwise
+            || (!contains_argument
+                && instructions.instructions.iter().enumerate().all(
+                    |(index, (_, _, instruction))| match instruction {
+                        Instruction::BitOr { .. } => {
+                            index.checked_sub(2).is_some_and(|arithmetic_index| {
+                                i32_arithmetic_coercion(
+                                    instructions,
+                                    arithmetic_index,
+                                    &instructions.instructions[arithmetic_index].2,
+                                )
+                            })
+                        }
+                        Instruction::BitXor { .. } => false,
+                        _ => true,
+                    },
+                ));
+
+    if contains_float_literal || !bitwise_coercions_are_proven_i32 {
         NativeMode::F64
     } else {
         NativeMode::I32
     }
+}
+
+fn small_exact_integer_definition(instruction: &Instruction, register: usize) -> bool {
+    let destination = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
+    match instruction {
+        Instruction::StoreZero { dst }
+        | Instruction::StoreOne { dst }
+        | Instruction::StoreInt8 { dst, .. }
+        | Instruction::StoreInt16 { dst, .. } => destination(*dst) == register,
+        Instruction::StoreInt32 { dst, value } => {
+            destination(*dst) == register && value.unsigned_abs() <= 1 << 21
+        }
+        _ => false,
+    }
+}
+
+fn i32_arithmetic_coercion(
+    instructions: &DecodedInstructions,
+    arithmetic_index: usize,
+    instruction: &Instruction,
+) -> bool {
+    let register = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
+    let (dst, multiplication_operands) = match instruction {
+        Instruction::Add { dst, .. } | Instruction::Sub { dst, .. } => (register(*dst), None),
+        Instruction::Mul { dst, lhs, rhs } => {
+            (register(*dst), Some((register(*lhs), register(*rhs))))
+        }
+        _ => return false,
+    };
+
+    let Some((_, _, Instruction::StoreZero { dst: zero })) =
+        instructions.instructions.get(arithmetic_index + 1)
+    else {
+        return false;
+    };
+    let zero = register(*zero);
+    let Some((_, _, Instruction::BitOr { lhs, rhs, .. })) =
+        instructions.instructions.get(arithmetic_index + 2)
+    else {
+        return false;
+    };
+    let lhs = register(*lhs);
+    let rhs = register(*rhs);
+    if !((lhs == dst && rhs == zero) || (rhs == dst && lhs == zero)) {
+        return false;
+    }
+
+    let Some((mul_lhs, mul_rhs)) = multiplication_operands else {
+        return true;
+    };
+    let Some((_, _, previous)) = arithmetic_index
+        .checked_sub(1)
+        .and_then(|index| instructions.instructions.get(index))
+    else {
+        return false;
+    };
+    small_exact_integer_definition(previous, mul_lhs)
+        || small_exact_integer_definition(previous, mul_rhs)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1444,8 +1538,7 @@ struct NativeCompiler<'a> {
     flag_defined: Option<cranelift_codegen::ir::Value>,
     flag_undefined: Option<cranelift_codegen::ir::Value>,
     dirty: BTreeSet<usize>,
-    charge_instruction_budget: bool,
-    instrument_storage: bool,
+    options: NativeCompileOptions,
 }
 
 impl<'a> NativeCompiler<'a> {
@@ -1454,8 +1547,7 @@ impl<'a> NativeCompiler<'a> {
         code: &'a CodeBlock,
         instructions: DecodedInstructions,
         mode: NativeMode,
-        charge_instruction_budget: bool,
-        instrument_storage: bool,
+        options: NativeCompileOptions,
     ) -> Option<Self> {
         let analysis = analyze_registers(&instructions, code.register_count as usize)?;
         Some(Self {
@@ -1470,8 +1562,7 @@ impl<'a> NativeCompiler<'a> {
             flag_defined: None,
             flag_undefined: None,
             dirty: BTreeSet::new(),
-            charge_instruction_budget,
-            instrument_storage,
+            options,
         })
     }
 
@@ -1553,7 +1644,7 @@ impl<'a> NativeCompiler<'a> {
             bcx.switch_to_block(block);
             self.current_instruction = index;
 
-            if self.charge_instruction_budget {
+            if self.options.accounting.instruction_budget {
                 self.emit_consume_instruction_budget(&mut bcx, ctx_val, &helpers, pc, break_block);
             }
 
@@ -1665,7 +1756,7 @@ impl<'a> NativeCompiler<'a> {
             ptr,
             guard: make(
                 jit_guard as *const () as usize,
-                &[ptr, types::I32],
+                &[ptr, types::I32, types::I32],
                 types::I64,
             ),
             copy_global_declarative_binding_register: make(
@@ -1729,7 +1820,7 @@ impl<'a> NativeCompiler<'a> {
                 types::F64,
             ),
             dense_i32_guarded: make(
-                if self.instrument_storage {
+                if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_dense_array_i32_guarded as *const () as usize
                 } else {
                     jit_dense_array_i32_guarded as *const () as usize
@@ -1738,7 +1829,7 @@ impl<'a> NativeCompiler<'a> {
                 types::I64,
             ),
             dense_f64_guarded: make(
-                if self.instrument_storage {
+                if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_dense_array_f64_guarded as *const () as usize
                 } else {
                     jit_dense_array_f64_guarded as *const () as usize
@@ -1747,7 +1838,7 @@ impl<'a> NativeCompiler<'a> {
                 types::I64,
             ),
             named_boxed_guarded: make(
-                if self.instrument_storage {
+                if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_boxed_guarded as *const () as usize
                 } else {
                     jit_named_property_boxed_guarded as *const () as usize
@@ -1756,7 +1847,7 @@ impl<'a> NativeCompiler<'a> {
                 types::I64,
             ),
             named_i32_guarded: make(
-                if self.instrument_storage {
+                if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_i32_guarded as *const () as usize
                 } else {
                     jit_named_property_i32_guarded as *const () as usize
@@ -1765,7 +1856,7 @@ impl<'a> NativeCompiler<'a> {
                 types::I64,
             ),
             named_f64_guarded: make(
-                if self.instrument_storage {
+                if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_f64_guarded as *const () as usize
                 } else {
                     jit_named_property_f64_guarded as *const () as usize
@@ -1882,13 +1973,18 @@ impl<'a> NativeCompiler<'a> {
         helpers: &Helpers,
     ) -> bool {
         let guard = bcx.ins().iconst(helpers.ptr, helpers.guard.address as i64);
-        let charge_instruction_budget = bcx
-            .ins()
-            .iconst(types::I32, i64::from(self.charge_instruction_budget));
+        let charge_instruction_budget = bcx.ins().iconst(
+            types::I32,
+            i64::from(self.options.accounting.instruction_budget),
+        );
+        let charge_loop_iterations = bcx.ins().iconst(
+            types::I32,
+            i64::from(self.options.accounting.loop_iterations),
+        );
         let result = bcx.ins().call_indirect(
             helpers.guard.signature,
             guard,
-            &[ctx, charge_instruction_budget],
+            &[ctx, charge_instruction_budget, charge_loop_iterations],
         );
         let result = bcx.inst_results(result)[0];
         let native_entry = bcx.create_block();
@@ -2410,6 +2506,8 @@ impl<'a> NativeCompiler<'a> {
                 };
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fadd(lhs, rhs)
+                } else if self.i32_arithmetic_wraps(instruction) {
+                    bcx.ins().iadd(lhs, rhs)
                 } else {
                     let (result, overflow) = bcx.ins().sadd_overflow(lhs, rhs);
                     let deopt = bcx.create_block();
@@ -2436,6 +2534,8 @@ impl<'a> NativeCompiler<'a> {
                 };
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fsub(lhs, rhs)
+                } else if self.i32_arithmetic_wraps(instruction) {
+                    bcx.ins().isub(lhs, rhs)
                 } else {
                     let (result, overflow) = bcx.ins().ssub_overflow(lhs, rhs);
                     let deopt = bcx.create_block();
@@ -2462,6 +2562,8 @@ impl<'a> NativeCompiler<'a> {
                 };
                 let result = if self.mode == NativeMode::F64 {
                     bcx.ins().fmul(lhs, rhs)
+                } else if self.i32_arithmetic_wraps(instruction) {
+                    bcx.ins().imul(lhs, rhs)
                 } else {
                     let (result, overflow) = bcx.ins().smul_overflow(lhs, rhs);
                     let zero = bcx.ins().iconst(types::I32, 0);
@@ -2605,6 +2707,9 @@ impl<'a> NativeCompiler<'a> {
                 }
             }
             Instruction::IncrementLoopIteration => {
+                if !self.options.accounting.loop_iterations {
+                    return true;
+                }
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);
@@ -2763,6 +2868,19 @@ impl<'a> NativeCompiler<'a> {
         self.variables
             .get(register)
             .and_then(|variable| bcx.try_use_var(*variable).ok())
+    }
+
+    /// Whether this arithmetic result is consumed immediately by an exact
+    /// `| 0` coercion. In the i32 specialization, wrapping add/sub already
+    /// produce the ECMAScript `ToInt32` result because two i32 inputs have an
+    /// exactly representable Number sum. Multiplication is equivalent only
+    /// when a nearby integer constant keeps the Number product below 2^53.
+    ///
+    /// Keep the proof deliberately local: the bytecompiler emits the coercion
+    /// as arithmetic, `StoreZero`, `BitOr`. Anything else retains the ordinary
+    /// overflow deopt instead of relying on wider data-flow assumptions.
+    fn i32_arithmetic_wraps(&self, instruction: &Instruction) -> bool {
+        i32_arithmetic_coercion(&self.instructions, self.current_instruction, instruction)
     }
 
     fn register_kind(&self, register: usize) -> RegisterKind {
@@ -2957,7 +3075,7 @@ impl<'a> NativeCompiler<'a> {
         // Budgeted native entries have charged this bytecode already, but a
         // guard exit asks the interpreter to execute the same bytecode. Refund
         // that charge so the interpreter remains the single owner of it.
-        if self.charge_instruction_budget {
+        if self.options.accounting.instruction_budget {
             let helper = bcx.ins().iconst(
                 helpers.ptr,
                 helpers.refund_instruction_budget.address as i64,
@@ -3835,12 +3953,18 @@ fn jit_break(
     JIT_BREAK_BIT
 }
 
-extern "C" fn jit_guard(context: *mut Context, charge_instruction_budget: u32) -> u64 {
+extern "C" fn jit_guard(
+    context: *mut Context,
+    charge_instruction_budget: u32,
+    charge_loop_iterations: u32,
+) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let budget_mode_matches =
         context.instruction_budget_remaining.is_some() == (charge_instruction_budget != 0);
-    if context.vm.frame().construct() || !budget_mode_matches {
+    let loop_mode_matches = (context.vm.runtime_limits.loop_iteration_limit() != u64::MAX)
+        == (charge_loop_iterations != 0);
+    if context.vm.frame().construct() || !budget_mode_matches || !loop_mode_matches {
         return 0;
     }
     1
