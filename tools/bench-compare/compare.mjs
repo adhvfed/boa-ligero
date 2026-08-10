@@ -6,7 +6,12 @@ import os from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { distribution, geometricMean, parseResultLine } from "./stats.mjs";
+import {
+  distribution,
+  geometricMean,
+  parseResultLine,
+  performanceTargetFailures,
+} from "./stats.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
@@ -43,6 +48,7 @@ function parseArgs(argv) {
     maxCvPct: 5,
     boaJit: process.env.BOA_JIT === "1",
     failNoisy: false,
+    enforceTargets: false,
     binding: false,
     filters: [],
     json: null,
@@ -57,6 +63,7 @@ function parseArgs(argv) {
     else if (argument === "--json") options.json = argv[++index];
     else if (argument === "--boa-jit") options.boaJit = true;
     else if (argument === "--fail-noisy") options.failNoisy = true;
+    else if (argument === "--enforce-targets") options.enforceTargets = true;
     else if (argument === "--binding") options.binding = true;
     else if (argument === "--help" || argument === "-h") {
       console.log(`usage: node tools/bench-compare/compare.mjs [filters...] [options]
@@ -68,7 +75,8 @@ function parseArgs(argv) {
   --json PATH      write the complete machine-readable report
   --max-cv-pct N   noisy-sample threshold (default 5)
   --fail-noisy     fail when any engine/workload exceeds the CV threshold
-  --binding        9 samples, 200 runs, 80 warmups, Boa JIT, fail noisy
+  --enforce-targets fail when a selected workload or the complete suite misses its parity target
+  --binding        9 samples, 200 runs, 80 warmups, Boa JIT, fail noisy, enforce targets
 
 RUNS, WARMUP, SAMPLES, and BOA_JIT remain supported for the old shell workflow.`);
       process.exit(0);
@@ -82,6 +90,7 @@ RUNS, WARMUP, SAMPLES, and BOA_JIT remain supported for the old shell workflow.`
     options.samples = 9;
     options.boaJit = true;
     options.failNoisy = true;
+    options.enforceTargets = true;
   }
   options.runs ??= 50;
   options.warmup ??= 20;
@@ -115,8 +124,22 @@ function engines(options) {
 
 function loadSuite(filters) {
   const suite = JSON.parse(readFileSync(SUITE_PATH, "utf8"));
-  if (suite.schema_version !== 1 || typeof suite.benchmarks !== "object") {
+  if (
+    suite.schema_version !== 1 ||
+    typeof suite.benchmarks !== "object" ||
+    typeof suite.targets !== "object"
+  ) {
     throw new Error("unsupported or malformed benchmark suite manifest");
+  }
+  for (const [name, target] of Object.entries(suite.targets)) {
+    if (
+      !Number.isFinite(target.geomean_max) ||
+      target.geomean_max <= 0 ||
+      !Number.isFinite(target.workload_max) ||
+      target.workload_max <= 0
+    ) {
+      throw new Error(`malformed performance target: ${name}`);
+    }
   }
 
   const discovered = readdirSync(SCRIPT_DIR)
@@ -131,10 +154,18 @@ function loadSuite(filters) {
     );
   }
 
-  return discovered
+  const enabled = discovered
     .filter((name) => suite.benchmarks[name].enabled !== false)
-    .filter((name) => filters.length === 0 || filters.some((filter) => name.includes(filter)))
     .map((name) => ({ name, path: join(SCRIPT_DIR, `${name}.js`), ...suite.benchmarks[name] }));
+  return {
+    targets: suite.targets,
+    headlineWorkloadCount: enabled.filter((benchmark) => benchmark.headline).length,
+    benchmarks: enabled
+      .filter(
+        (benchmark) =>
+          filters.length === 0 || filters.some((filter) => benchmark.name.includes(filter)),
+      ),
+  };
 }
 
 function rotate(values, count) {
@@ -205,7 +236,8 @@ function printBenchmark(result, includeJit) {
 function main() {
   const options = parseArgs(process.argv);
   const definitions = engines(options);
-  const benchmarks = loadSuite(options.filters);
+  const suite = loadSuite(options.filters);
+  const benchmarks = suite.benchmarks;
   if (benchmarks.length === 0) throw new Error("no benchmarks matched the requested filters");
 
   const report = {
@@ -224,10 +256,12 @@ function main() {
       process_samples: options.samples,
       paired_and_order_alternated: true,
       max_cv_pct: options.maxCvPct,
+      targets_enforced: options.enforceTargets,
     },
     engines: definitions.map(({ name, command, prefix, mode }) => ({ name, command, prefix, mode })),
     benchmarks: [],
     headline: {},
+    performance_targets: {},
     valid: true,
     failures: [],
   };
@@ -293,9 +327,24 @@ function main() {
       ? maxOrNull(headline.map((benchmark) => benchmark.ratios.boa_jit_to_v8))
       : null,
   };
+  const completeHeadlineSuite = headline.length === suite.headlineWorkloadCount;
+  const targetFailures = performanceTargetFailures(
+    report.benchmarks,
+    suite.targets,
+    completeHeadlineSuite,
+  );
+  report.performance_targets = {
+    definitions: suite.targets,
+    enforced: options.enforceTargets,
+    complete_headline_suite: completeHeadlineSuite,
+    failures: targetFailures,
+  };
   const sinkFailures = report.failures.filter((failure) => failure.includes("sink mismatch"));
   const noiseFailures = report.failures.filter((failure) => failure.includes("CV "));
-  report.valid = sinkFailures.length === 0 && (!options.failNoisy || noiseFailures.length === 0);
+  report.valid =
+    sinkFailures.length === 0 &&
+    (!options.failNoisy || noiseFailures.length === 0) &&
+    (!options.enforceTargets || targetFailures.length === 0);
 
   console.log("\n* headline workload; times are p50 ns/main() from independent processes");
   const header = ["workload".padEnd(31), "boa".padStart(12), "v8-jitless".padStart(12), "boa/jitless".padStart(12)];
@@ -308,6 +357,10 @@ function main() {
   if (report.failures.length) {
     console.error("\nmeasurement warnings/failures:");
     for (const failure of report.failures) console.error(`  - ${failure}`);
+  }
+  if (targetFailures.length) {
+    console.error("\nperformance target misses:");
+    for (const failure of targetFailures) console.error(`  - ${failure}`);
   }
   if (options.json) {
     mkdirSync(dirname(resolve(options.json)), { recursive: true });

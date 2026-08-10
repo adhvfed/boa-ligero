@@ -47,6 +47,34 @@ export function geometricMean(values) {
   return Math.exp(values.reduce((total, value) => total + Math.log(value), 0) / values.length);
 }
 
+export function performanceTargetFailures(benchmarks, targets, completeHeadlineSuite) {
+  const failures = [];
+  for (const [ratioName, target] of Object.entries(targets)) {
+    const measured = benchmarks
+      .filter((benchmark) => benchmark.headline)
+      .map((benchmark) => ({ name: benchmark.name, ratio: benchmark.ratios[ratioName] }))
+      .filter(({ ratio }) => ratio != null);
+
+    for (const { name, ratio } of measured) {
+      if (ratio > target.workload_max) {
+        failures.push(
+          `${ratioName}/${name}: ${ratio.toFixed(3)}x > ${target.workload_max.toFixed(3)}x workload target`,
+        );
+      }
+    }
+
+    if (completeHeadlineSuite && measured.length > 0) {
+      const geomean = geometricMean(measured.map(({ ratio }) => ratio));
+      if (geomean > target.geomean_max) {
+        failures.push(
+          `${ratioName}/headline-geomean: ${geomean.toFixed(3)}x > ${target.geomean_max.toFixed(3)}x suite target`,
+        );
+      }
+    }
+  }
+  return failures;
+}
+
 export function parseResultLine(output) {
   const line = output
     .trim()

@@ -1,5 +1,15 @@
 {
   "schema_version": 1,
+  "targets": {
+    "boa_to_v8_jitless": {
+      "geomean_max": 1.0,
+      "workload_max": 1.25
+    },
+    "boa_jit_to_v8": {
+      "geomean_max": 1.0,
+      "workload_max": 1.25
+    }
+  },
   "benchmarks": {
     "array-numeric-sum": { "category": "arrays", "headline": true },
     "closure-capture": { "category": "calls", "headline": true },

@@ -24,9 +24,16 @@ fresh, order-alternated process pairs. It validates the observable result sink
 and reports p50/p95/p99/max, median absolute deviation, and coefficient of
 variation. `--binding` uses nine processes per engine, 200 measured calls, 80
 warmups, includes Boa's tiered/JIT mode, and fails noisy measurements.
+It also enforces the suite's parity targets: headline geomean no slower than
+1.00x and every selected headline workload no slower than 1.25x for both
+Boa/V8-jitless and Boa-JIT/V8. A filtered run enforces the per-workload target;
+only a complete headline run can assert the suite geomean. Use
+`--enforce-targets` with a shorter exploratory protocol when an early failing
+gate is useful.
 
-`tools/bench-compare/suite.json` names the headline set. New scripts must be
-classified explicitly, so benchmark coverage cannot change silently.
+`tools/bench-compare/suite.json` owns the targets and names the headline set.
+New scripts must be classified explicitly, so benchmark coverage cannot change
+silently.
 
 ## Design rules
 
