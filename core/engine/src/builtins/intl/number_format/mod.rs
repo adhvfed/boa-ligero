@@ -1368,8 +1368,11 @@ impl NumberFormat {
 
 fn load_optional_payload<M: DataMarker>(
     provider: &impl DataProvider<M>,
-    request: icu_provider::DataRequest<'_>,
+    mut request: icu_provider::DataRequest<'_>,
 ) -> JsResult<Option<DataPayload<M>>> {
+    // Identifier misses are the expected fallback path for supplemental data,
+    // so they must not produce provider warnings.
+    request.metadata.silent = true;
     match provider.load(request) {
         Ok(response) => Ok(Some(response.payload)),
         Err(error)
