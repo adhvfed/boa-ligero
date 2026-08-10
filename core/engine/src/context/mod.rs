@@ -200,11 +200,12 @@ impl Context {
     ///
     /// The tier is enabled when a context is created unless the embedder uses
     /// [`ContextBuilder::jit`] to opt out. Calling this after
-    /// [`Self::disable_jit`] creates a fresh backend.
+    /// [`Self::disable_jit`] attempts to create a fresh backend. The context
+    /// remains in interpreter mode when Cranelift does not support the host.
     #[cfg(feature = "jit")]
     pub fn enable_jit(&mut self) {
         if self.jit_backend.is_none() {
-            self.jit_backend = Some(crate::jit::JitBackend::new());
+            self.jit_backend = crate::jit::JitBackend::try_new();
         }
     }
 
@@ -1321,7 +1322,8 @@ impl ContextBuilder {
     ///
     /// JIT is enabled by default when Boa is built with the `jit` feature.
     /// Passing `false` constructs an interpreter-only context without
-    /// allocating a backend.
+    /// allocating a backend. On unsupported hosts, requesting JIT gracefully
+    /// falls back to an interpreter-only context.
     #[cfg(feature = "jit")]
     #[must_use]
     pub const fn jit(mut self, enabled: bool) -> Self {
@@ -1393,7 +1395,7 @@ impl ContextBuilder {
             interner: self.interner.unwrap_or_default(),
             vm,
             #[cfg(feature = "jit")]
-            jit_backend: jit_enabled.then(crate::jit::JitBackend::new),
+            jit_backend: jit_enabled.then(crate::jit::JitBackend::try_new).flatten(),
             #[cfg(feature = "jit")]
             active_jit_backend_id: 0,
             #[cfg(feature = "jit")]
@@ -1496,24 +1498,32 @@ where
 #[cfg(all(test, feature = "jit"))]
 mod jit_defaults_tests {
     use super::{Context, ContextBuilder};
+    use crate::jit::JitBackend;
 
     #[test]
     fn contexts_enable_jit_by_default_and_allow_explicit_opt_out() {
-        assert!(Context::default().jit_enabled());
-        assert!(
+        let jit_available = JitBackend::try_new().is_some();
+        assert_eq!(Context::default().jit_enabled(), jit_available);
+        assert_eq!(
             ContextBuilder::new()
                 .jit(true)
                 .build()
                 .unwrap()
-                .jit_enabled()
+                .jit_enabled(),
+            jit_available
         );
 
         let mut interpreter = ContextBuilder::new().jit(false).build().unwrap();
         assert!(!interpreter.jit_enabled());
 
         interpreter.enable_jit();
-        assert!(interpreter.jit_enabled());
+        assert_eq!(interpreter.jit_enabled(), jit_available);
         interpreter.disable_jit();
         assert!(!interpreter.jit_enabled());
+    }
+
+    #[test]
+    fn unsupported_hosts_remain_in_interpreter_mode() {
+        assert!(JitBackend::try_new_with_isa_builder(Err("unsupported architecture")).is_none());
     }
 }

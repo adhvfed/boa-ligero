@@ -1515,23 +1515,28 @@ impl JitBackend {
     /// iterations.
     const MIN_STRAIGHT_LINE_INSTRUCTIONS: u32 = 45;
 
-    /// Build a JIT backend configured for the host ISA.
+    /// Try to build a JIT backend configured for the host ISA.
     ///
-    /// # Panics
-    /// Panics if the host platform is not supported by Cranelift.
+    /// Returns [`None`] when Cranelift cannot target the current host. This is
+    /// the constructor used by [`Context`], which can continue executing with
+    /// the interpreter when native code generation is unavailable.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn try_new() -> Option<Self> {
+        Self::try_new_with_isa_builder(cranelift_native::builder())
+    }
+
+    pub(crate) fn try_new_with_isa_builder(
+        isa_builder: Result<cranelift_codegen::isa::Builder, &'static str>,
+    ) -> Option<Self> {
+        let isa_builder = isa_builder.ok()?;
         let mut flags = settings::builder();
         flags
             .set("use_colocated_libcalls", "false")
             .expect("valid flag");
         flags.set("is_pic", "false").expect("valid flag");
-        let isa_builder = cranelift_native::builder().expect("host ISA must be supported");
-        let isa = isa_builder
-            .finish(settings::Flags::new(flags))
-            .expect("valid ISA flags");
+        let isa = isa_builder.finish(settings::Flags::new(flags)).ok()?;
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        Self {
+        Some(Self {
             id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
             health: JitBackendHealth::Active,
             module: ManuallyDrop::new(JITModule::new(builder)),
@@ -1548,7 +1553,16 @@ impl JitBackend {
             diagnostics: None,
             #[cfg(test)]
             compile_fault: None,
-        }
+        })
+    }
+
+    /// Build a JIT backend configured for the host ISA.
+    ///
+    /// # Panics
+    /// Panics if the host platform is not supported by Cranelift.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::try_new().expect("host ISA must be supported")
     }
 
     /// Return a snapshot of the counters collected by this backend.
