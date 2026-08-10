@@ -134,14 +134,7 @@ impl SupplementalNumberData {
                         nan: Cow::Owned(symbols.nan),
                         exponential: Cow::Owned(symbols.exponential),
                         approximately_sign: Cow::Owned(symbols.approximately_sign),
-                        // ICU's Portuguese (Portugal) number-range convention is
-                        // intentionally more specific than CLDR's generic number
-                        // range pattern.
-                        range_separator: Cow::Owned(if locale_name == "pt-PT" {
-                            " - ".to_owned()
-                        } else {
-                            range_separator
-                        }),
+                        range_separator: Cow::Owned(range_separator),
                     },
                 );
             }

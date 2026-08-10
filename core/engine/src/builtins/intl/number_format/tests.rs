@@ -94,6 +94,49 @@ fn scientific_notation_formats_values_and_parts() {
 
 #[cfg(feature = "intl_bundled")]
 #[test]
+fn number_ranges_preserve_and_collapse_affixes_by_role() {
+    run_test_actions([
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("-3 – -5"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "meter", unitDisplay: "long", maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("-3 – -5 meters"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("-300–500%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 0 }).formatRange(3, 5)"#,
+            js_string!("300% – 500%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "unit", unit: "percent", unitDisplay: "short", maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("-3–5%"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", currencySign: "accounting", maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("($3–5)"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ar-EG", { maximumFractionDigits: 0 }).formatRange(-3, -5)"#,
+            js_string!("\u{61c}-٣–٥"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("ar-EG", { style: "unit", unit: "meter", unitDisplay: "long" }).formatRange(1, 1)"#,
+            js_string!("متر"),
+        ),
+        TestAction::assert_eq(
+            r#"new Intl.NumberFormat("he-IL", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).formatRange(1, 1)"#,
+            js_string!("\u{200f}~1\u{a0}\u{200f}$"),
+        ),
+    ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
 fn significant_digit_padding_uses_rounded_magnitude() {
     run_test_actions([
         TestAction::assert_eq(
