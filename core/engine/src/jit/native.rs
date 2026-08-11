@@ -1247,7 +1247,9 @@ fn register_uses(instruction: &Instruction) -> Vec<usize> {
         | Instruction::JumpIfNotEqual { lhs, rhs, .. } => {
             vec![register(*lhs), register(*rhs)]
         }
-        Instruction::GetLengthProperty { value, .. }
+        Instruction::StrictEq { lhs, rhs, .. } => vec![register(*lhs), register(*rhs)],
+        Instruction::JumpIfFalse { value, .. }
+        | Instruction::GetLengthProperty { value, .. }
         | Instruction::GetPropertyByName { value, .. } => vec![register(*value)],
         Instruction::GetPropertyByNameWithThis {
             receiver, value, ..
@@ -1294,6 +1296,9 @@ fn object_operands(instruction: &Instruction) -> Vec<usize> {
         | Instruction::GetPropertyByValuePush {
             receiver, object, ..
         } => vec![usize::from(*receiver), usize::from(*object)],
+        Instruction::StrictEq { lhs, rhs, .. } => {
+            vec![usize::from(*lhs), usize::from(*rhs)]
+        }
         _ => Vec::new(),
     }
 }
@@ -1374,6 +1379,7 @@ fn output_definition(
         | Instruction::Mul { dst, .. }
         | Instruction::BitOr { dst, .. }
         | Instruction::BitXor { dst, .. }
+        | Instruction::StrictEq { dst, .. }
         | Instruction::Inc { dst, .. }
         | Instruction::PopIntoRegister { dst }
         | Instruction::GetPropertyByName { dst, .. }
@@ -1424,6 +1430,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::StoreFloat, Instruction::StoreFloat { .. })
         | (Opcode::StoreDouble, Instruction::StoreDouble { .. })
         | (Opcode::Move, Instruction::Move { .. })
+        | (Opcode::GetLengthProperty, Instruction::GetLengthProperty { .. })
         | (Opcode::GetPropertyByName, Instruction::GetPropertyByName { .. })
         | (Opcode::GetPropertyByNameWithThis, Instruction::GetPropertyByNameWithThis { .. })
         | (Opcode::GetPropertyByValue, Instruction::GetPropertyByValue { .. })
@@ -1434,6 +1441,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::Mul, Instruction::Mul { .. })
         | (Opcode::BitOr, Instruction::BitOr { .. })
         | (Opcode::BitXor, Instruction::BitXor { .. })
+        | (Opcode::StrictEq, Instruction::StrictEq { .. })
         | (Opcode::Inc, Instruction::Inc { .. })
         | (Opcode::Jump, Instruction::Jump { .. })
         | (Opcode::JumpIfNotLessThan, Instruction::JumpIfNotLessThan { .. })
@@ -1441,6 +1449,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::JumpIfNotGreaterThan, Instruction::JumpIfNotGreaterThan { .. })
         | (Opcode::JumpIfNotGreaterThanOrEqual, Instruction::JumpIfNotGreaterThanOrEqual { .. })
         | (Opcode::JumpIfNotEqual, Instruction::JumpIfNotEqual { .. })
+        | (Opcode::JumpIfFalse, Instruction::JumpIfFalse { .. })
         | (Opcode::IncrementLoopIteration, Instruction::IncrementLoopIteration)
         | (Opcode::PushFromRegister, Instruction::PushFromRegister { .. })
         | (Opcode::PopIntoRegister, Instruction::PopIntoRegister { .. })
@@ -1454,6 +1463,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
 fn branch_target(instruction: &Instruction) -> Option<usize> {
     match instruction {
         Instruction::Jump { address }
+        | Instruction::JumpIfFalse { address, .. }
         | Instruction::JumpIfNotLessThan { address, .. }
         | Instruction::JumpIfNotLessThanOrEqual { address, .. }
         | Instruction::JumpIfNotGreaterThan { address, .. }
@@ -1471,6 +1481,7 @@ fn has_explicit_edges(instruction: &Instruction) -> bool {
     matches!(
         instruction,
         Instruction::Jump { .. }
+            | Instruction::JumpIfFalse { .. }
             | Instruction::JumpIfNotLessThan { .. }
             | Instruction::JumpIfNotLessThanOrEqual { .. }
             | Instruction::JumpIfNotGreaterThan { .. }
@@ -1503,11 +1514,14 @@ struct Helpers {
     get_argument_f64: Helper,
     dense_i32_guarded: Helper,
     dense_f64_guarded: Helper,
+    dense_boxed_i32_guarded: Helper,
+    dense_boxed_f64_guarded: Helper,
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
     bit_or_f64: Helper,
     bit_xor_f64: Helper,
+    strict_eq: Helper,
     call_ordinary: Helper,
     set_pc: Helper,
     store_i32_if_defined: Helper,
@@ -1837,6 +1851,24 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::F64, types::I32, ptr],
                 types::I64,
             ),
+            dense_boxed_i32_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_dense_array_boxed_i32_guarded as *const () as usize
+                } else {
+                    jit_dense_array_boxed_i32_guarded as *const () as usize
+                },
+                &[ptr, types::I32, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
+            dense_boxed_f64_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_dense_array_boxed_f64_guarded as *const () as usize
+                } else {
+                    jit_dense_array_boxed_f64_guarded as *const () as usize
+                },
+                &[ptr, types::I32, types::F64, types::I32, types::I32],
+                types::I64,
+            ),
             named_boxed_guarded: make(
                 if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_boxed_guarded as *const () as usize
@@ -1873,6 +1905,11 @@ impl<'a> NativeCompiler<'a> {
                 jit_bit_xor_f64 as *const () as usize,
                 &[types::F64, types::F64],
                 types::F64,
+            ),
+            strict_eq: make(
+                jit_strict_eq as *const () as usize,
+                &[ptr, types::I32, types::I32],
+                types::I32,
             ),
             call_ordinary: make(
                 jit_call_ordinary as *const () as usize,
@@ -2231,7 +2268,12 @@ impl<'a> NativeCompiler<'a> {
                     }
                 }
             }
-            Instruction::GetPropertyByName {
+            Instruction::GetLengthProperty {
+                dst,
+                value,
+                ic_index,
+            }
+            | Instruction::GetPropertyByName {
                 dst,
                 value,
                 ic_index,
@@ -2348,14 +2390,28 @@ impl<'a> NativeCompiler<'a> {
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
                 self.emit_set_pc(bcx, ctx, helpers, next_pc);
-                let f64_output = (self.mode == NativeMode::F64).then(|| {
+                let boxed = self.defined_register_kind(dst) == RegisterKind::Boxed;
+                let f64_output = (!boxed && self.mode == NativeMode::F64).then(|| {
                     bcx.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         8,
                         3,
                     ))
                 });
-                let guarded_value = if self.mode == NativeMode::F64 {
+                let guarded_value = if boxed {
+                    let dst_value = bcx.ins().iconst(types::I32, dst as i64);
+                    let helper = if self.mode == NativeMode::F64 {
+                        helpers.dense_boxed_f64_guarded
+                    } else {
+                        helpers.dense_boxed_i32_guarded
+                    };
+                    let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
+                    bcx.ins().call_indirect(
+                        helper.signature,
+                        helper_address,
+                        &[ctx, object, key, ic_index, dst_value],
+                    )
+                } else if self.mode == NativeMode::F64 {
                     let helper = bcx
                         .ins()
                         .iconst(helpers.ptr, helpers.dense_f64_guarded.address as i64);
@@ -2382,7 +2438,7 @@ impl<'a> NativeCompiler<'a> {
                 let guarded_value = bcx.inst_results(guarded_value)[0];
                 let deopt = bcx.create_block();
                 let cont = bcx.create_block();
-                if self.mode == NativeMode::F64 {
+                if boxed || self.mode == NativeMode::F64 {
                     bcx.ins().brif(guarded_value, cont, &[], deopt, &[]);
                 } else {
                     let fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
@@ -2394,7 +2450,10 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 }
                 bcx.switch_to_block(cont);
-                if self.mode == NativeMode::F64 {
+                if boxed {
+                    // The helper copied the traced value directly into the VM
+                    // register. Generic bookkeeping clears stale native state.
+                } else if self.mode == NativeMode::F64 {
                     let result = bcx.ins().stack_load(
                         types::F64,
                         f64_output.expect("F64 mode has an output slot"),
@@ -2492,6 +2551,30 @@ impl<'a> NativeCompiler<'a> {
                                 .call_indirect(helper.signature, helper_address, &[lhs, rhs]);
                         bcx.inst_results(call)[0]
                     }
+                };
+                if !self.define_register(bcx, register(*dst), result) {
+                    return false;
+                }
+            }
+            Instruction::StrictEq { dst, lhs, rhs } => {
+                if self.register_kind(usize::from(*lhs)) != RegisterKind::Boxed
+                    || self.register_kind(usize::from(*rhs)) != RegisterKind::Boxed
+                {
+                    return false;
+                }
+                let helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.strict_eq.address as i64);
+                let lhs = bcx.ins().iconst(types::I32, usize::from(*lhs) as i64);
+                let rhs = bcx.ins().iconst(types::I32, usize::from(*rhs) as i64);
+                let call =
+                    bcx.ins()
+                        .call_indirect(helpers.strict_eq.signature, helper, &[ctx, lhs, rhs]);
+                let result = bcx.inst_results(call)[0];
+                let result = if self.mode == NativeMode::F64 {
+                    bcx.ins().fcvt_from_uint(types::F64, result)
+                } else {
+                    result
                 };
                 if !self.define_register(bcx, register(*dst), result) {
                     return false;
@@ -2635,6 +2718,24 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 };
                 bcx.ins().jump(target, &[]);
+            }
+            Instruction::JumpIfFalse { address, value } => {
+                let Some(value) = self.use_register(bcx, register(*value)) else {
+                    return false;
+                };
+                let Some(target) = self.target_block(*address, blocks) else {
+                    return false;
+                };
+                let Some(fallthrough) = self.next_block(next_pc, blocks) else {
+                    return false;
+                };
+                let is_true = if self.mode == NativeMode::F64 {
+                    let zero = bcx.ins().f64const(0.0);
+                    bcx.ins().fcmp(FloatCC::NotEqual, value, zero)
+                } else {
+                    bcx.ins().icmp_imm(IntCC::NotEqual, value, 0)
+                };
+                bcx.ins().brif(is_true, fallthrough, &[], target, &[]);
             }
             Instruction::JumpIfNotLessThan { address, lhs, rhs } => {
                 if !self.emit_compare_branch(
@@ -4307,6 +4408,38 @@ extern "C" fn jit_dense_array_f64_guarded(
     1
 }
 
+extern "C" fn jit_dense_array_boxed_i32_guarded(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some((_kind, value)) = dense_array_value(context, register, index, ic_index) else {
+        return 0;
+    };
+    context.vm.set_register(dst as usize, value);
+    1
+}
+
+extern "C" fn jit_dense_array_boxed_f64_guarded(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let Some((_kind, value)) = dense_array_value_f64(context, register, index, ic_index) else {
+        return 0;
+    };
+    context.vm.set_register(dst as usize, value);
+    1
+}
+
 extern "C" fn jit_diagnostic_dense_array_i32_guarded(
     context: *mut Context,
     register: u32,
@@ -4334,6 +4467,46 @@ extern "C" fn jit_diagnostic_dense_array_f64_guarded(
     output: *mut f64,
 ) -> u64 {
     let result = jit_dense_array_f64_guarded(context, register, index, ic_index, output);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+    } else {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+        counters.dense_loads = counters.dense_loads.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_dense_array_boxed_i32_guarded(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    let result = jit_dense_array_boxed_i32_guarded(context, register, index, ic_index, dst);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrow ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result == 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+    } else {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+        counters.dense_loads = counters.dense_loads.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_dense_array_boxed_f64_guarded(
+    context: *mut Context,
+    register: u32,
+    index: f64,
+    ic_index: u32,
+    dst: u32,
+) -> u64 {
+    let result = jit_dense_array_boxed_f64_guarded(context, register, index, ic_index, dst);
     // SAFETY: generated code receives an exclusively borrowed live context,
     // and the delegated helper's borrow ended before this update.
     let counters = unsafe { &mut (*context).vm.jit_native_storage };
@@ -4493,6 +4666,17 @@ extern "C" fn jit_bit_or_f64(lhs: f64, rhs: f64) -> f64 {
 
 extern "C" fn jit_bit_xor_f64(lhs: f64, rhs: f64) -> f64 {
     f64::from(f64_to_int32(lhs) ^ f64_to_int32(rhs))
+}
+
+extern "C" fn jit_strict_eq(context: *mut Context, lhs: u32, rhs: u32) -> i32 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    i32::from(
+        context
+            .vm
+            .get_register(lhs as usize)
+            .strict_equals(context.vm.get_register(rhs as usize)),
+    )
 }
 
 extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {

@@ -7172,6 +7172,94 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_runs_native_monomorphic_length_load() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sumLength(object, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + object.length; } return total; } let object = { length: 3 }; let answer = 0; for (let j = 0; j < 80; j++) { answer = sumLength(object, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(30));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_intrinsic_array_length_to_interpreter() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function sumLength(array, n) { let total = 0; for (let i = 0; i < n; i++) { total = total + array.length; } return total; } let array = [1, 2, 3]; let answer = 0; for (let j = 0; j < 80; j++) { answer = sumLength(array, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(30));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_scans_readonly_indexed_objects() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const list = { length: 3 }; const first = {}; const needle = {}; const last = {}; Object.defineProperty(list, 0, { value: first, enumerable: true, configurable: true }); Object.defineProperty(list, 1, { value: needle, enumerable: true, configurable: true }); Object.defineProperty(list, 2, { value: last, enumerable: true, configurable: true }); function find(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = find(list, needle, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(10));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_readonly_indexed_scan_after_shape_change() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const list = { length: 3 }; const first = {}; const needle = {}; const last = {}; Object.defineProperty(list, 0, { value: first, enumerable: true, configurable: true }); Object.defineProperty(list, 1, { value: needle, enumerable: true, configurable: true }); Object.defineProperty(list, 2, { value: last, enumerable: true, configurable: true }); function find(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { find(list, needle, 10); } Object.defineProperty(list, 1, { get() { return first; }, configurable: true }); find(list, needle, 10)",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(0));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn context_owned_jit_preserves_named_integer_payload_bits() {
         let mut context = Context::default();
         context.enable_jit();
