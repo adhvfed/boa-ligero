@@ -150,9 +150,9 @@ fn indexed_properties_read_kind(props: &IndexedProperties) -> IndexedKind {
         IndexedProperties::DenseI32(_) => IndexedKind::DenseI32,
         IndexedProperties::DenseF64(_) => IndexedKind::DenseF64,
         IndexedProperties::DenseElement(_) => IndexedKind::DenseElement,
-        IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => {
-            IndexedKind::SparseData
-        }
+        IndexedProperties::DenseReadOnlyElement(_)
+        | IndexedProperties::SparseElement(_)
+        | IndexedProperties::SparseProperty(_) => IndexedKind::SparseData,
     }
 }
 

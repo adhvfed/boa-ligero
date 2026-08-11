@@ -40,6 +40,37 @@ fn object_properties_return_order() {
 }
 
 #[test]
+fn dense_readonly_indexed_properties_preserve_descriptors_and_transitions() {
+    run_test_actions([
+        TestAction::run_harness(),
+        TestAction::run(indoc! {r#"
+            const values = {};
+            for (let index = 0; index < 3; index++) {
+                Object.defineProperty(values, index, {
+                    value: `value-${index}`,
+                    writable: false,
+                    enumerable: true,
+                    configurable: true,
+                });
+            }
+        "#}),
+        TestAction::assert("values[1] === 'value-1'"),
+        TestAction::assert("Object.getOwnPropertyDescriptor(values, 1).writable === false"),
+        TestAction::assert("Object.getOwnPropertyDescriptor(values, 1).enumerable"),
+        TestAction::assert("Object.getOwnPropertyDescriptor(values, 1).configurable"),
+        TestAction::assert("arrayEquals(Object.keys(values), ['0', '1', '2'])"),
+        TestAction::assert(
+            "Object.defineProperty(values, 1, { value: 'changed' })[1] === 'changed'",
+        ),
+        TestAction::assert("delete values[1]"),
+        TestAction::assert("!(1 in values)"),
+        TestAction::assert("values[2] === 'value-2'"),
+        TestAction::assert("Object.defineProperty(values, 0, { writable: true })[0] === 'value-0'"),
+        TestAction::assert("Object.getOwnPropertyDescriptor(values, 0).writable"),
+    ]);
+}
+
+#[test]
 fn weak_js_object_does_not_keep_object_alive() {
     let weak = {
         let object = JsObject::with_null_proto();

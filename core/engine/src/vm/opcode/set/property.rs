@@ -257,7 +257,9 @@ fn indexed_properties_write_kind(props: &IndexedProperties) -> Option<IndexedKin
         IndexedProperties::DenseI32(_) => Some(IndexedKind::DenseI32),
         IndexedProperties::DenseF64(_) => Some(IndexedKind::DenseF64),
         IndexedProperties::DenseElement(_) => Some(IndexedKind::DenseElement),
-        IndexedProperties::SparseElement(_) | IndexedProperties::SparseProperty(_) => None,
+        IndexedProperties::DenseReadOnlyElement(_)
+        | IndexedProperties::SparseElement(_)
+        | IndexedProperties::SparseProperty(_) => None,
     }
 }
 
