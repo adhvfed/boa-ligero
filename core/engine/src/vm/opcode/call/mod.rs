@@ -9,7 +9,7 @@ use crate::{
     builtins::{Promise, function::OrdinaryFunction, promise::PromiseCapability},
     error::JsNativeError,
     job::NativeAsyncJob,
-    module::{ImportAttribute, ModuleKind, ModuleRequest, Referrer},
+    module::{ImportAttribute, Module, ModuleKind, ModuleRequest, Referrer},
     object::{FunctionObjectBuilder, internal_methods::InternalMethodCallContext},
     vm::opcode::Operation,
 };
@@ -428,6 +428,24 @@ async fn load_dyn_import(
     let mut heap = Vec::<MaybeUninit<u8>>::new();
     let completion = fut.init2(&mut stack, &mut heap).await;
 
+    continue_dyn_import(
+        referrer,
+        request,
+        &cap,
+        phase,
+        completion,
+        &mut context.borrow_mut(),
+    )
+}
+
+fn continue_dyn_import(
+    referrer: Referrer,
+    request: ModuleRequest,
+    cap: &PromiseCapability,
+    phase: u32,
+    completion: JsResult<Module>,
+    context: &mut Context,
+) -> JsResult<()> {
     // `ContinueDynamicImport ( promiseCapability, moduleCompletion )`
     // https://tc39.es/ecma262/#sec-ContinueDynamicImport
 
@@ -438,9 +456,9 @@ async fn load_dyn_import(
         // 1. If moduleCompletion is an abrupt completion, then
         Err(err) => {
             // a. Perform ! Call(promiseCapability.[[Reject]], undefined, « moduleCompletion.[[Value]] »).
-            let err = err.into_opaque(&mut context.borrow_mut())?;
+            let err = err.into_opaque(context)?;
             cap.reject()
-                .call(&JsValue::undefined(), &[err], &mut context.borrow_mut())
+                .call(&JsValue::undefined(), &[err], context)
                 .expect("default `reject` function cannot throw");
 
             // b. Return unused.
@@ -492,9 +510,9 @@ async fn load_dyn_import(
         let err = JsNativeError::syntax()
             .with_message("import.defer() and import.source() require the 'experimental' feature")
             .into();
-        let err = JsError::into_opaque(err, &mut context.borrow_mut())?;
+        let err = JsError::into_opaque(err, context)?;
         cap.reject()
-            .call(&JsValue::undefined(), &[err], &mut context.borrow_mut())
+            .call(&JsValue::undefined(), &[err], context)
             .expect("default `reject` function cannot throw");
         return Ok(());
     }
@@ -509,21 +527,21 @@ async fn load_dyn_import(
         let err = JsNativeError::syntax()
             .with_message("source phase import is not available for this module")
             .into();
-        let err = JsError::into_opaque(err, &mut context.borrow_mut())?;
+        let err = JsError::into_opaque(err, context)?;
         cap.reject()
-            .call(&JsValue::undefined(), &[err], &mut context.borrow_mut())
+            .call(&JsValue::undefined(), &[err], context)
             .expect("default `reject` function cannot throw");
         return Ok(());
     }
 
     // 2. Let module be moduleCompletion.[[Value]].
     // 3. Let loadPromise be module.LoadRequestedModules().
-    let load = module.load(&mut context.borrow_mut());
+    let load = module.load(context);
 
     // 4. Let rejectedClosure be a new Abstract Closure with parameters (reason) that captures promiseCapability and performs the following steps when called:
     // 5. Let onRejected be CreateBuiltinFunction(rejectedClosure, 1, "", « »).
     let on_rejected = FunctionObjectBuilder::new(
-        context.borrow().realm(),
+        context.realm(),
         NativeFunction::from_copy_closure_with_captures(
             |_, args, cap, context| {
                 //     a. Perform ! Call(promiseCapability.[[Reject]], undefined, « reason »).
@@ -542,7 +560,7 @@ async fn load_dyn_import(
     // 6. Let linkAndEvaluateClosure be a new Abstract Closure with no parameters that captures module, promiseCapability, and onRejected and performs the following steps when called:
     // 7. Let linkAndEvaluate be CreateBuiltinFunction(linkAndEvaluateClosure, 0, "", « »).
     let link_evaluate = FunctionObjectBuilder::new(
-        context.borrow().realm(),
+        context.realm(),
         NativeFunction::from_copy_closure_with_captures(
             |_, _, (module, cap, on_rejected), context| {
                 // a. Let link be Completion(module.Link()).
@@ -600,13 +618,7 @@ async fn load_dyn_import(
     .build();
 
     // 8. Perform PerformPromiseThen(loadPromise, linkAndEvaluate, onRejected).
-    Promise::perform_promise_then(
-        &load,
-        Some(link_evaluate),
-        Some(on_rejected),
-        None,
-        &mut context.borrow_mut(),
-    );
+    Promise::perform_promise_then(&load, Some(link_evaluate), Some(on_rejected), None, context);
 
     // 9. Return unused.
     Ok(())
@@ -675,13 +687,32 @@ impl ImportCall {
         };
 
         // 8. Perform HostLoadImportedModule(referrer, specifierString, empty, promiseCapability).
-        let job = NativeAsyncJob::with_realm(
-            async move |context| {
-                load_dyn_import(referrer, request, cap, phase, context).await?;
-                Ok(JsValue::undefined())
-            },
-            context.realm().clone(),
+        let realm = context.realm().clone();
+        let module_loader = context.module_loader();
+        let detached = module_loader.clone().load_imported_module_job(
+            referrer.clone(),
+            request.clone(),
+            context,
         );
+        let job = if let Some(job) = detached {
+            NativeAsyncJob::from_future_with_realm(
+                job,
+                move |completion, context| {
+                    let completion = completion.call(context);
+                    continue_dyn_import(referrer, request, &cap, phase, completion, context)?;
+                    Ok(JsValue::undefined())
+                },
+                realm,
+            )
+        } else {
+            NativeAsyncJob::with_realm(
+                async move |context| {
+                    load_dyn_import(referrer, request, cap, phase, context).await?;
+                    Ok(JsValue::undefined())
+                },
+                realm,
+            )
+        };
         context.enqueue_job(job.into());
 
         // 9. Return promiseCapability.[[Promise]].

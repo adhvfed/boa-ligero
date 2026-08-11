@@ -916,12 +916,13 @@ fn into_js_module() {
 }
 
 #[test]
-fn detached_module_load_survives_non_blocking_job_drains() {
+fn detached_static_and_dynamic_module_loads_survive_non_blocking_job_drains() {
     use boa_engine::{
         Context, JsResult, JsValue, Module, Source,
         builtins::promise::PromiseState,
         job::JobRunStatus,
         module::{ModuleLoadJob, ModuleLoader, ModuleRequest, Referrer},
+        object::builtins::JsPromise,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1009,6 +1010,40 @@ fn detached_module_load_survives_non_blocking_job_drains() {
     assert_eq!(
         evaluation.state(),
         PromiseState::Fulfilled(JsValue::undefined())
+    );
+
+    ready.store(false, Ordering::Release);
+    let dynamic_import = context
+        .eval(Source::from_bytes("import('dynamic')"))
+        .expect("start dynamic import");
+    let dynamic_import = JsPromise::from_object(
+        dynamic_import
+            .as_object()
+            .expect("dynamic import returns a promise")
+            .clone(),
+    )
+    .expect("dynamic import promise");
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("start dynamic module transport"),
+        JobRunStatus::Pending
+    );
+    assert_eq!(dynamic_import.state(), PromiseState::Pending);
+
+    ready.store(true, Ordering::Release);
+    if let Some(waker) = waker.lock().expect("module transport waker").take() {
+        waker.wake();
+    }
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("complete dynamic module transport"),
+        JobRunStatus::Complete
+    );
+    assert!(
+        dynamic_import.state().as_fulfilled().is_some(),
+        "dynamic import should resolve after detached transport"
     );
 }
 
