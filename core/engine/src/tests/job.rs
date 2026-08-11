@@ -175,6 +175,40 @@ fn detached_async_jobs_survive_non_blocking_drains() {
 }
 
 #[test]
+fn non_blocking_drain_starts_all_detached_jobs_before_stalling() {
+    const JOBS: usize = 8;
+
+    let mut context = Context::default();
+    let polls = Arc::new((0..JOBS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+    for index in 0..JOBS {
+        context.enqueue_job(
+            NativeAsyncJob::from_future(
+                {
+                    let polls = Arc::clone(&polls);
+                    std::future::poll_fn(move |_| {
+                        polls[index].fetch_add(1, Ordering::Relaxed);
+                        Poll::<()>::Pending
+                    })
+                },
+                |(), _| Ok(JsValue::undefined()),
+            )
+            .into(),
+        );
+    }
+
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("start detached jobs"),
+        JobRunStatus::Pending
+    );
+    assert!(
+        polls.iter().all(|count| count.load(Ordering::Relaxed) == 1),
+        "a non-blocking pass must start every independent transport"
+    );
+}
+
+#[test]
 fn non_blocking_drain_stalls_at_future_clock_jobs() {
     let clock = Rc::new(FixedClock::default());
     let mut context = ContextBuilder::default()
