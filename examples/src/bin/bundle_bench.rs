@@ -34,14 +34,19 @@ fn main() {
     assert!(iterations > 0, "iterations must be positive");
 
     let source = fs::read(&path).expect("failed to read bundle");
+    let mut context_samples = Vec::with_capacity(iterations);
     let mut parse_samples = Vec::with_capacity(iterations);
     let mut compile_samples = Vec::with_capacity(iterations);
+    let mut total_samples = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
         // A browser document starts with a fresh realm and interner. Reusing
         // one here would make later iterations unrealistically benefit from
         // all strings interned by the first parse.
+        let total_start = Instant::now();
+        let start = Instant::now();
         let mut context = Context::default();
+        context_samples.push(start.elapsed());
         let start = Instant::now();
         let script = Script::parse(Source::from_bytes(&source), None, &mut context)
             .expect("failed to parse bundle");
@@ -52,13 +57,15 @@ fn main() {
             .codeblock(&mut context)
             .expect("failed to compile bundle");
         compile_samples.push(start.elapsed());
+        total_samples.push(total_start.elapsed());
     }
 
+    let context = median(&mut context_samples);
     let parse = median(&mut parse_samples);
     let compile = median(&mut compile_samples);
+    let total = median(&mut total_samples);
     println!(
-        "{} bytes: parse={parse:.2?}, compile={compile:.2?}, total={:.2?}",
+        "{} bytes: context={context:.2?}, parse={parse:.2?}, compile={compile:.2?}, total={total:.2?}",
         source.len(),
-        parse + compile
     );
 }
