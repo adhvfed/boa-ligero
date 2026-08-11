@@ -1037,36 +1037,6 @@ pub(crate) fn function_call(
 
     let context = context.context();
 
-    let lexical_this_mode = context.vm.frame().code_block.this_mode == ThisMode::Lexical;
-    let this = if lexical_this_mode {
-        ThisBindingStatus::Lexical
-    } else {
-        let this = context.vm.stack.get_this(context.vm.frame());
-        if context.vm.frame().code_block.strict() {
-            context.vm.frame_mut().flags |= CallFrameFlags::THIS_VALUE_CACHED;
-            ThisBindingStatus::Initialized(this)
-        } else if this.is_null_or_undefined() {
-            context.vm.frame_mut().flags |= CallFrameFlags::THIS_VALUE_CACHED;
-            let this: JsValue = context.realm().global_this().clone().into();
-            context.vm.stack.set_this(
-                context.vm.frames.last().js_expect("frame must exist")?,
-                this.clone(),
-            );
-            ThisBindingStatus::Initialized(this)
-        } else {
-            let this: JsValue = this
-                .to_object(context)
-                .js_expect("conversion cannot fail")?
-                .into();
-            context.vm.frame_mut().flags |= CallFrameFlags::THIS_VALUE_CACHED;
-            context.vm.stack.set_this(
-                context.vm.frames.last().js_expect("frame must exist")?,
-                this.clone(),
-            );
-            ThisBindingStatus::Initialized(this)
-        }
-    };
-
     let mut last_env = 0;
 
     let has_binding_identifier = context.vm.frame().code_block().has_binding_identifier();
@@ -1086,6 +1056,19 @@ pub(crate) fn function_call(
     }
 
     if has_function_scope {
+        let lexical_this_mode = context.vm.frame().code_block.this_mode == ThisMode::Lexical;
+        let this = if lexical_this_mode {
+            ThisBindingStatus::Lexical
+        } else {
+            let this = ordinary_this_value(context)?;
+            context.vm.frame_mut().flags |= CallFrameFlags::THIS_VALUE_CACHED;
+            context.vm.stack.set_this(
+                context.vm.frames.last().js_expect("frame must exist")?,
+                this.clone(),
+            );
+            ThisBindingStatus::Initialized(this)
+        };
+
         let scope = context.vm.frame().code_block().constant_scope(last_env);
         let frame = context.vm.frame_mut();
         let global = frame.realm.environment();
@@ -1097,6 +1080,26 @@ pub(crate) fn function_call(
     }
 
     Ok(CallValue::Ready)
+}
+
+/// Apply `OrdinaryCallBindThis` coercion to the current frame's raw receiver.
+///
+/// Callers decide when the result must be cached. Keeping coercion separate
+/// lets functions without an observable `this` binding defer this work until
+/// their bytecode actually reads the binding.
+#[inline]
+pub(crate) fn ordinary_this_value(context: &mut Context) -> JsResult<JsValue> {
+    let this = context.vm.stack.get_this(context.vm.frame());
+    if context.vm.frame().code_block.strict() {
+        Ok(this)
+    } else if this.is_null_or_undefined() {
+        Ok(context.realm().global_this().clone().into())
+    } else {
+        Ok(this
+            .to_object(context)
+            .js_expect("ordinary receiver conversion cannot fail")?
+            .into())
+    }
 }
 
 /// Construct an instance of this object with the specified arguments.

@@ -1,6 +1,7 @@
 use super::{IndexOperand, RegisterOperand};
 use crate::{
     Context, JsExpect, JsResult, JsValue,
+    builtins::function::{ThisMode, ordinary_this_value},
     environments::Environment,
     error::JsNativeError,
     object::internal_methods::InternalMethodPropertyContext,
@@ -65,12 +66,21 @@ impl This {
             return Ok(());
         }
 
-        let this = context
-            .vm
-            .frame()
-            .environments
-            .get_this_binding()?
-            .unwrap_or(context.realm().global_this().clone().into());
+        let code_block = context.vm.frame().code_block();
+        let this = if code_block.has_function_scope() || code_block.this_mode == ThisMode::Lexical {
+            context
+                .vm
+                .frame()
+                .environments
+                .get_this_binding()?
+                .unwrap_or(context.realm().global_this().clone().into())
+        } else {
+            // Non-lexical functions without a function environment cannot
+            // expose their `this` binding through eval or a nested arrow.
+            // Keep the call's raw value in the frame prologue and normalize
+            // it only if the function actually executes a `This` instruction.
+            ordinary_this_value(context)?
+        };
         context.vm.frame_mut().flags |= CallFrameFlags::THIS_VALUE_CACHED;
         context.vm.stack.set_this(
             context.vm.frames.last().js_expect("frame must exist")?,

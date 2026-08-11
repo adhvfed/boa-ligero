@@ -127,6 +127,28 @@ fn eval_arrow_captures_the_callers_this_binding() {
 }
 
 #[test]
+fn ordinary_calls_normalize_this_without_a_function_environment() {
+    run_test_actions([TestAction::assert(indoc! {r#"
+        function sloppyThis() {
+            return this;
+        }
+
+        function strictThis() {
+            "use strict";
+            return this;
+        }
+
+        const receiver = {};
+        sloppyThis() === globalThis
+            && sloppyThis.call(null) === globalThis
+            && sloppyThis.call(receiver) === receiver
+            && strictThis() === undefined
+            && strictThis.call(null) === null
+            && strictThis.call(42) === 42;
+    "#})]);
+}
+
+#[test]
 fn implicit_constructor_return_does_not_leak_completion_value_from_same_eval() {
     run_test_actions([
         TestAction::run(indoc! {r#"
