@@ -15,7 +15,10 @@ use futures_lite::future;
 use crate::{
     Context, JsValue, Source, TestAction,
     context::{ContextBuilder, time::FixedClock},
-    job::{GenericJob, JobExecutor, JobExecutorMetrics, NativeAsyncJob, SimpleJobExecutor},
+    job::{
+        GenericJob, JobExecutor, JobExecutorMetrics, JobRunStatus, NativeAsyncJob,
+        SimpleJobExecutor, TimeoutJob,
+    },
     run_test_actions_with,
 };
 
@@ -112,6 +115,100 @@ fn synchronous_executor_parks_instead_of_spinning_on_async_jobs() {
         polls.load(Ordering::Relaxed) <= 3,
         "the delayed future should be polled only around wakeup"
     );
+}
+
+#[test]
+fn detached_async_jobs_survive_non_blocking_drains() {
+    let mut context = Context::default();
+    let ready = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let waker = Arc::new(Mutex::new(None::<Waker>));
+    let completed = Rc::new(Cell::new(false));
+
+    context.enqueue_job(
+        NativeAsyncJob::from_future(
+            {
+                let ready = Arc::clone(&ready);
+                let polls = Arc::clone(&polls);
+                let waker = Arc::clone(&waker);
+                std::future::poll_fn(move |cx| {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    if ready.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        *waker.lock().expect("detached future waker") = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+            },
+            {
+                let completed = Rc::clone(&completed);
+                move |(), _| {
+                    completed.set(true);
+                    Ok(JsValue::undefined())
+                }
+            },
+        )
+        .into(),
+    );
+
+    assert_eq!(
+        context.run_jobs_until_stalled().expect("poll detached job"),
+        JobRunStatus::Pending
+    );
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+    assert!(!completed.get());
+
+    ready.store(true, Ordering::Release);
+    if let Some(waker) = waker.lock().expect("detached future waker").take() {
+        waker.wake();
+    }
+
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("complete detached job"),
+        JobRunStatus::Complete
+    );
+    assert_eq!(polls.load(Ordering::Relaxed), 2);
+    assert!(completed.get());
+}
+
+#[test]
+fn non_blocking_drain_stalls_at_future_clock_jobs() {
+    let clock = Rc::new(FixedClock::default());
+    let mut context = ContextBuilder::default()
+        .clock(clock.clone())
+        .build()
+        .expect("build context");
+    let completed = Rc::new(Cell::new(false));
+
+    context.enqueue_job(
+        TimeoutJob::from_duration(
+            {
+                let completed = Rc::clone(&completed);
+                move |_| {
+                    completed.set(true);
+                    Ok(JsValue::undefined())
+                }
+            },
+            Duration::from_millis(10),
+        )
+        .into(),
+    );
+
+    assert_eq!(
+        context.run_jobs_until_stalled().expect("stall at timer"),
+        JobRunStatus::Pending
+    );
+    assert!(!completed.get());
+
+    clock.forward(11);
+    assert_eq!(
+        context.run_jobs_until_stalled().expect("run due timer"),
+        JobRunStatus::Complete
+    );
+    assert!(completed.get());
 }
 
 #[test]

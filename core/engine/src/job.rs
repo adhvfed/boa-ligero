@@ -39,7 +39,7 @@ use crate::{
 };
 use boa_gc::{Finalize, Trace};
 use futures_concurrency::future::FutureGroup;
-use futures_lite::{StreamExt, future};
+use futures_lite::{Stream, StreamExt, future};
 use portable_atomic::AtomicBool;
 use std::any::Any;
 use std::cell::Cell;
@@ -477,13 +477,20 @@ impl GenericJob {
 /// The [`Future`] job returned by a [`NativeAsyncJob`] operation.
 pub type BoxedFuture<'a> = Pin<Box<dyn Future<Output = JsResult<JsValue>> + 'a>>;
 
+type DetachedJobFuture = Pin<Box<dyn Future<Output = NativeJob> + 'static>>;
+
+#[allow(clippy::type_complexity)]
+enum NativeAsyncJobInner {
+    Contextual(Box<dyn for<'a> FnOnce(&'a RefCell<&mut Context>) -> BoxedFuture<'a>>),
+    Detached(DetachedJobFuture),
+}
+
 /// An ECMAScript [Job] that can be run asynchronously.
 ///
 /// This is an additional type of job that is not defined by the specification, enabling running `Future` tasks
 /// created by ECMAScript code in an easier way.
-#[allow(clippy::type_complexity)]
 pub struct NativeAsyncJob {
-    f: Box<dyn for<'a> FnOnce(&'a RefCell<&mut Context>) -> BoxedFuture<'a>>,
+    inner: NativeAsyncJobInner,
     realm: Option<Realm>,
 }
 
@@ -502,7 +509,9 @@ impl NativeAsyncJob {
         F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
     {
         Self {
-            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+            inner: NativeAsyncJobInner::Contextual(Box::new(move |ctx| {
+                Box::pin(async move { f(ctx).await })
+            })),
             realm: None,
         }
     }
@@ -513,8 +522,56 @@ impl NativeAsyncJob {
         F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
     {
         Self {
-            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+            inner: NativeAsyncJobInner::Contextual(Box::new(move |ctx| {
+                Box::pin(async move { f(ctx).await })
+            })),
             realm: Some(realm),
+        }
+    }
+
+    /// Creates an async job whose pending future does not borrow the JavaScript
+    /// context.
+    ///
+    /// The future may be retained and polled across host event-loop turns. Its
+    /// output is passed to `complete` with exclusive context access only after
+    /// the future is ready.
+    pub fn from_future<F, T, C>(future: F, complete: C) -> Self
+    where
+        F: Future<Output = T> + 'static,
+        C: FnOnce(T, &mut Context) -> JsResult<JsValue> + 'static,
+        T: 'static,
+    {
+        Self::from_future_inner(future, complete, None)
+    }
+
+    /// Creates a context-independent async job with an execution realm.
+    pub fn from_future_with_realm<F, T, C>(future: F, complete: C, realm: Realm) -> Self
+    where
+        F: Future<Output = T> + 'static,
+        C: FnOnce(T, &mut Context) -> JsResult<JsValue> + 'static,
+        T: 'static,
+    {
+        Self::from_future_inner(future, complete, Some(realm))
+    }
+
+    fn from_future_inner<F, T, C>(future: F, complete: C, realm: Option<Realm>) -> Self
+    where
+        F: Future<Output = T> + 'static,
+        C: FnOnce(T, &mut Context) -> JsResult<JsValue> + 'static,
+        T: 'static,
+    {
+        let completion_realm = realm.clone();
+        let future = Box::pin(async move {
+            let output = future.await;
+            if let Some(realm) = completion_realm {
+                NativeJob::with_realm(move |context| complete(output, context), realm)
+            } else {
+                NativeJob::new(move |context| complete(output, context))
+            }
+        });
+        Self {
+            inner: NativeAsyncJobInner::Detached(future),
+            realm,
         }
     }
 
@@ -530,17 +587,21 @@ impl NativeAsyncJob {
     ///
     /// If the native async job has an execution realm defined, this sets the running execution
     /// context to the realm's before calling the inner closure, and resets it after execution.
-    pub fn call<'a, 'b>(
-        self,
-        context: &'a RefCell<&'b mut Context>,
-        // We can make our users assume `Unpin` because `self.f` is already boxed, so we shouldn't
-        // need pin at all.
-    ) -> impl Future<Output = JsResult<JsValue>> + Unpin + use<'a, 'b> {
+    pub fn call<'a>(self, context: &'a RefCell<&mut Context>) -> BoxedFuture<'a> {
+        let NativeAsyncJob { inner, realm } = self;
+        let NativeAsyncJobInner::Contextual(f) = inner else {
+            let NativeAsyncJobInner::Detached(future) = inner else {
+                unreachable!();
+            };
+            return Box::pin(async move {
+                let completion = future.await;
+                completion.call(&mut context.borrow_mut())
+            });
+        };
+
         // If realm is not null, each time job is invoked the implementation must perform
         // implementation-defined steps such that execution is prepared to evaluate ECMAScript
         // code at the time of job's invocation.
-        let realm = self.realm;
-
         let mut future = if let Some(realm) = &realm {
             let old_realm = context.borrow_mut().enter_realm(realm.clone());
 
@@ -548,15 +609,15 @@ impl NativeAsyncJob {
             // invoked. If realm is not null, each time job is invoked the implementation must
             // perform implementation-defined steps such that scriptOrModule is the active script or
             // module at the time of job's invocation.
-            let result = (self.f)(context);
+            let result = f(context);
 
             context.borrow_mut().enter_realm(old_realm);
             result
         } else {
-            (self.f)(context)
+            f(context)
         };
 
-        std::future::poll_fn(move |cx| {
+        Box::pin(std::future::poll_fn(move |cx| {
             // We need to do the same dance again since the inner code could assume we're still
             // on the same realm.
             if let Some(realm) = &realm {
@@ -569,7 +630,17 @@ impl NativeAsyncJob {
             } else {
                 future.as_mut().poll(cx)
             }
-        })
+        }))
+    }
+
+    fn into_detached(self) -> Result<DetachedJobFuture, Self> {
+        match self.inner {
+            NativeAsyncJobInner::Detached(future) => Ok(future),
+            inner @ NativeAsyncJobInner::Contextual(_) => Err(Self {
+                inner,
+                realm: self.realm,
+            }),
+        }
     }
 }
 
@@ -829,6 +900,15 @@ pub struct JobExecutorMetrics {
     pub clock_time: ProfileDuration,
 }
 
+/// Result of a non-blocking job-queue drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRunStatus {
+    /// No runnable or pending jobs remain.
+    Complete,
+    /// At least one job remains pending on an external event.
+    Pending,
+}
+
 /// An executor of `ECMAscript` [Jobs].
 ///
 /// This is the main API that allows creating custom event loops.
@@ -845,6 +925,17 @@ pub trait JobExecutor: Any {
 
     /// Runs all jobs in the executor.
     fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()>;
+
+    /// Runs jobs until the queue is empty or only externally pending work
+    /// remains.
+    ///
+    /// The default implementation drains to completion. Executors that retain
+    /// context-independent futures can override this to yield control to the
+    /// host event loop without losing pending work.
+    fn run_jobs_until_stalled(self: Rc<Self>, context: &mut Context) -> JsResult<JobRunStatus> {
+        self.run_jobs(context)?;
+        Ok(JobRunStatus::Complete)
+    }
 
     /// Enable or disable opt-in executor measurements.
     ///
@@ -925,6 +1016,7 @@ impl ClockJob {
 pub struct SimpleJobExecutor {
     promise_jobs: RefCell<VecDeque<PromiseJob>>,
     async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    detached_jobs: RefCell<FutureGroup<DetachedJobFuture>>,
     finalization_registry_jobs: RefCell<VecDeque<NativeAsyncJob>>,
     clock_jobs: RefCell<BTreeMap<JsInstant, Vec<ClockJob>>>,
     generic_jobs: RefCell<VecDeque<GenericJob>>,
@@ -937,6 +1029,8 @@ impl SimpleJobExecutor {
     fn clear(&self) {
         self.promise_jobs.borrow_mut().clear();
         self.async_jobs.borrow_mut().clear();
+        drop(self.detached_jobs.replace(FutureGroup::new()));
+        self.finalization_registry_jobs.borrow_mut().clear();
         self.clock_jobs.borrow_mut().clear();
         self.generic_jobs.borrow_mut().clear();
     }
@@ -964,10 +1058,40 @@ impl SimpleJobExecutor {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
+        self.queued_jobs_empty() && self.detached_jobs.borrow().is_empty()
+    }
+
+    fn queued_jobs_empty(&self) -> bool {
+        self.immediate_jobs_empty()
+            && self.finalization_registry_jobs.borrow().is_empty()
+            && self.clock_jobs.borrow().is_empty()
+    }
+
+    fn immediate_jobs_empty(&self) -> bool {
         self.promise_jobs.borrow().is_empty()
             && self.async_jobs.borrow().is_empty()
             && self.generic_jobs.borrow().is_empty()
-            && self.clock_jobs.borrow().is_empty()
+    }
+
+    fn admit_detached_jobs(&self) {
+        let jobs = mem::take(&mut *self.async_jobs.borrow_mut());
+        let mut contextual = self.async_jobs.borrow_mut();
+        for job in jobs {
+            match job.into_detached() {
+                Ok(future) => {
+                    self.detached_jobs.borrow_mut().insert(future);
+                }
+                Err(job) => contextual.push_back(job),
+            }
+        }
+    }
+
+    async fn next_detached_job(&self) -> Option<NativeJob> {
+        future::poll_fn(|cx| {
+            let mut jobs = self.detached_jobs.borrow_mut();
+            Stream::poll_next(Pin::new(&mut *jobs), cx)
+        })
+        .await
     }
 }
 
@@ -1005,6 +1129,30 @@ impl JobExecutor for SimpleJobExecutor {
         )
     }
 
+    fn run_jobs_until_stalled(self: Rc<Self>, context: &mut Context) -> JsResult<JobRunStatus> {
+        self.admit_detached_jobs();
+        if !self.async_jobs.borrow().is_empty()
+            || !self.finalization_registry_jobs.borrow().is_empty()
+        {
+            self.run_jobs(context)?;
+            return Ok(JobRunStatus::Complete);
+        }
+
+        let context = RefCell::new(context);
+        if let Some(result) = future::block_on(future::poll_once(
+            self.clone()
+                .run_jobs_async_impl(&context, AsyncWaitMode::UntilStalled),
+        )) {
+            result?;
+        }
+
+        Ok(if self.is_empty() {
+            JobRunStatus::Complete
+        } else {
+            JobRunStatus::Pending
+        })
+    }
+
     fn set_profiling_enabled(&self, enabled: bool) {
         self.profiling_enabled.set(enabled);
         if !enabled {
@@ -1031,6 +1179,9 @@ impl JobExecutor for SimpleJobExecutor {
 enum AsyncWaitMode {
     /// Yield to an embedding-owned executor after every scheduler pass.
     Cooperative,
+    /// Continue through immediately runnable work, then yield while detached
+    /// futures are waiting on an external event.
+    UntilStalled,
     /// Park the calling thread on the async future group's registered waker
     /// when no newly queued JavaScript work can run.
     ParkWhenIdle,
@@ -1050,6 +1201,7 @@ impl SimpleJobExecutor {
         let mut group = FutureGroup::new();
         let mut fr_group = FutureGroup::new();
         loop {
+            let mut contextual_deferred = false;
             if profiling {
                 self.metrics.borrow_mut().scheduler_iterations += 1;
             }
@@ -1064,11 +1216,29 @@ impl SimpleJobExecutor {
                 self.metrics.borrow_mut().async_jobs += async_jobs.len();
             }
             for job in async_jobs {
-                group.insert(job.call(context));
+                match job.into_detached() {
+                    Ok(future) => {
+                        self.detached_jobs.borrow_mut().insert(future);
+                    }
+                    Err(job) => {
+                        if wait_mode == AsyncWaitMode::UntilStalled {
+                            self.async_jobs.borrow_mut().push_back(job);
+                            contextual_deferred = true;
+                        } else {
+                            group.insert(job.call(context));
+                        }
+                    }
+                }
             }
 
-            for job in mem::take(&mut *self.finalization_registry_jobs.borrow_mut()) {
-                fr_group.insert(job.call(context));
+            if wait_mode == AsyncWaitMode::UntilStalled
+                && !self.finalization_registry_jobs.borrow().is_empty()
+            {
+                contextual_deferred = true;
+            } else {
+                for job in mem::take(&mut *self.finalization_registry_jobs.borrow_mut()) {
+                    fr_group.insert(job.call(context));
+                }
             }
 
             // Dispatch all past-due timeout jobs before the termination check.
@@ -1127,7 +1297,30 @@ impl SimpleJobExecutor {
                 }
             }
 
-            if self.is_empty() && group.is_empty() {
+            let detached_jobs_pending = !self.detached_jobs.borrow().is_empty();
+            let detached_poll_start =
+                (profiling && detached_jobs_pending).then(ProfileInstant::now);
+            let detached_result = if detached_jobs_pending {
+                let completion = future::poll_once(self.next_detached_job()).await.flatten();
+                completion.map(|completion| completion.call(&mut context.borrow_mut()))
+            } else {
+                None
+            };
+            if let Some(started) = detached_poll_start {
+                let mut metrics = self.metrics.borrow_mut();
+                metrics.async_polls += 1;
+                metrics.async_poll_time += started.elapsed();
+                metrics.async_completions += usize::from(detached_result.is_some());
+            }
+            if let Some(Err(err)) = detached_result {
+                self.clear();
+                return Err(err);
+            }
+
+            if self.queued_jobs_empty()
+                && group.is_empty()
+                && self.detached_jobs.borrow().is_empty()
+            {
                 match future::poll_once(fr_group.next()).await.flatten() {
                     Some(Err(err)) => {
                         self.clear();
@@ -1184,9 +1377,27 @@ impl SimpleJobExecutor {
             }
             context.borrow_mut().clear_kept_objects();
 
-            if wait_mode == AsyncWaitMode::ParkWhenIdle && self.is_empty() && !group.is_empty() {
+            let detached_jobs_pending = !self.detached_jobs.borrow().is_empty();
+            if wait_mode == AsyncWaitMode::ParkWhenIdle
+                && self.queued_jobs_empty()
+                && (!group.is_empty() || detached_jobs_pending)
+            {
                 let wait_start = profiling.then(ProfileInstant::now);
-                let async_result = group.next().await;
+                let async_result = match (group.is_empty(), detached_jobs_pending) {
+                    (false, true) => {
+                        let detached = async {
+                            let completion = self.next_detached_job().await?;
+                            Some(completion.call(&mut context.borrow_mut()))
+                        };
+                        future::or(group.next(), detached).await
+                    }
+                    (false, false) => group.next().await,
+                    (true, true) => {
+                        let completion = self.next_detached_job().await;
+                        completion.map(|job| job.call(&mut context.borrow_mut()))
+                    }
+                    (true, false) => None,
+                };
                 if let Some(started) = wait_start {
                     let mut metrics = self.metrics.borrow_mut();
                     metrics.async_waits += 1;
@@ -1197,6 +1408,15 @@ impl SimpleJobExecutor {
                     self.clear();
                     return Err(err);
                 }
+            } else if wait_mode == AsyncWaitMode::UntilStalled {
+                if contextual_deferred || self.immediate_jobs_empty() {
+                    future::yield_now().await;
+                }
+            } else if wait_mode == AsyncWaitMode::Cooperative
+                && self.queued_jobs_empty()
+                && group.is_empty()
+                && self.detached_jobs.borrow().is_empty()
+            {
             } else {
                 future::yield_now().await;
             }

@@ -916,6 +916,103 @@ fn into_js_module() {
 }
 
 #[test]
+fn detached_module_load_survives_non_blocking_job_drains() {
+    use boa_engine::{
+        Context, JsResult, JsValue, Module, Source,
+        builtins::promise::PromiseState,
+        job::JobRunStatus,
+        module::{ModuleLoadJob, ModuleLoader, ModuleRequest, Referrer},
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Poll, Waker};
+
+    struct DelayedLoader {
+        ready: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl ModuleLoader for DelayedLoader {
+        fn load_imported_module_job(
+            self: Rc<Self>,
+            _referrer: Referrer,
+            _request: ModuleRequest,
+            _context: &mut Context,
+        ) -> Option<ModuleLoadJob> {
+            let ready = Arc::clone(&self.ready);
+            let waker = Arc::clone(&self.waker);
+            let transport = std::future::poll_fn(move |cx| {
+                if ready.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    *waker.lock().expect("module transport waker") = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            });
+            Some(ModuleLoadJob::new(transport, |(), context| {
+                Module::parse(
+                    Source::from_bytes(b"export const value = 42;"),
+                    None,
+                    context,
+                )
+            }))
+        }
+
+        async fn load_imported_module(
+            self: Rc<Self>,
+            _referrer: Referrer,
+            _request: ModuleRequest,
+            _context: &RefCell<&mut Context>,
+        ) -> JsResult<Module> {
+            panic!("detached module loads must not use the borrowing fallback")
+        }
+    }
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let waker = Arc::new(Mutex::new(None));
+    let loader = Rc::new(DelayedLoader {
+        ready: Arc::clone(&ready),
+        waker: Arc::clone(&waker),
+    });
+    let mut context = Context::builder()
+        .module_loader(loader)
+        .build()
+        .expect("build context");
+    let root = Module::parse(
+        Source::from_bytes(b"import { value } from 'dep'; export default value;"),
+        None,
+        &mut context,
+    )
+    .expect("parse root module");
+    let evaluation = root.load_link_evaluate(&mut context);
+
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("start module transport"),
+        JobRunStatus::Pending
+    );
+    assert_eq!(evaluation.state(), PromiseState::Pending);
+
+    ready.store(true, Ordering::Release);
+    if let Some(waker) = waker.lock().expect("module transport waker").take() {
+        waker.wake();
+    }
+    assert_eq!(
+        context
+            .run_jobs_until_stalled()
+            .expect("complete module transport"),
+        JobRunStatus::Complete
+    );
+    assert_eq!(
+        evaluation.state(),
+        PromiseState::Fulfilled(JsValue::undefined())
+    );
+}
+
+#[test]
 fn can_throw_exception() {
     use boa_engine::{
         Context, IntoJsFunctionCopied, JsError, JsResult, JsValue, Module, Source, js_string,

@@ -22,7 +22,7 @@ use crate::vm::{CodeBlock, RuntimeLimits, create_function_object_fast};
 use crate::{
     HostDefined, JsNativeError, JsResult, JsString, JsValue, Source, builtins,
     class::{Class, ClassBuilder},
-    job::{JobExecutor, JobExecutorMetrics, SimpleJobExecutor},
+    job::{JobExecutor, JobExecutorMetrics, JobRunStatus, SimpleJobExecutor},
     js_string,
     module::{IdleModuleLoader, ModuleLoader, SimpleModuleLoader},
     native_function::NativeFunction,
@@ -616,6 +616,15 @@ impl Context {
     #[inline]
     pub fn run_jobs(&mut self) -> JsResult<()> {
         self.job_executor().run_jobs(self)
+    }
+
+    /// Runs queued jobs without waiting for context-independent host futures.
+    ///
+    /// Pending detached jobs remain owned by the executor and can be resumed
+    /// by calling this method again from the host event loop.
+    #[inline]
+    pub fn run_jobs_until_stalled(&mut self) -> JsResult<JobRunStatus> {
+        self.job_executor().run_jobs_until_stalled(self)
     }
 
     /// Enable or disable opt-in measurements in the active job executor.

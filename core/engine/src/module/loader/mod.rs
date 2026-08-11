@@ -1,7 +1,10 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context as TaskContext, Poll};
+use std::{fmt, future::Future};
 
 use dynify::dynify;
 use rustc_hash::FxHashMap;
@@ -119,6 +122,66 @@ pub enum Referrer {
     Script(Script),
 }
 
+#[doc(hidden)]
+pub struct ModuleLoadCompletion(ModuleLoadCallback);
+
+type ModuleLoadCallback = Box<dyn FnOnce(&mut Context) -> JsResult<Module>>;
+
+impl fmt::Debug for ModuleLoadCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleLoadCompletion")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModuleLoadCompletion {
+    pub(crate) fn call(self, context: &mut Context) -> JsResult<Module> {
+        (self.0)(context)
+    }
+}
+
+/// A module load whose pending transport does not borrow the JavaScript
+/// context.
+///
+/// The transport future can remain pending across host event-loop turns. Once
+/// it completes, Boa invokes the completion callback with exclusive context
+/// access so parsing and module-record construction remain realm-local.
+pub struct ModuleLoadJob {
+    inner: Pin<Box<dyn Future<Output = ModuleLoadCompletion>>>,
+}
+
+impl fmt::Debug for ModuleLoadJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleLoadJob").finish_non_exhaustive()
+    }
+}
+
+impl ModuleLoadJob {
+    /// Split a module load into context-independent transport and a realm-local
+    /// completion.
+    pub fn new<F, T, C>(future: F, complete: C) -> Self
+    where
+        F: Future<Output = T> + 'static,
+        C: FnOnce(T, &mut Context) -> JsResult<Module> + 'static,
+        T: 'static,
+    {
+        Self {
+            inner: Box::pin(async move {
+                let output = future.await;
+                ModuleLoadCompletion(Box::new(move |context| complete(output, context)))
+            }),
+        }
+    }
+}
+
+impl Future for ModuleLoadJob {
+    type Output = ModuleLoadCompletion;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
 impl Referrer {
     /// Gets the path of the referrer, if it has one.
     #[must_use]
@@ -146,6 +209,22 @@ impl From<ActiveRunnable> for Referrer {
 /// `import.meta` requests.
 #[dynify]
 pub trait ModuleLoader: Any {
+    /// Start a context-independent module load when the host can separate
+    /// transport from realm-local completion.
+    ///
+    /// Returning `None` preserves the borrowing [`ModuleLoader::load_imported_module`]
+    /// path. Hosts should return a job only when its pending future owns no
+    /// reference to `context`.
+    #[allow(unused_variables)]
+    fn load_imported_module_job(
+        self: Rc<Self>,
+        referrer: Referrer,
+        request: ModuleRequest,
+        context: &mut Context,
+    ) -> Option<ModuleLoadJob> {
+        None
+    }
+
     /// Host hook [`HostLoadImportedModule ( referrer, specifier, hostDefined, payload )`][spec].
     ///
     /// This hook allows to customize the module loading functionality of the engine. Technically,
