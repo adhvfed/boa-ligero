@@ -39,6 +39,7 @@ fn indexed_storage_type(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsRes
         IndexProperties::DenseI32(_) => "DenseI32",
         IndexProperties::DenseF64(_) => "DenseF64",
         IndexProperties::DenseElement(_) => "DenseElement",
+        IndexProperties::DenseReadOnlyElement(_) => "DenseReadOnlyElement",
         IndexProperties::SparseElement(_) => "SparseElement",
         IndexProperties::SparseProperty(_) => "SparseProperty",
     };
