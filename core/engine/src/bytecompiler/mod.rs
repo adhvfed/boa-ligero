@@ -3116,6 +3116,8 @@ impl<'ctx> ByteCompiler<'ctx> {
             debug_id: CodeBlock::get_next_codeblock_id(),
             #[cfg(feature = "jit")]
             jit_tiering: Cell::new(crate::vm::JitTieringCache::default()),
+            #[cfg(feature = "jit")]
+            jit_leaf_entry: Cell::new(crate::vm::JitLeafEntryCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         }

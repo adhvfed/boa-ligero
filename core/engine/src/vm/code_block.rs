@@ -38,6 +38,19 @@ pub(crate) struct JitTieringCache {
     loop_backedges: u32,
 }
 
+/// Production-mode native entry prepared for a small call-free function.
+///
+/// The entry belongs to exactly one backend generation. The function pointer
+/// may outlive that backend inside the code block, but it is never returned
+/// once another generation is active, so retired executable memory cannot be
+/// entered through this cache.
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JitLeafEntryCache {
+    backend_id: u64,
+    entry: Option<extern "C" fn(*mut Context) -> u64>,
+}
+
 #[cfg(feature = "jit")]
 impl JitTieringCache {
     const fn scoped(self, backend_id: u64) -> Self {
@@ -256,6 +269,12 @@ pub struct CodeBlock {
     #[unsafe_ignore_trace]
     pub(crate) jit_tiering: Cell<JitTieringCache>,
 
+    /// Native entry used only when generated code calls a prepared denied
+    /// leaf. Interpreter callers retain the cheaper direct interpreter path.
+    #[cfg(feature = "jit")]
+    #[unsafe_ignore_trace]
+    pub(crate) jit_leaf_entry: Cell<JitLeafEntryCache>,
+
     #[cfg(feature = "trace")]
     #[unsafe_ignore_trace]
     pub(crate) traced: Cell<bool>,
@@ -292,6 +311,8 @@ impl CodeBlock {
             debug_id: CodeBlock::get_next_codeblock_id(),
             #[cfg(feature = "jit")]
             jit_tiering: Cell::new(JitTieringCache::default()),
+            #[cfg(feature = "jit")]
+            jit_leaf_entry: Cell::new(JitLeafEntryCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         }
@@ -389,6 +410,31 @@ impl CodeBlock {
     pub(crate) fn set_jit_admission(&self, backend_id: u64, state: JitAdmissionState) {
         self.jit_tiering
             .set(self.jit_tiering.get().with_state(backend_id, state));
+    }
+
+    /// Return the production-mode native entry prepared by `backend_id`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_leaf_entry(
+        &self,
+        backend_id: u64,
+    ) -> Option<extern "C" fn(*mut Context) -> u64> {
+        let cached = self.jit_leaf_entry.get();
+        (cached.backend_id == backend_id)
+            .then_some(cached.entry)
+            .flatten()
+    }
+
+    /// Publish a native leaf entry for one live backend generation.
+    #[cfg(feature = "jit")]
+    pub(crate) fn set_jit_leaf_entry(
+        &self,
+        backend_id: u64,
+        entry: extern "C" fn(*mut Context) -> u64,
+    ) {
+        self.jit_leaf_entry.set(JitLeafEntryCache {
+            backend_id,
+            entry: Some(entry),
+        });
     }
 
     /// Return function-entry and loop-backedge hotness for one backend

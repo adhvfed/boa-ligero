@@ -4679,6 +4679,67 @@ extern "C" fn jit_strict_eq(context: *mut Context, lhs: u32, rhs: u32) -> i32 {
     )
 }
 
+/// Enter a prepared call-free leaf from an already-native caller.
+///
+/// `None` leaves the callee frame installed for interpreter completion after
+/// an entry guard or arithmetic deopt. Every `Some` value is the final status
+/// the ordinary-call helper must return to generated code.
+fn call_prepared_leaf(
+    context: &mut Context,
+    caller_depth: usize,
+    caller_code_id: u64,
+    continuation_pc: u32,
+) -> Option<u64> {
+    if context.instruction_budget_remaining().is_some()
+        || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        || context.active_jit_observes_interpreted_sites
+    {
+        return None;
+    }
+    let entry = context
+        .vm
+        .frame()
+        .code_block
+        .jit_leaf_entry(context.active_jit_backend_id)?;
+    let status = entry(std::ptr::from_mut(context));
+    if status & JIT_BREAK_BIT != 0 {
+        return Some(status);
+    }
+
+    match JitExit::decode(status) {
+        Some(JitExit {
+            kind: JitExitKind::Return,
+            reason: JitExitReason::Return,
+            ..
+        }) if context.vm.frames.len() == caller_depth
+            && context.vm.frame().code_block.debug_id == caller_code_id
+            && context.vm.frame().pc == continuation_pc =>
+        {
+            context
+                .vm
+                .record_native_leaf_entry(context.active_jit_backend_id);
+            Some(0)
+        }
+        Some(JitExit {
+            kind: JitExitKind::Deopt | JitExitKind::EntryRejected,
+            ..
+        }) => None,
+        _ => {
+            let mut error =
+                crate::error::PanicError::new("invalid prepared JIT leaf continuation metadata")
+                    .into();
+            context.capture_error_backtrace(&mut error);
+            Some(jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Completion,
+                JitExitReason::Unknown,
+                continuation_pc,
+            ))
+        }
+    }
+}
+
 extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
@@ -4724,45 +4785,55 @@ extern "C" fn jit_call_ordinary(context: *mut Context, argument_count: u32) -> u
 
     match call.resolve(context) {
         Ok(true) => 0,
-        Ok(false) => match context.run_interpreter_until_frame_depth(caller_depth) {
-            std::ops::ControlFlow::Continue(())
-                if context.vm.frames.len() == caller_depth
-                    && context.vm.frame().code_block.debug_id == caller_code_id
-                    && context.vm.frame().pc == continuation_pc =>
+        Ok(false) => {
+            if let Some(status) =
+                call_prepared_leaf(context, caller_depth, caller_code_id, continuation_pc)
             {
-                0
+                return status;
             }
-            std::ops::ControlFlow::Continue(())
-                if context.vm.frames.len() < caller_depth && !context.vm.frames.is_empty() =>
-            {
-                JitExit::encode_with_reason(
-                    JitExitKind::Call,
-                    JitExitReason::Scheduler,
-                    context.vm.frame().pc,
-                )
-            }
-            std::ops::ControlFlow::Continue(()) => {
-                let mut error = crate::error::PanicError::new(
-                    "invalid JIT ordinary-call continuation metadata",
-                )
-                .into();
-                context.capture_error_backtrace(&mut error);
-                jit_break(
+
+            // An unprepared leaf or a native entry guard/deopt completes in
+            // the interpreter from the current callee frame.
+            match context.run_interpreter_until_frame_depth(caller_depth) {
+                std::ops::ControlFlow::Continue(())
+                    if context.vm.frames.len() == caller_depth
+                        && context.vm.frame().code_block.debug_id == caller_code_id
+                        && context.vm.frame().pc == continuation_pc =>
+                {
+                    0
+                }
+                std::ops::ControlFlow::Continue(())
+                    if context.vm.frames.len() < caller_depth && !context.vm.frames.is_empty() =>
+                {
+                    JitExit::encode_with_reason(
+                        JitExitKind::Call,
+                        JitExitReason::Scheduler,
+                        context.vm.frame().pc,
+                    )
+                }
+                std::ops::ControlFlow::Continue(()) => {
+                    let mut error = crate::error::PanicError::new(
+                        "invalid JIT ordinary-call continuation metadata",
+                    )
+                    .into();
+                    context.capture_error_backtrace(&mut error);
+                    jit_break(
+                        context,
+                        crate::vm::CompletionRecord::Throw(error),
+                        JitExitKind::Completion,
+                        JitExitReason::Unknown,
+                        continuation_pc,
+                    )
+                }
+                std::ops::ControlFlow::Break(record) => jit_break(
                     context,
-                    crate::vm::CompletionRecord::Throw(error),
+                    record,
                     JitExitKind::Completion,
-                    JitExitReason::Unknown,
+                    JitExitReason::Exception,
                     continuation_pc,
-                )
+                ),
             }
-            std::ops::ControlFlow::Break(record) => jit_break(
-                context,
-                record,
-                JitExitKind::Completion,
-                JitExitReason::Exception,
-                continuation_pc,
-            ),
-        },
+        }
         Err(mut error) => {
             context.capture_error_backtrace(&mut error);
             let pc = context.vm.frame().pc;

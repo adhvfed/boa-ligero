@@ -194,6 +194,9 @@ pub struct JitStats {
     pub dormant_loop_frames: u64,
     /// Number of native baseline entries invoked.
     pub native_entries: u64,
+    /// Number of prepared call-free entries invoked directly from native
+    /// callers without returning to interpreter dispatch.
+    pub native_leaf_entries: u64,
     /// Number of native entries that returned to the interpreter.
     pub deopts: u64,
     /// Number of native call exits handed to the general VM scheduler.
@@ -1485,17 +1488,15 @@ impl Drop for JitBackend {
         // module is executing and that no pointer obtained from it is called
         // afterwards. Both hold for every `JitBackend`, by construction:
         //
-        // 1. No module-owned address escapes this type. The only pointers
-        //    `get_finalized_function` yields are stored in the private
-        //    `cache` (`CachedEntry::entry`) and `loop_cache`
-        //    (`LoopCachedEntry::compiled.entry`) maps, which this same
-        //    destructor drops. `JitBackend`'s entire public surface is
-        //    `new`, `stats`, `thresholds`, `set_thresholds`, and the three
-        //    diagnostic methods; none returns a code address, and `JitStats`
-        //    and `JitDiagnosticSnapshot` are counters and `(pc, kind, reason)`
-        //    exit records. Nothing durable — `CodeBlock` admission state,
-        //    diagnostic call observations (bytecode `debug_id`s, not addresses),
-        //    `vm.jit_pending`, `vm.jit_exit_pending` — holds a native address.
+        // 1. Every callable address remains scoped to this backend generation.
+        //    Most pointers stay in the private `cache` and `loop_cache`. A
+        //    prepared denied leaf also publishes its entry in the owning
+        //    `CodeBlock`, paired with this backend's unique generation ID.
+        //    The call helper reads that entry only while
+        //    `Context::active_jit_backend_id` exactly matches; `Context::run`
+        //    clears the ID before dropping or replacing this backend. The
+        //    stale, non-owning pointer can therefore remain in the code block
+        //    but can never be entered after its executable pages are freed.
         //
         // 2. Compiled code contains no cross-module or self-referential code
         //    pointers. Every call the lowering emits is an indirect call
@@ -1505,20 +1506,17 @@ impl Drop for JitBackend {
         //    objects. Each compiled body is therefore a leaf with respect to
         //    this module, and no other module can hold a reference into it.
         //
-        // 3. Nothing can be executing. A compiled entry is only ever called
-        //    from `invoke_cached_entry` and `invoke_loop_region`, both
-        //    `&mut self` methods, so the borrow checker keeps this value alive
-        //    and undroppable for the whole native call — including when a
-        //    shim re-enters the interpreter, calls an embedder host function,
-        //    or unwinds, since all of those pop the native frames before the
-        //    frame owning this backend. Native code receives only
-        //    `*mut Context`, and `Context::jit_backend` is `None` for the
-        //    entire duration of a native call (`Context::run` moves the
-        //    backend into a local before entering), so no re-entrant
-        //    `disable_jit`, `enable_jit`, or nested `Context::run` reachable
-        //    from that pointer can observe or drop the executing backend.
-        //    `Script::evaluate_jit` borrows a caller-owned backend `&mut` for
-        //    the same reason, and that backend is unreachable from `Context`.
+        // 3. Nothing can be executing. Root entries are called only from
+        //    `invoke_cached_entry` and `invoke_loop_region`, whose borrows keep
+        //    this value alive. Prepared leaves are called synchronously below
+        //    one of those root entries while the same backend remains in the
+        //    `Context::run` stack local. Native code receives only
+        //    `*mut Context`, and `Context::jit_backend` is `None` throughout;
+        //    nested `Context::run` clears the active generation token and
+        //    cannot reach a prepared entry. Thus re-entrant disable/enable,
+        //    host callbacks, deopts, and unwinds cannot drop the executing
+        //    backend. `Script::evaluate_jit` retains its caller-owned backend
+        //    borrow for the same duration and does not publish leaf entries.
         //
         // 4. Deopts and OSR continuations do not resume into freed code. Every
         //    exit is an ordinary `return` of a `u64` status; the interpreter
@@ -2481,6 +2479,30 @@ impl JitBackend {
             });
         }
         allowed
+    }
+
+    /// Compile a hot, call-free denied leaf for calls originating in native
+    /// code without changing its interpreter-entry admission decision.
+    ///
+    /// Entering a tiny native body from the interpreter does not amortize the
+    /// transition. A native caller has already paid that transition, however,
+    /// and can use the prepared entry to avoid dispatching the complete leaf
+    /// body through the VM. Keep the first implementation deliberately narrow:
+    /// runtime-accounted and diagnostic variants retain the scheduler path.
+    pub(crate) fn prepare_denied_leaf(&mut self, code: &CodeBlock, context: &Context) {
+        if code.jit_admission(self.id) != crate::vm::JitAdmissionState::DeniedLeaf
+            || context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+            || self.diagnostics.is_some()
+        {
+            return;
+        }
+
+        if let Some(cached) = self.cached_entry(code, false, false)
+            && cached.native
+        {
+            code.set_jit_leaf_entry(self.id, cached.entry);
+        }
     }
 
     /// Record a backward edge for tiering.
@@ -4626,7 +4648,7 @@ mod tests {
     }
 
     #[test]
-    fn context_owned_jit_suppresses_tiny_hot_function_entries() {
+    fn context_owned_jit_prepares_tiny_hot_function_for_native_callers() {
         let mut context = Context::default();
         context.enable_jit();
         let script = crate::Script::parse(
@@ -4644,8 +4666,67 @@ mod tests {
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.function_entries >= 2, "stats: {stats:?}");
         assert_eq!(stats.admission_denials, 1, "stats: {stats:?}");
-        assert_eq!(stats.compilations, 0, "stats: {stats:?}");
+        assert_eq!(stats.compilations, 1, "stats: {stats:?}");
+        assert_eq!(stats.native_compilations, 1, "stats: {stats:?}");
         assert_eq!(stats.native_entries, 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn native_caller_enters_prepared_tiny_leaf_without_interpreter_dispatch() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function leaf(value) { return value + 1; } function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = leaf(total); } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = hot(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(10));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 2, "stats: {stats:?}");
+        assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+
+        let native_leaf_entries = stats.native_leaf_entries;
+        context.set_instruction_budget(10_000);
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("hot(10)"))
+                .expect("evaluate budgeted call")
+                .as_i32(),
+            Some(10)
+        );
+        assert_eq!(
+            context
+                .jit_stats()
+                .expect("JIT was enabled")
+                .native_leaf_entries,
+            native_leaf_entries,
+            "an unmetered prepared entry must not run under an instruction budget"
+        );
+
+        context.clear_instruction_budget();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("hot(10)"))
+                .expect("evaluate diagnostic call")
+                .as_i32(),
+            Some(10)
+        );
+        assert_eq!(
+            context
+                .jit_stats()
+                .expect("JIT was enabled")
+                .native_leaf_entries,
+            native_leaf_entries,
+            "an uninstrumented prepared entry must not run under diagnostics"
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub(crate) use call_frame::BindingReference;
 
 pub(crate) use code_block::GlobalFunctionBinding;
 #[cfg(feature = "jit")]
-pub(crate) use code_block::{JitAdmissionState, JitTieringCache};
+pub(crate) use code_block::{JitAdmissionState, JitLeafEntryCache, JitTieringCache};
 
 mod call_frame;
 mod code_block;
@@ -133,6 +133,14 @@ pub struct Vm {
     /// payload crossing the generated-code ABI.
     #[cfg(feature = "jit")]
     pub(crate) jit_exit_pending: Option<crate::jit::JitExit>,
+
+    /// Backend generation owning `jit_native_leaf_entries`.
+    #[cfg(feature = "jit")]
+    jit_native_leaf_backend_id: u64,
+
+    /// Prepared leaf entries reached directly from native callers.
+    #[cfg(feature = "jit")]
+    jit_native_leaf_entries: u64,
 
     /// Per-entry scratch counters updated only by diagnostic native helper
     /// variants and merged into the owning backend immediately after return.
@@ -498,11 +506,33 @@ impl Vm {
             #[cfg(feature = "jit")]
             jit_exit_pending: None,
             #[cfg(feature = "jit")]
+            jit_native_leaf_backend_id: 0,
+            #[cfg(feature = "jit")]
+            jit_native_leaf_entries: 0,
+            #[cfg(feature = "jit")]
             jit_native_storage: crate::jit::JitNativeStorageRecord::default(),
             #[cfg(feature = "trace")]
             trace: false,
             #[cfg(feature = "trace")]
             current_frame: None,
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn record_native_leaf_entry(&mut self, backend_id: u64) {
+        if self.jit_native_leaf_backend_id != backend_id {
+            self.jit_native_leaf_backend_id = backend_id;
+            self.jit_native_leaf_entries = 0;
+        }
+        self.jit_native_leaf_entries = self.jit_native_leaf_entries.saturating_add(1);
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn native_leaf_entries(&self, backend_id: u64) -> u64 {
+        if self.jit_native_leaf_backend_id == backend_id {
+            self.jit_native_leaf_entries
+        } else {
+            0
         }
     }
 
@@ -1550,6 +1580,7 @@ impl Context {
                 if backend.is_hot(&code) {
                     self.vm.frame_mut().mark_jit_entry_attempted();
                     if !backend.admit_function_entry(&code) {
+                        backend.prepare_denied_leaf(&code, self);
                         continue;
                     }
                     let Some(status) = backend.invoke_cached_entry(&code, self) else {

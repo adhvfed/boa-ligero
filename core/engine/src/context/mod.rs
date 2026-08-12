@@ -235,7 +235,14 @@ impl Context {
     #[cfg(feature = "jit")]
     #[must_use]
     pub fn jit_stats(&self) -> Option<crate::jit::JitStats> {
-        self.jit_backend.as_ref().map(crate::jit::JitBackend::stats)
+        self.jit_backend.as_ref().map(|backend| {
+            let mut stats = backend.stats();
+            stats.native_leaf_entries = self.vm.native_leaf_entries(backend.id());
+            stats.native_entries = stats
+                .native_entries
+                .saturating_add(stats.native_leaf_entries);
+            stats
+        })
     }
 
     /// Enable bounded, detailed diagnostics for the experimental JIT tier.
