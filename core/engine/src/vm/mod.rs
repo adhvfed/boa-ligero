@@ -1555,6 +1555,7 @@ impl Context {
                 frame.code_block.jit_admission(backend.id()),
                 JitAdmissionState::Denied
                     | JitAdmissionState::DeniedLeaf
+                    | JitAdmissionState::DeniedSmall
                     | JitAdmissionState::DeniedNoLoop
             );
             let entry_code = if frame.jit_entry_counted() {
@@ -1580,7 +1581,7 @@ impl Context {
                 if backend.is_hot(&code) {
                     self.vm.frame_mut().mark_jit_entry_attempted();
                     if !backend.admit_function_entry(&code) {
-                        backend.prepare_denied_leaf(&code, self);
+                        backend.prepare_call_free_entry(&code, self);
                         continue;
                     }
                     let Some(status) = backend.invoke_cached_entry(&code, self) else {

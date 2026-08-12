@@ -68,6 +68,17 @@ const JIT_EXIT_KIND_MASK: u64 = 0xff;
 const JIT_EXIT_REASON_SHIFT: u32 = 8;
 const JIT_EXIT_PC_SHIFT: u32 = 16;
 
+/// Enter a prepared call-free callee and validate its return against the
+/// interpreter caller that installed its frame.
+pub(crate) fn call_prepared_leaf(
+    context: &mut Context,
+    caller_depth: usize,
+    caller_code_id: u64,
+    continuation_pc: u32,
+) -> Option<u64> {
+    native::call_prepared_leaf(context, caller_depth, caller_code_id, continuation_pc)
+}
+
 /// Kinds of exits from generated code.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2370,6 +2381,7 @@ impl JitBackend {
             JitAdmissionState::Allowed => return true,
             JitAdmissionState::Denied
             | JitAdmissionState::DeniedLeaf
+            | JitAdmissionState::DeniedSmall
             | JitAdmissionState::DeniedNoLoop => return false,
             JitAdmissionState::Unknown => {}
         }
@@ -2396,9 +2408,12 @@ impl JitBackend {
                 )
             }
             Ok(profile) => {
-                let state = if profile.call_instructions == 0 && profile.property_instructions == 0
-                {
-                    JitAdmissionState::DeniedLeaf
+                let state = if profile.call_instructions == 0 {
+                    if profile.property_instructions == 0 {
+                        JitAdmissionState::DeniedLeaf
+                    } else {
+                        JitAdmissionState::DeniedSmall
+                    }
                 } else {
                     JitAdmissionState::Denied
                 };
@@ -2481,17 +2496,18 @@ impl JitBackend {
         allowed
     }
 
-    /// Compile a hot, call-free denied leaf for calls originating in native
-    /// code without changing its interpreter-entry admission decision.
+    /// Compile a hot, call-free denied body without changing its ordinary
+    /// function-entry admission decision.
     ///
-    /// Entering a tiny native body from the interpreter does not amortize the
-    /// transition. A native caller has already paid that transition, however,
-    /// and can use the prepared entry to avoid dispatching the complete leaf
-    /// body through the VM. Keep the first implementation deliberately narrow:
-    /// runtime-accounted and diagnostic variants retain the scheduler path.
-    pub(crate) fn prepare_denied_leaf(&mut self, code: &CodeBlock, context: &Context) {
-        if code.jit_admission(self.id) != crate::vm::JitAdmissionState::DeniedLeaf
-            || context.instruction_budget_remaining().is_some()
+    /// Tiny arithmetic leaves are entered only by native callers. Small
+    /// property bodies may also amortize entry from an interpreter caller, so
+    /// the call opcode can use the same prepared entry for `DeniedSmall`.
+    /// Runtime-accounted and diagnostic variants retain the scheduler path.
+    pub(crate) fn prepare_call_free_entry(&mut self, code: &CodeBlock, context: &Context) {
+        if !matches!(
+            code.jit_admission(self.id),
+            crate::vm::JitAdmissionState::DeniedLeaf | crate::vm::JitAdmissionState::DeniedSmall
+        ) || context.instruction_budget_remaining().is_some()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
             || self.diagnostics.is_some()
         {
@@ -4730,6 +4746,46 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_caller_enters_prepared_small_property_reader() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function read(object) { return object.x + object.y + object.z; } const object = { x: 1, y: 2, z: 3 }; function main() { let total = 0; for (let index = 0; index < 100; index++) { total += read(object); } return total; } main()",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(600));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
+        assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+
+        let native_leaf_entries = stats.native_leaf_entries;
+        context.set_instruction_budget(100_000);
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("main()"))
+                .expect("evaluate budgeted property reader")
+                .as_i32(),
+            Some(600)
+        );
+        assert_eq!(
+            context
+                .jit_stats()
+                .expect("JIT was enabled")
+                .native_leaf_entries,
+            native_leaf_entries,
+            "the unmetered property entry must not run under an instruction budget"
+        );
+    }
+
+    #[test]
     fn denied_wrapper_still_schedules_eligible_callee() {
         let mut context = Context::default();
         context.enable_jit();
@@ -4769,10 +4825,11 @@ mod tests {
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+        assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
     }
 
     #[test]
-    fn denied_property_reader_with_getter_closes_impossible_loop_osr() {
+    fn prepared_property_reader_deopts_before_nested_getter() {
         let mut context = Context::default();
         context.enable_jit();
         context
@@ -4802,11 +4859,12 @@ mod tests {
         assert_eq!(result.as_i32(), Some(45));
         assert_eq!(
             read_code.jit_admission(backend_id),
-            crate::vm::JitAdmissionState::DeniedNoLoop
+            crate::vm::JitAdmissionState::DeniedSmall
         );
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.admission_denials >= 1, "stats: {stats:?}");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
     }
 
     #[test]

@@ -239,14 +239,41 @@ impl Call {
             return ControlFlow::Continue(());
         }
         let admission = context.vm.frame().code_block.jit_admission(backend_id);
+        let frame_depth = context.vm.frames.len();
+        if admission == crate::vm::JitAdmissionState::DeniedSmall {
+            let caller = &context.vm.frames[frame_depth - 2];
+            let caller_depth = frame_depth - 1;
+            let caller_code_id = caller.code_block.debug_id;
+            let continuation_pc = caller.pc;
+            context.vm.frame_mut().mark_jit_entry_counted();
+            context.vm.frame_mut().mark_jit_entry_attempted();
+            if let Some(status) = crate::jit::call_prepared_leaf(
+                context,
+                caller_depth,
+                caller_code_id,
+                continuation_pc,
+            ) {
+                if status & crate::jit::JIT_BREAK_BIT == 0 {
+                    debug_assert_eq!(status, 0);
+                    return ControlFlow::Continue(());
+                }
+                return ControlFlow::Break(
+                    context
+                        .vm
+                        .jit_pending
+                        .take()
+                        .expect("a prepared callee break must stash a completion record"),
+                );
+            }
+        }
         let may_run_directly = admission == crate::vm::JitAdmissionState::DeniedLeaf
+            || admission == crate::vm::JitAdmissionState::DeniedSmall
             || (admission == crate::vm::JitAdmissionState::DeniedNoLoop
                 && !context.active_jit_observes_interpreted_sites);
         if !may_run_directly {
             return ControlFlow::Continue(());
         }
 
-        let frame_depth = context.vm.frames.len();
         context.vm.frame_mut().mark_jit_entry_counted();
         context.vm.frame_mut().mark_jit_entry_attempted();
         context.run_interpreter_until_frame_change(frame_depth)

@@ -4684,7 +4684,7 @@ extern "C" fn jit_strict_eq(context: *mut Context, lhs: u32, rhs: u32) -> i32 {
 /// `None` leaves the callee frame installed for interpreter completion after
 /// an entry guard or arithmetic deopt. Every `Some` value is the final status
 /// the ordinary-call helper must return to generated code.
-fn call_prepared_leaf(
+pub(super) fn call_prepared_leaf(
     context: &mut Context,
     caller_depth: usize,
     caller_code_id: u64,

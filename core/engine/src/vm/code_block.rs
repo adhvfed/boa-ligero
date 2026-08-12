@@ -25,6 +25,9 @@ pub(crate) enum JitAdmissionState {
     Allowed,
     Denied,
     DeniedLeaf,
+    /// Native-eligible straight-line code that is too small for ordinary
+    /// interpreter entry but contains property helpers and may re-enter.
+    DeniedSmall,
     /// Native entry is denied and static bytecode contains no backward edge,
     /// so this frame can never become eligible for loop OSR.
     DeniedNoLoop,
@@ -73,7 +76,8 @@ impl JitTieringCache {
             1 => JitAdmissionState::Allowed,
             2 => JitAdmissionState::Denied,
             3 => JitAdmissionState::DeniedLeaf,
-            4 => JitAdmissionState::DeniedNoLoop,
+            4 => JitAdmissionState::DeniedSmall,
+            5 => JitAdmissionState::DeniedNoLoop,
             _ => JitAdmissionState::Unknown,
         }
     }
