@@ -4786,6 +4786,124 @@ mod tests {
     }
 
     #[test]
+    fn prepared_method_preserves_receiver_mutation_and_this_modes() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "class Counter { constructor() { this.value = 0; } increment(amount) { this.value = this.value + amount; return this.value; } } function strictThis() { 'use strict'; return this === undefined; } function sloppyThis() { return this === globalThis; } const counter = new Counter(); let last = 0; let strict = false; let sloppy = false; for (let index = 0; index < 80; index++) { last = counter.increment(1); strict = strictThis(); sloppy = sloppyThis(); }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("last"))
+                .expect("read last")
+                .as_i32(),
+            Some(80)
+        );
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("counter.value"))
+                .expect("read receiver")
+                .as_i32(),
+            Some(80)
+        );
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("strict"))
+                .expect("read strict this result")
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("sloppy"))
+                .expect("read sloppy this result")
+                .as_boolean(),
+            Some(true)
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
+
+        let native_leaf_entries = stats.native_leaf_entries;
+        context.set_instruction_budget(100_000);
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("counter.increment(1)"))
+                .expect("evaluate budgeted method call")
+                .as_i32(),
+            Some(81)
+        );
+        assert_eq!(
+            context
+                .jit_stats()
+                .expect("JIT was enabled")
+                .native_leaf_entries,
+            native_leaf_entries,
+            "an unmetered prepared method must not run under an instruction budget"
+        );
+    }
+
+    #[test]
+    fn prepared_property_writer_suspends_native_entry_for_setters() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context
+            .register_global_callable(
+                js_string!("probeNestedSetter"),
+                0,
+                NativeFunction::from_copy_closure(|_, _, context| {
+                    assert_eq!(context.active_jit_backend_id, 0);
+                    Ok(JsValue::new(45))
+                }),
+            )
+            .expect("register probe");
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function write(object, value) { object.value = value; return value; } let observed = 0; const object = { set value(value) { observed = probeNestedSetter(value); } }; let last = 0; for (let index = 0; index < 80; index++) { last = write(object, index); } last === 79 && observed === 45",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn native_boolean_values_remain_booleans_across_vm_boundaries() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function identity(value) { return value; } function compareAndStore(object, count) { let result = 0; for (let index = 0; index < count; index++) { const equal = object === object; object.value = equal; result = identity(equal); } return result; } const object = { value: false }; let answer = false; for (let index = 0; index < 80; index++) { answer = compareAndStore(object, 4); } typeof answer === 'boolean' && answer === true && typeof object.value === 'boolean' && object.value === true",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_boolean(), Some(true));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries > 0, "stats: {stats:?}");
+    }
+
+    #[test]
     fn denied_wrapper_still_schedules_eligible_callee() {
         let mut context = Context::default();
         context.enable_jit();
@@ -4877,7 +4995,7 @@ mod tests {
         });
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function sum(n) { this; let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } sum(10)",
+                "function sum(n) { typeof n; let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; } sum(10)",
             ),
             None,
             &mut context,

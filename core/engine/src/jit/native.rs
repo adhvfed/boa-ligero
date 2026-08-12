@@ -135,6 +135,7 @@ pub(super) fn loop_admission_profile(
                     | Instruction::GetPropertyByNameWithThis { .. }
                     | Instruction::GetPropertyByValue { .. }
                     | Instruction::GetPropertyByValuePush { .. }
+                    | Instruction::SetPropertyByName { .. }
             );
             if region_excluded || !is_supported(code, opcode, instruction) {
                 return Err(NativeRejection::new(
@@ -854,6 +855,7 @@ impl DecodedInstructions {
                     | Instruction::GetPropertyByNameWithThis { .. }
                     | Instruction::GetPropertyByValue { .. }
                     | Instruction::GetPropertyByValuePush { .. }
+                    | Instruction::SetPropertyByName { .. }
             ) {
                 profile.property_instructions = profile.property_instructions.saturating_add(1);
             }
@@ -1074,6 +1076,7 @@ fn i32_arithmetic_coercion(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegisterKind {
     Numeric,
+    Boolean,
     Boxed,
 }
 
@@ -1266,6 +1269,9 @@ fn register_uses(instruction: &Instruction) -> Vec<usize> {
             key,
             ..
         } => vec![register(*receiver), register(*object), register(*key)],
+        Instruction::SetPropertyByName { value, object, .. } => {
+            vec![register(*value), register(*object)]
+        }
         _ => Vec::new(),
     }
 }
@@ -1299,6 +1305,7 @@ fn object_operands(instruction: &Instruction) -> Vec<usize> {
         Instruction::StrictEq { lhs, rhs, .. } => {
             vec![usize::from(*lhs), usize::from(*rhs)]
         }
+        Instruction::SetPropertyByName { object, .. } => vec![usize::from(*object)],
         _ => Vec::new(),
     }
 }
@@ -1354,6 +1361,7 @@ fn output_definition(
     definitions: &[RegisterDefinition],
 ) -> Option<(usize, Option<usize>, RegisterKind)> {
     let numeric = |register: usize| (register, None, RegisterKind::Numeric);
+    let boolean = |register: usize| (register, None, RegisterKind::Boolean);
     let boxed = |register: usize| (register, None, RegisterKind::Boxed);
     let moved = |dst: usize, src: usize| {
         let kind = definitions
@@ -1363,6 +1371,7 @@ fn output_definition(
     };
 
     match instruction {
+        Instruction::This { dst } => Some(boxed(usize::from(*dst))),
         Instruction::GetArgument { dst, .. }
         | Instruction::GetName { dst, .. }
         | Instruction::GetNameGlobal { dst, .. }
@@ -1379,7 +1388,6 @@ fn output_definition(
         | Instruction::Mul { dst, .. }
         | Instruction::BitOr { dst, .. }
         | Instruction::BitXor { dst, .. }
-        | Instruction::StrictEq { dst, .. }
         | Instruction::Inc { dst, .. }
         | Instruction::PopIntoRegister { dst }
         | Instruction::GetPropertyByName { dst, .. }
@@ -1387,6 +1395,7 @@ fn output_definition(
         | Instruction::GetPropertyByNameWithThis { dst, .. }
         | Instruction::GetPropertyByValue { dst, .. }
         | Instruction::GetPropertyByValuePush { dst, .. } => Some(numeric(usize::from(*dst))),
+        Instruction::StrictEq { dst, .. } => Some(boolean(usize::from(*dst))),
         Instruction::Move { dst, src } => Some(moved(usize::from(*dst), usize::from(*src))),
         Instruction::GetFunction { dst, .. } | Instruction::StoreNewArray { dst } => {
             Some(boxed(usize::from(*dst)))
@@ -1421,7 +1430,8 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
             .bindings
             .get(usize::from(*binding_index))
             .is_some_and(|binding| binding.scope() == BindingLocatorScope::GlobalObject),
-        (Opcode::GetArgument, Instruction::GetArgument { .. })
+        (Opcode::This, Instruction::This { .. })
+        | (Opcode::GetArgument, Instruction::GetArgument { .. })
         | (Opcode::StoreZero, Instruction::StoreZero { .. })
         | (Opcode::StoreOne, Instruction::StoreOne { .. })
         | (Opcode::StoreInt8, Instruction::StoreInt8 { .. })
@@ -1434,6 +1444,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::GetPropertyByName, Instruction::GetPropertyByName { .. })
         | (Opcode::GetPropertyByNameWithThis, Instruction::GetPropertyByNameWithThis { .. })
         | (Opcode::GetPropertyByValue, Instruction::GetPropertyByValue { .. })
+        | (Opcode::SetPropertyByName, Instruction::SetPropertyByName { .. })
         | (Opcode::Call, Instruction::Call { .. })
         | (Opcode::Add, Instruction::Add { .. })
         | (Opcode::Sub, Instruction::Sub { .. })
@@ -1505,6 +1516,7 @@ struct Helpers {
     guard_argument_number: Helper,
     guard_stack_number: Helper,
     copy_argument_register: Helper,
+    copy_this_register: Helper,
     copy_register: Helper,
     get_register_i32: Helper,
     get_register_f64: Helper,
@@ -1523,15 +1535,22 @@ struct Helpers {
     bit_xor_f64: Helper,
     strict_eq: Helper,
     call_ordinary: Helper,
+    set_property_by_name: Helper,
     set_pc: Helper,
     store_i32_if_defined: Helper,
     store_f64_if_defined: Helper,
+    store_bool_i32_if_defined: Helper,
+    store_bool_f64_if_defined: Helper,
     push_i32: Helper,
     push_f64: Helper,
+    push_bool_i32: Helper,
+    push_bool_f64: Helper,
     pop_i32: Helper,
     pop_f64: Helper,
     set_return_i32: Helper,
     set_return_f64: Helper,
+    set_return_bool_i32: Helper,
+    set_return_bool_f64: Helper,
     increment_loop: Helper,
     handle_return: Helper,
     consume_instruction_budget: Helper,
@@ -1798,6 +1817,11 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::I32],
                 types::I64,
             ),
+            copy_this_register: make(
+                jit_copy_this_register as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
             copy_register: make(
                 jit_copy_register as *const () as usize,
                 &[ptr, types::I32, types::I32],
@@ -1916,6 +1940,11 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32],
                 types::I64,
             ),
+            set_property_by_name: make(
+                jit_set_property_by_name as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
             set_pc: make(
                 jit_set_pc as *const () as usize,
                 &[ptr, types::I32],
@@ -1931,6 +1960,16 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::F64, types::I32],
                 types::I64,
             ),
+            store_bool_i32_if_defined: make(
+                jit_store_bool_i32_if_defined as *const () as usize,
+                &[ptr, types::I32, types::I32, types::I32],
+                types::I64,
+            ),
+            store_bool_f64_if_defined: make(
+                jit_store_bool_f64_if_defined as *const () as usize,
+                &[ptr, types::I32, types::F64, types::I32],
+                types::I64,
+            ),
             push_i32: make(
                 jit_push_i32 as *const () as usize,
                 &[ptr, types::I32],
@@ -1938,6 +1977,16 @@ impl<'a> NativeCompiler<'a> {
             ),
             push_f64: make(
                 jit_push_f64 as *const () as usize,
+                &[ptr, types::F64],
+                types::I64,
+            ),
+            push_bool_i32: make(
+                jit_push_bool_i32 as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            push_bool_f64: make(
+                jit_push_bool_f64 as *const () as usize,
                 &[ptr, types::F64],
                 types::I64,
             ),
@@ -1950,6 +1999,16 @@ impl<'a> NativeCompiler<'a> {
             ),
             set_return_f64: make(
                 jit_set_return_f64 as *const () as usize,
+                &[ptr, types::F64],
+                types::I64,
+            ),
+            set_return_bool_i32: make(
+                jit_set_return_bool_i32 as *const () as usize,
+                &[ptr, types::I32],
+                types::I64,
+            ),
+            set_return_bool_f64: make(
+                jit_set_return_bool_f64 as *const () as usize,
                 &[ptr, types::F64],
                 types::I64,
             ),
@@ -2048,6 +2107,31 @@ impl<'a> NativeCompiler<'a> {
         let register = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
 
         match instruction {
+            Instruction::This { dst } => {
+                let dst = register(*dst);
+                if self.defined_register_kind(dst) != RegisterKind::Boxed
+                    || !self.emit_materialize_live_dirty_registers(bcx, ctx, helpers)
+                {
+                    return false;
+                }
+                self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.copy_this_register.address as i64);
+                let dst = bcx.ins().iconst(types::I32, dst as i64);
+                let status = bcx.ins().call_indirect(
+                    helpers.copy_this_register.signature,
+                    helper,
+                    &[ctx, dst],
+                );
+                let status = bcx.inst_results(status)[0];
+                let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+                let is_break = bcx.ins().band(status, break_mask);
+                let cont = bcx.create_block();
+                bcx.ins()
+                    .brif(is_break, break_block, &[status.into()], cont, &[]);
+                bcx.switch_to_block(cont);
+            }
             Instruction::GetName { dst, binding_index } => {
                 let dst = register(*dst);
                 let binding_index = bcx
@@ -2469,6 +2553,45 @@ impl<'a> NativeCompiler<'a> {
                     }
                 }
             }
+            Instruction::SetPropertyByName {
+                value,
+                object,
+                ic_index,
+            } => {
+                // The canonical setter reads its operands from the VM register
+                // file. The assigned value is commonly dead immediately after
+                // this instruction, so publish it in addition to the values
+                // that a re-entrant setter can observe after returning.
+                if !self.emit_materialize_live_dirty_registers_with(
+                    bcx,
+                    ctx,
+                    helpers,
+                    &[usize::from(*value)],
+                ) {
+                    return false;
+                }
+                self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                let helper = bcx
+                    .ins()
+                    .iconst(helpers.ptr, helpers.set_property_by_name.address as i64);
+                let value = bcx.ins().iconst(types::I32, usize::from(*value) as i64);
+                let object = bcx.ins().iconst(types::I32, usize::from(*object) as i64);
+                let ic_index = bcx
+                    .ins()
+                    .iconst(types::I32, i64::from(u32::from(*ic_index)));
+                let status = bcx.ins().call_indirect(
+                    helpers.set_property_by_name.signature,
+                    helper,
+                    &[ctx, value, object, ic_index],
+                );
+                let status = bcx.inst_results(status)[0];
+                let break_mask = bcx.ins().iconst(types::I64, JIT_BREAK_BIT as i64);
+                let is_break = bcx.ins().band(status, break_mask);
+                let cont = bcx.create_block();
+                bcx.ins()
+                    .brif(is_break, break_block, &[status.into()], cont, &[]);
+                bcx.switch_to_block(cont);
+            }
             Instruction::Call { argument_count } => {
                 // `function_call` can allocate, invoke host code, trigger GC,
                 // and execute nested frames. Publish dirty primitives that are
@@ -2847,10 +2970,12 @@ impl<'a> NativeCompiler<'a> {
                     let Some(value) = self.use_register(bcx, src) else {
                         return false;
                     };
-                    let helper = if self.mode == NativeMode::F64 {
-                        helpers.push_f64
-                    } else {
-                        helpers.push_i32
+                    let helper = match (self.register_kind(src), self.mode) {
+                        (RegisterKind::Numeric, NativeMode::I32) => helpers.push_i32,
+                        (RegisterKind::Numeric, NativeMode::F64) => helpers.push_f64,
+                        (RegisterKind::Boolean, NativeMode::I32) => helpers.push_bool_i32,
+                        (RegisterKind::Boolean, NativeMode::F64) => helpers.push_bool_f64,
+                        (RegisterKind::Boxed, _) => unreachable!("handled above"),
                     };
                     let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
                     bcx.ins()
@@ -2928,10 +3053,12 @@ impl<'a> NativeCompiler<'a> {
                     let Some(value) = self.use_register(bcx, src) else {
                         return false;
                     };
-                    let helper = if self.mode == NativeMode::F64 {
-                        helpers.set_return_f64
-                    } else {
-                        helpers.set_return_i32
+                    let helper = match (self.register_kind(src), self.mode) {
+                        (RegisterKind::Numeric, NativeMode::I32) => helpers.set_return_i32,
+                        (RegisterKind::Numeric, NativeMode::F64) => helpers.set_return_f64,
+                        (RegisterKind::Boolean, NativeMode::I32) => helpers.set_return_bool_i32,
+                        (RegisterKind::Boolean, NativeMode::F64) => helpers.set_return_bool_f64,
+                        (RegisterKind::Boxed, _) => unreachable!("handled above"),
                     };
                     let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
                     bcx.ins()
@@ -3225,10 +3352,31 @@ impl<'a> NativeCompiler<'a> {
         ctx: cranelift_codegen::ir::Value,
         helpers: &Helpers,
     ) -> bool {
+        self.emit_materialize_live_dirty_registers_with(bcx, ctx, helpers, &[])
+    }
+
+    /// Materialize live dirty primitives plus operands consumed by a helper.
+    ///
+    /// Helpers that implement the current bytecode read their operands from
+    /// the VM register file even when those values die at the instruction.
+    /// Re-entrant helpers additionally require all values live afterwards to
+    /// be visible to nested execution.
+    fn emit_materialize_live_dirty_registers_with(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+        required: &[usize],
+    ) -> bool {
         let Some(live_after) = self.analysis.live_after.get(self.current_instruction) else {
             return false;
         };
-        let registers: Vec<usize> = self.dirty.intersection(live_after).copied().collect();
+        let mut registers: Vec<usize> = self.dirty.intersection(live_after).copied().collect();
+        for &register in required {
+            if self.dirty.contains(&register) && !registers.contains(&register) {
+                registers.push(register);
+            }
+        }
         self.emit_materialize_registers(bcx, ctx, helpers, &registers)
     }
 
@@ -3246,10 +3394,12 @@ impl<'a> NativeCompiler<'a> {
             let Some(defined) = self.use_defined_flag(bcx, register) else {
                 return false;
             };
-            let helper = if self.mode == NativeMode::F64 {
-                helpers.store_f64_if_defined
-            } else {
-                helpers.store_i32_if_defined
+            let helper = match (self.register_kind(register), self.mode) {
+                (RegisterKind::Numeric, NativeMode::I32) => helpers.store_i32_if_defined,
+                (RegisterKind::Numeric, NativeMode::F64) => helpers.store_f64_if_defined,
+                (RegisterKind::Boolean, NativeMode::I32) => helpers.store_bool_i32_if_defined,
+                (RegisterKind::Boolean, NativeMode::F64) => helpers.store_bool_f64_if_defined,
+                (RegisterKind::Boxed, _) => return false,
             };
             let register_value = bcx.ins().iconst(types::I32, register as i64);
             let helper_address = bcx.ins().iconst(helpers.ptr, helper.address as i64);
@@ -4296,6 +4446,25 @@ extern "C" fn jit_copy_argument_register(context: *mut Context, index: u32, regi
     0
 }
 
+extern "C" fn jit_copy_this_register(context: *mut Context, register: u32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    match crate::vm::opcode::This::operation(register.into(), context) {
+        Ok(()) => 0,
+        Err(mut error) => {
+            context.capture_error_backtrace(&mut error);
+            let pc = context.vm.frame().pc;
+            jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Completion,
+                JitExitReason::Exception,
+                pc,
+            )
+        }
+    }
+}
+
 extern "C" fn jit_copy_register(context: *mut Context, dst: u32, src: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
@@ -4679,6 +4848,33 @@ extern "C" fn jit_strict_eq(context: *mut Context, lhs: u32, rhs: u32) -> i32 {
     )
 }
 
+extern "C" fn jit_set_property_by_name(
+    context: *mut Context,
+    value: u32,
+    object: u32,
+    ic_index: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    match crate::vm::opcode::SetPropertyByName::operation(
+        (value.into(), object.into(), ic_index.into()),
+        context,
+    ) {
+        Ok(()) => 0,
+        Err(mut error) => {
+            context.capture_error_backtrace(&mut error);
+            let pc = context.vm.frame().pc;
+            jit_break(
+                context,
+                crate::vm::CompletionRecord::Throw(error),
+                JitExitKind::Completion,
+                JitExitReason::Exception,
+                pc,
+            )
+        }
+    }
+}
+
 /// Enter a prepared call-free leaf from an already-native caller.
 ///
 /// `None` leaves the callee frame installed for interpreter completion after
@@ -4938,6 +5134,40 @@ extern "C" fn jit_store_f64_if_defined(
     0
 }
 
+extern "C" fn jit_store_bool_i32_if_defined(
+    context: *mut Context,
+    register: u32,
+    value: i32,
+    defined: u32,
+) -> u64 {
+    if defined == 0 {
+        return 0;
+    }
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .set_register(register as usize, JsValue::new(value != 0));
+    0
+}
+
+extern "C" fn jit_store_bool_f64_if_defined(
+    context: *mut Context,
+    register: u32,
+    value: f64,
+    defined: u32,
+) -> u64 {
+    if defined == 0 {
+        return 0;
+    }
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context
+        .vm
+        .set_register(register as usize, JsValue::new(value != 0.0));
+    0
+}
+
 extern "C" fn jit_push_i32(context: *mut Context, value: i32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
@@ -4949,6 +5179,20 @@ extern "C" fn jit_push_f64(context: *mut Context, value: f64) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     context.vm.stack.push(JsValue::new(value));
+    0
+}
+
+extern "C" fn jit_push_bool_i32(context: *mut Context, value: i32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.stack.push(JsValue::new(value != 0));
+    0
+}
+
+extern "C" fn jit_push_bool_f64(context: *mut Context, value: f64) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.stack.push(JsValue::new(value != 0.0));
     0
 }
 
@@ -4978,6 +5222,20 @@ extern "C" fn jit_set_return_f64(context: *mut Context, value: f64) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     context.vm.set_return_value(JsValue::new(value));
+    0
+}
+
+extern "C" fn jit_set_return_bool_i32(context: *mut Context, value: i32) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.set_return_value(JsValue::new(value != 0));
+    0
+}
+
+extern "C" fn jit_set_return_bool_f64(context: *mut Context, value: f64) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    context.vm.set_return_value(JsValue::new(value != 0.0));
     0
 }
 

@@ -59,7 +59,7 @@ pub(crate) struct This;
 
 impl This {
     #[inline(always)]
-    pub(super) fn operation(dst: RegisterOperand, context: &mut Context) -> JsResult<()> {
+    pub(crate) fn operation(dst: RegisterOperand, context: &mut Context) -> JsResult<()> {
         if context.vm.frame().has_this_value_cached() {
             let this = context.vm.stack.get_this(context.vm.frame());
             context.vm.set_register(dst.into(), this);
