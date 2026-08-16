@@ -182,6 +182,33 @@ fn class_boolean_literal_static_method_names() {
     ]);
 }
 
+#[test]
+fn class_computed_method_name_containing_function_with_var() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            class A {
+                [function() { var v = "m"; return v; }()]() { return 42; }
+                static [(function() { var w; }, "s")]() { return 7; }
+            }
+            var a = new A();
+        "#}),
+        TestAction::assert_eq("a.m()", 42),
+        TestAction::assert_eq("A.s()", 7),
+    ]);
+}
+
+#[test]
+fn class_expression_computed_method_name_containing_function_with_var() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            var B = class {
+                [(function() { var v; }, "n")]() { return 1; }
+            };
+        "#}),
+        TestAction::assert_eq("new B().n()", 1),
+    ]);
+}
+
 // https://github.com/boa-dev/boa/issues/4605
 #[test]
 fn class_boolean_literal_getter_setter_names() {

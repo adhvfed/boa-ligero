@@ -735,6 +735,12 @@ impl ClassMethodDefinition {
         &self.name
     }
 
+    /// Returns a mutable reference to the name of the class method definition.
+    #[inline]
+    pub(crate) const fn name_mut(&mut self) -> &mut ClassElementName {
+        &mut self.name
+    }
+
     /// Returns the parameters of the class method definition.
     #[inline]
     #[must_use]

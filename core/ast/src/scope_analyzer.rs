@@ -13,7 +13,7 @@ use crate::{
     function::{
         ArrowFunction, AsyncArrowFunction, AsyncFunctionDeclaration, AsyncFunctionExpression,
         AsyncGeneratorDeclaration, AsyncGeneratorExpression, ClassDeclaration, ClassElement,
-        ClassExpression, FormalParameterList, FunctionBody, FunctionDeclaration,
+        ClassElementName, ClassExpression, FormalParameterList, FunctionBody, FunctionDeclaration,
         FunctionExpression, GeneratorDeclaration, GeneratorExpression,
     },
     operations::{
@@ -441,12 +441,17 @@ impl<'ast> VisitorMut<'ast> for BindingEscapeAnalyzer<'_> {
         node: &'ast mut ClassElement,
     ) -> ControlFlow<Self::BreakTy> {
         match node {
-            ClassElement::MethodDefinition(node) => self.visit_function_like(
-                &mut node.parameters,
-                &mut node.body,
-                &mut node.scopes,
-                node.contains_direct_eval,
-            ),
+            ClassElement::MethodDefinition(node) => {
+                if let ClassElementName::PropertyName(name) = node.name_mut() {
+                    self.visit_property_name_mut(name)?;
+                }
+                self.visit_function_like(
+                    &mut node.parameters,
+                    &mut node.body,
+                    &mut node.scopes,
+                    node.contains_direct_eval,
+                )
+            }
             ClassElement::FieldDefinition(field) | ClassElement::StaticFieldDefinition(field) => {
                 self.visit_property_name_mut(&mut field.name)?;
                 if let Some(e) = &mut field.initializer {
@@ -840,6 +845,9 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
     ) -> ControlFlow<Self::BreakTy> {
         match node {
             ClassElement::MethodDefinition(node) => {
+                if let ClassElementName::PropertyName(name) = node.name_mut() {
+                    self.visit_property_name_mut(name)?;
+                }
                 let strict = node.body.strict();
                 self.visit_function_like(
                     &mut node.body,
@@ -1506,6 +1514,9 @@ impl<'ast> VisitorMut<'ast> for ScopeIndexVisitor {
     ) -> ControlFlow<Self::BreakTy> {
         match node {
             ClassElement::MethodDefinition(node) => {
+                if let ClassElementName::PropertyName(name) = node.name_mut() {
+                    self.visit_property_name_mut(name)?;
+                }
                 let contains_direct_eval = node.contains_direct_eval();
                 self.visit_function_like(
                     &mut node.body,
