@@ -26,6 +26,8 @@ use boa_gc::{Finalize, Trace};
 use boa_macros::{js_str, utf16};
 use boa_parser::lexer::regex::RegExpFlags;
 use regress::{Flags, Range, Regex};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::str::FromStr;
 
 use super::{BuiltInBuilder, BuiltInConstructor, IntrinsicObject};
@@ -41,10 +43,55 @@ mod tests;
 #[boa_gc(unsafe_empty_trace)]
 pub struct RegExp {
     /// Regex matcher.
-    matcher: Regex,
+    ///
+    /// Shared: the compiled pattern depends only on the source and flags, and
+    /// a regex *literal* produces a fresh object on every evaluation (each
+    /// needs its own `lastIndex`) while reusing the same compiled program.
+    matcher: Rc<Regex>,
     flags: RegExpFlags,
     original_source: JsString,
     original_flags: JsString,
+}
+
+/// Distinct compiled patterns retained per thread. Bounded so a page that
+/// builds regexes from user input cannot grow this without limit; real code
+/// reuses a small set.
+const COMPILED_REGEXP_CACHE_CAP: usize = 256;
+
+thread_local! {
+    /// Compiled patterns keyed by source text and flag bits.
+    ///
+    /// A regex *literal* evaluates to a fresh object every time its expression
+    /// runs — each needs its own `lastIndex` — but the compiled program behind
+    /// it depends only on the source and the flags. Recompiling it (parse,
+    /// optimize, emit) on every evaluation is pure waste inside a loop or a hot
+    /// function, and it was 2.4% of a live developer.mozilla.org load, nearly
+    /// all of it under the regex-literal opcode.
+    ///
+    /// Sharing across realms and `Context`s on the same thread is sound because
+    /// a compiled pattern is a pure function of its key: it holds no realm,
+    /// object, or match state.
+    static COMPILED_REGEXPS: RefCell<rustc_hash::FxHashMap<(JsString, u8), Rc<Regex>>> =
+        RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+fn cached_matcher(source: &JsString, flags: RegExpFlags) -> Option<Rc<Regex>> {
+    COMPILED_REGEXPS.with(|cache| {
+        cache
+            .borrow()
+            .get(&(source.clone(), flags.bits()))
+            .map(Rc::clone)
+    })
+}
+
+fn cache_matcher(source: &JsString, flags: RegExpFlags, matcher: &Rc<Regex>) {
+    COMPILED_REGEXPS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= COMPILED_REGEXP_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert((source.clone(), flags.bits()), Rc::clone(matcher));
+    });
 }
 
 impl RegExp {
@@ -355,6 +402,15 @@ impl RegExp {
         let full_unicode =
             flags.contains(RegExpFlags::UNICODE) || flags.contains(RegExpFlags::UNICODE_SETS);
 
+        if let Some(matcher) = cached_matcher(&p, flags) {
+            return Ok(RegExp {
+                matcher,
+                flags,
+                original_source: p,
+                original_flags: f,
+            });
+        }
+
         let matcher = if full_unicode {
             // Unicode mode (u/v flag) OR pattern has named groups:
             // compile as full Unicode codepoints.
@@ -393,6 +449,8 @@ impl RegExp {
         //     [[CapturingGroupsCount]]: capturingGroupsCount }.
         // 20. Set obj.[[RegExpRecord]] to rer.
         // 21. Set obj.[[RegExpMatcher]] to CompilePattern of parseResult with argument rer.
+        let matcher = Rc::new(matcher);
+        cache_matcher(&p, flags, &matcher);
         Ok(RegExp {
             matcher,
             flags,

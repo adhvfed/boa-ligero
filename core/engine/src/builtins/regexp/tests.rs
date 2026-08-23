@@ -262,3 +262,46 @@ fn regexp_no_panic_on_empty_class_quantifier() {
     // It should return null without panicking.
     run_test_actions([TestAction::assert_eq("/[]*1/u.exec()", JsValue::null())]);
 }
+
+#[test]
+fn sharing_a_compiled_pattern_keeps_regexps_independent() {
+    // The compiled program is memoized by (source, flags), but everything
+    // observable about a `RegExp` — `lastIndex`, identity, own properties —
+    // must stay per-object. A literal in particular evaluates to a *new*
+    // object every time its expression runs.
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+                function make() { return /a/g; }
+                var first = make();
+                var second = make();
+                first.lastIndex = 0;
+                first.exec('aaa');
+                var firstIndex = first.lastIndex;
+                var secondIndex = second.lastIndex;
+                first.own = 1;
+            "#}),
+        TestAction::assert("first !== second"),
+        TestAction::assert_eq("firstIndex", 1),
+        TestAction::assert_eq("secondIndex", 0),
+        TestAction::assert("second.own === undefined"),
+        // Same source, different flags: a distinct compiled program.
+        TestAction::assert("/a/i.test('A')"),
+        TestAction::assert("!/a/.test('A')"),
+        // Same source and flags reached through the constructor.
+        TestAction::assert("new RegExp('a', 'i').test('A')"),
+        TestAction::assert("!new RegExp('a').test('A')"),
+    ]);
+}
+
+#[test]
+fn memoized_patterns_still_reject_invalid_sources() {
+    run_test_actions([
+        TestAction::assert_native_error(
+            "new RegExp('(')",
+            JsNativeErrorKind::Syntax,
+            "failed to create matcher: Unbalanced parenthesis",
+        ),
+        // A valid pattern with the same prefix must still compile.
+        TestAction::assert("new RegExp('(a)').test('a')"),
+    ]);
+}
