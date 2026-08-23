@@ -113,6 +113,34 @@ impl Drop for DropGuard {
     }
 }
 
+/// A snapshot of this thread's collector state.
+///
+/// The collector is otherwise invisible from outside the crate, which makes it
+/// impossible to tell a slow *program* from a program that is collecting
+/// constantly — the two look identical in a wall-clock measurement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcStats {
+    /// Collections run on this thread since it started.
+    pub collections: usize,
+    /// Bytes currently held by live GC allocations.
+    pub bytes_allocated: usize,
+    /// Allocation high-water mark that triggers the next collection.
+    pub threshold: usize,
+}
+
+/// Read this thread's collector state.
+#[must_use]
+pub fn stats() -> GcStats {
+    BOA_GC.with(|gc| {
+        let gc = gc.borrow();
+        GcStats {
+            collections: gc.runtime.collections,
+            bytes_allocated: gc.runtime.bytes_allocated,
+            threshold: gc.config.threshold,
+        }
+    })
+}
+
 /// Returns `true` if it is safe for a type to run [`Finalize::finalize`].
 #[must_use]
 #[inline]

@@ -10,7 +10,7 @@
 
 use std::{env, fs, path::PathBuf, time::Instant};
 
-use boa_engine::{Context, Source, script::Script};
+use boa_engine::{Context, Source, optimizer::OptimizerOptions, script::Script};
 
 fn main() {
     let mut args = env::args_os().skip(1);
@@ -44,9 +44,25 @@ fn main() {
         .build()
         .expect("start sampling profiler");
 
+    // `BOA_PROFILE_SCRIPT=1` executes the file instead of only parsing and
+    // compiling it, so the profile covers the interpreter and the collector.
+    let execute = env::var("BOA_PROFILE_SCRIPT").is_ok();
+
+    // `BOA_PROFILE_OPTIMIZER=off` measures parse without the parse-time
+    // constant-folding/strength-reduction walk; `stats` prints what that walk
+    // actually achieved on this input.
+    let optimizer = env::var("BOA_PROFILE_OPTIMIZER").unwrap_or_default();
+
     let started = Instant::now();
     for _ in 0..iterations {
         let mut context = Context::default();
+        match optimizer.as_str() {
+            "off" => context.set_optimizer_options(OptimizerOptions::empty()),
+            "stats" => context.set_optimizer_options(
+                OptimizerOptions::OPTIMIZE_ALL | OptimizerOptions::STATISTICS,
+            ),
+            _ => {}
+        }
         let script = Script::parse(Source::from_bytes(&source), None, &mut context)
             .expect("failed to parse bundle");
         if phase != "parse" {
@@ -54,9 +70,18 @@ fn main() {
                 .codeblock(&mut context)
                 .expect("failed to compile bundle");
         }
+        if execute {
+            script.evaluate(&mut context).expect("failed to run script");
+            context.run_jobs().expect("failed to drain jobs");
+        }
     }
     let elapsed = started.elapsed();
 
+    let gc = boa_gc::stats();
+    eprintln!(
+        "bundle_profile: gc collections={} bytes_allocated={} threshold={}",
+        gc.collections, gc.bytes_allocated, gc.threshold
+    );
     eprintln!(
         "bundle_profile: {} bytes x {iterations} ({phase}) in {:.1} ms ({:.2} ms/iter)",
         source.len(),
