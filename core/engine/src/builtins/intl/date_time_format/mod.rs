@@ -119,6 +119,7 @@ impl IntrinsicObject for DateTimeFormat {
                 None,
                 Attribute::CONFIGURABLE,
             )
+            .method(Self::format_to_parts, js_string!("formatToParts"), 1)
             .method(Self::resolved_options, js_string!("resolvedOptions"), 0)
             .property(
                 JsSymbol::to_string_tag(),
@@ -139,7 +140,7 @@ impl BuiltInObject for DateTimeFormat {
 
 impl BuiltInConstructor for DateTimeFormat {
     const CONSTRUCTOR_ARGUMENTS: usize = 0;
-    const PROTOTYPE_STORAGE_SLOTS: usize = 4;
+    const PROTOTYPE_STORAGE_SLOTS: usize = 5;
     const CONSTRUCTOR_STORAGE_SLOTS: usize = 1;
 
     const STANDARD_CONSTRUCTOR: fn(&StandardConstructors) -> &StandardConstructor =
@@ -242,6 +243,42 @@ impl BuiltInConstructor for DateTimeFormat {
 }
 
 impl DateTimeFormat {
+    /// `Intl.DateTimeFormat.prototype.formatToParts ( date )`
+    ///
+    /// The same formatting as `format`, split by the field each run came from.
+    /// Date libraries reach for it constantly — redis.io's build logs
+    /// "Error formatting date with Intl.DateTimeFormat" on every render
+    /// without it.
+    ///
+    /// More information:
+    ///  - [ECMA-402 reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma402/#sec-Intl.DateTimeFormat.prototype.formatToParts
+    fn format_to_parts(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let dtf be the this value.
+        // 2. Perform ? RequireInternalSlot(dtf, [[InitializedDateTimeFormat]]).
+        let dtf_object = unwrap_date_time_format(this, context)?;
+
+        let date = args.get_or_undefined(0);
+        // 3. If date is undefined, then let x be ! Call(%Date.now%, undefined).
+        // 4. Else, let x be ? ToNumber(date).
+        let x = if date.is_undefined() {
+            context.clock().system_time_millis() as f64
+        } else {
+            date.to_number(context)?
+        };
+
+        // 5. Return ? FormatDateTimeToParts(dtf, x).
+        let borrowed = dtf_object.borrow();
+        let internals = borrowed.data().clone();
+        drop(borrowed);
+        format_timestamp_to_parts_with_dtf(&internals, x, context)
+    }
+
     fn get_format(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
         // 1. Let dtf be the this value.
         // 2. If the implementation supports the normative optional constructor mode of 4.3 Note 1, then
@@ -861,7 +898,125 @@ fn parse_offset_time_zone_identifier(identifier: &str) -> Option<UtcOffset> {
     ))
 }
 
-/// Formats a timestamp (epoch milliseconds) using the given [`DateTimeFormat`] internals.
+// ── formatToParts ────────────────────────────────────────────────────
+//
+// ECMA-402's `FormatDateTimeToParts` needs the formatted string *split* by the
+// field each run came from. ICU4X already annotates its output with those
+// fields through `writeable`'s part mechanism; the formatter just discarded
+// them by going straight to a `String`.
+
+/// Records the text ICU4X writes together with the field each run belongs to.
+///
+/// Adjacent runs carrying the same field are merged, which is what turns
+/// `writeable`'s per-write annotations into ECMA-402's one entry per field.
+#[derive(Default)]
+struct DateTimePartsRecorder {
+    text: String,
+    /// `(ECMA-402 type, end offset)` per run, in order and contiguous from 0.
+    runs: Vec<(&'static str, usize)>,
+    current: &'static str,
+}
+
+impl DateTimePartsRecorder {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            runs: Vec::new(),
+            // Anything ICU4X does not annotate is a literal: separators,
+            // spaces, and punctuation between fields.
+            current: LITERAL,
+        }
+    }
+
+    /// `(type, value)` per run, in order.
+    fn parts(&self) -> Vec<(&'static str, &str)> {
+        let mut parts = Vec::with_capacity(self.runs.len());
+        let mut start = 0;
+        for &(kind, end) in &self.runs {
+            parts.push((kind, &self.text[start..end]));
+            start = end;
+        }
+        parts
+    }
+}
+
+impl core::fmt::Write for DateTimePartsRecorder {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.text.push_str(s);
+        let end = self.text.len();
+        match self.runs.last_mut() {
+            Some((kind, last_end)) if *kind == self.current => *last_end = end,
+            _ => self.runs.push((self.current, end)),
+        }
+        Ok(())
+    }
+}
+
+impl writeable::PartsWrite for DateTimePartsRecorder {
+    type SubPartsWrite = Self;
+
+    fn with_part(
+        &mut self,
+        part: writeable::Part,
+        mut f: impl FnMut(&mut Self::SubPartsWrite) -> core::fmt::Result,
+    ) -> core::fmt::Result {
+        // Keep the *outermost* recognised field. ICU4X writes numeric fields
+        // through a decimal formatter, which adds its own inner annotations —
+        // taking the innermost would report a year as `literal` because the
+        // digits themselves are only marked as an integer.
+        let outer = self.current;
+        if outer == LITERAL {
+            self.current = ecma_part_type(part);
+        }
+        let result = f(self);
+        self.current = outer;
+        result
+    }
+}
+
+/// Map an ICU4X datetime field to its ECMA-402 part type.
+///
+/// Anything unrecognised is a literal rather than an invented type name: a new
+/// ICU field must not leak a nonstandard `type` into script.
+fn ecma_part_type(part: writeable::Part) -> &'static str {
+    use icu_datetime::parts;
+    if part == parts::ERA {
+        "era"
+    } else if part == parts::YEAR || part == parts::EXTENDED_YEAR {
+        "year"
+    } else if part == parts::RELATED_YEAR {
+        "relatedYear"
+    } else if part == parts::YEAR_NAME {
+        "yearName"
+    } else if part == parts::MONTH {
+        "month"
+    } else if part == parts::DAY {
+        "day"
+    } else if part == parts::WEEKDAY {
+        "weekday"
+    } else if part == parts::DAY_PERIOD {
+        "dayPeriod"
+    } else if part == parts::HOUR {
+        "hour"
+    } else if part == parts::MINUTE {
+        "minute"
+    } else if part == parts::SECOND {
+        "second"
+    } else if part == parts::TIME_ZONE_NAME {
+        "timeZoneName"
+    } else {
+        LITERAL
+    }
+}
+
+/// ECMA-402's type for text that belongs to no field.
+const LITERAL: &str = "literal";
+
+/// The zoned datetime [`PartitionDateTimePattern`][11.5.6] formats, for a
+/// timestamp in epoch milliseconds.
 ///
 /// It corresponds the logic from [`PartitionDateTimePattern`][11.5.6] and [`ToLocalTime`][11.5.12].
 ///
@@ -878,13 +1033,14 @@ fn parse_offset_time_zone_identifier(identifier: &str) -> Option<UtcOffset> {
 /// 5. Let offsetNs be GetOffsetNanosecondsFor(timeZone, epochNanoseconds).
 /// 6. Let tz be 𝔽(ℝ(x) + ℝ(offsetNs) / 10^6).
 ///
-/// Then calls `ToLocalTime::from_local_epoch_milliseconds` to obtain calendar fields,
-/// and formats the resulting `ZonedDateTime` with ICU4X.
-pub(crate) fn format_timestamp_with_dtf(
+/// `ToLocalTime::from_local_epoch_milliseconds` then supplies the calendar
+/// fields. Both `format` and `formatToParts` share every step up to here and
+/// differ only in how they render the result.
+fn zoned_date_time_for_timestamp(
     dtf: &DateTimeFormat,
     timestamp: f64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<ZonedDateTime<Iso, TimeZoneInfo<icu_time::zone::models::AtTime>>> {
     // PartitionDateTimePattern ( dtf, x ) step 1:
     // 1. Let x be TimeClip(x).
     let x = time_clip(timestamp);
@@ -927,13 +1083,51 @@ pub(crate) fn format_timestamp_with_dtf(
     let dt = fields.to_formattable_datetime()?;
     let tz_info = time_zone.to_time_zone_info();
     let tz_info_at_time = tz_info.at_date_time(dt);
-    let zdt = ZonedDateTime {
+    Ok(ZonedDateTime {
         date: dt.date,
         time: dt.time,
         zone: tz_info_at_time,
-    };
+    })
+}
+
+/// `FormatDateTime` — the formatted string for a timestamp.
+pub(crate) fn format_timestamp_with_dtf(
+    dtf: &DateTimeFormat,
+    timestamp: f64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let zdt = zoned_date_time_for_timestamp(dtf, timestamp, context)?;
     let result = dtf.formatter.format(&zdt).to_string();
     Ok(JsString::from(result).into())
+}
+
+/// `PartitionDateTimePattern`, keeping ICU4X's field annotations.
+///
+/// Shares every step with [`format_timestamp_with_dtf`] except the last: the
+/// formatted output is written through a parts sink instead of straight to a
+/// `String`.
+pub(crate) fn format_timestamp_to_parts_with_dtf(
+    dtf: &DateTimeFormat,
+    timestamp: f64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    use writeable::Writeable;
+
+    let zdt = zoned_date_time_for_timestamp(dtf, timestamp, context)?;
+    let mut recorder = DateTimePartsRecorder::new();
+    dtf.formatter
+        .format(&zdt)
+        .write_to_parts(&mut recorder)
+        .map_err(|_| js_error!(RangeError: "could not format date"))?;
+
+    let parts = crate::builtins::Array::array_create(0, None, context)?;
+    for (kind, value) in recorder.parts() {
+        let part = JsObject::with_object_proto(context.intrinsics());
+        part.create_data_property_or_throw(js_string!("type"), js_string!(kind), context)?;
+        part.create_data_property_or_throw(js_string!("value"), JsString::from(value), context)?;
+        crate::builtins::Array::push(&parts.clone().into(), &[part.into()], context)?;
+    }
+    Ok(parts.into())
 }
 
 fn date_time_style_format(

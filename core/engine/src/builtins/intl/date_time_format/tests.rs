@@ -1,6 +1,6 @@
 use indoc::indoc;
 
-use crate::{TestAction, run_test_actions};
+use crate::{TestAction, js_string, run_test_actions};
 
 use super::{UtcOffset, parse_offset_time_zone_identifier};
 
@@ -175,4 +175,54 @@ fn ecma402_offset_time_zone_grammar() {
             "{identifier}"
         );
     }
+}
+
+#[test]
+fn format_to_parts_splits_the_formatted_date_by_field() {
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            const date = new Date(Date.UTC(2026, 7, 24, 15, 4, 5));
+            const long = new Intl.DateTimeFormat("en-US", {
+              year: "numeric", month: "long", day: "numeric",
+              hour: "numeric", minute: "2-digit", timeZone: "UTC",
+            });
+            const short = new Intl.DateTimeFormat("en-US", { timeZone: "UTC" });
+            const types = (f) => f.formatToParts(date).map(p => p.type).join(",");
+            const joined = (f) => f.formatToParts(date).map(p => p.value).join("");
+        "#}),
+        // Numeric fields arrive through a decimal formatter that adds its own
+        // annotations; reporting the innermost one would call a year a literal.
+        TestAction::assert_eq(
+            "types(long)",
+            js_string!(
+                "month,literal,day,literal,year,literal,hour,literal,minute,literal,dayPeriod"
+            ),
+        ),
+        TestAction::assert_eq("types(short)", js_string!("month,literal,day,literal,year")),
+        // The parts must reconstruct exactly what `format` produces.
+        TestAction::assert("joined(long) === long.format(date)"),
+        TestAction::assert("joined(short) === short.format(date)"),
+        // Field order follows the locale, not the option order.
+        TestAction::assert_eq(
+            "new Intl.DateTimeFormat('de-DE', { dateStyle: 'long', timeZone: 'UTC' })\
+               .formatToParts(date).map(p => p.type).join(',')",
+            js_string!("day,literal,month,literal,year"),
+        ),
+        // Every entry is a plain `{ type, value }` pair of strings.
+        TestAction::assert(
+            "long.formatToParts(date).every(p => \
+               typeof p.type === 'string' && typeof p.value === 'string' && \
+               Object.keys(p).length === 2)",
+        ),
+        TestAction::assert_eq("Intl.DateTimeFormat.prototype.formatToParts.length", 1),
+    ]);
+}
+
+#[test]
+fn format_to_parts_rejects_a_non_finite_date() {
+    run_test_actions([TestAction::assert_native_error(
+        "new Intl.DateTimeFormat('en-US').formatToParts(NaN)",
+        crate::JsNativeErrorKind::Range,
+        "formatted date cannot be NaN",
+    )]);
 }
