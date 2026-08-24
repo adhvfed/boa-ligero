@@ -1774,9 +1774,26 @@ impl Context {
         // behavior the web observes.
         //
         // `host_call_depth` accounts for nested host calls that re-enter the VM by invoking
-        // `Context::run()` recursively (for example, accessor calls).
+        // `Context::run()` recursively (for example, accessor calls, or an
+        // embedder's `dispatchEvent` invoking a JS listener).
+        //
+        // Those re-entries are charged at `host_frame_cost` plain-JS-frame
+        // units apiece rather than 1:1, because they cost ~15-16x as much
+        // native stack as a plain JS call does -- a plain call pushes a heap
+        // `CallFrame` and stays in this same `run()` loop, while a host
+        // re-entry nests a fresh native frame chain. `frames.len()` already
+        // counts the callee's own frame, so the two together charge
+        // `host_frame_cost + 1`. See `RuntimeLimits::host_frame_cost` for the
+        // measurements and for why one weighted budget is needed rather than
+        // two independent limits (the costs are additive: a page can
+        // interleave both kinds of recursion freely).
+        //
         // Subtract 1 to exclude the dummy frame at index 0.
-        let recursion_depth = (self.vm.frames.len() - 1).saturating_add(self.vm.host_call_depth);
+        let recursion_depth = (self.vm.frames.len() - 1).saturating_add(
+            self.vm
+                .host_call_depth
+                .saturating_mul(self.vm.runtime_limits.host_frame_cost()),
+        );
         if self.vm.runtime_limits.recursion_limit() <= recursion_depth
             || self.vm.runtime_limits.stack_size_limit() <= self.vm.stack.stack.len()
         {

@@ -684,3 +684,63 @@ fn recursion_in_setter_throws_catchable_range_error() {
         ),
     ]);
 }
+
+/// Builds a context with an explicit recursion budget and host-frame weighting.
+fn limited_context(recursion_limit: usize, host_frame_cost: usize) -> Context {
+    let mut context = Context::default();
+    context
+        .runtime_limits_mut()
+        .set_recursion_limit(recursion_limit);
+    context
+        .runtime_limits_mut()
+        .set_host_frame_cost(host_frame_cost);
+    context
+}
+
+/// Plain JS recursion must be charged 1:1 no matter how expensive host
+/// re-entries are declared to be: the weighting exists to price the *native*
+/// stack, and a plain call never nests a native frame chain.
+#[test]
+fn host_frame_cost_leaves_plain_js_recursion_unweighted() {
+    for cost in [1_usize, 16] {
+        let mut context = limited_context(200, cost);
+        run_test_actions_with(
+            [TestAction::assert_eq(
+                indoc! {r#"
+                    let depth = 0;
+                    function go() { depth++; go(); }
+                    try { go() } catch (e) {}
+                    depth;
+                "#},
+                JsValue::from(199),
+            )],
+            &mut context,
+        );
+    }
+}
+
+/// A setter that assigns through itself recurses via a *host* re-entry, so
+/// raising `host_frame_cost` must make it trip proportionally sooner while the
+/// budget itself stays put.
+#[test]
+fn host_frame_cost_charges_host_reentry_proportionally() {
+    // Each level costs the callee's own frame plus `host_frame_cost`, and the
+    // level that exhausts the budget still runs its body before recursing.
+    const BUDGET: usize = 200;
+    for cost in [1_usize, 4, 16] {
+        let expected = BUDGET.div_ceil(cost + 1);
+        let mut context = limited_context(BUDGET, cost);
+        run_test_actions_with(
+            [TestAction::assert_eq(
+                indoc! {r#"
+                    let depth = 0;
+                    const obj = { set x(value) { depth++; this.x = value; } };
+                    try { obj.x = 1 } catch (e) {}
+                    depth;
+                "#},
+                JsValue::from(i32::try_from(expected).unwrap()),
+            )],
+            &mut context,
+        );
+    }
+}

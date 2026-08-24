@@ -12,6 +12,9 @@ pub struct RuntimeLimits {
 
     /// Max function recursion limit
     recursion: usize,
+
+    /// Native-stack cost of one host re-entry, in units of one plain JS frame.
+    host_frame_cost: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -22,6 +25,7 @@ impl Default for RuntimeLimits {
             recursion: 512,
             backtrace_limit: 50,
             stack_size: 1024 * 10,
+            host_frame_cost: 1,
         }
     }
 }
@@ -93,5 +97,53 @@ impl RuntimeLimits {
     #[inline]
     pub fn set_recursion_limit(&mut self, value: usize) {
         self.recursion = value;
+    }
+
+    /// Get the native-stack cost charged against [`Self::recursion_limit`] for
+    /// each host re-entry, expressed in units of one plain JS frame.
+    ///
+    /// Not every frame the recursion limit counts costs the same amount of
+    /// native stack. A plain JS call pushes a heap-allocated `CallFrame` and
+    /// keeps running inside the *same* `Context::run()` loop, so its native
+    /// footprint is just the interpreter's own per-call bookkeeping. A host
+    /// call that re-enters the VM (an accessor, or an embedder API such as
+    /// `dispatchEvent` invoking a JS listener) instead nests a whole new
+    /// native `Context::run()` frame chain underneath itself.
+    ///
+    /// Measured on `x86_64-unknown-linux-gnu`, release (`lto = "fat"`,
+    /// `codegen-units = 1`), by recursing each way with both engine guards
+    /// raised out of the way and bisecting the depth at which the process
+    /// takes a stack-overflow abort:
+    ///
+    /// | thread stack | plain JS frames | host re-entries |
+    /// |---|---|---|
+    /// | 8 `MiB` (OS-default main thread) | crashes between 25,000-30,000 | crashes between 1,700-1,800 |
+    /// | 2 `MiB` (`std::thread` default)  | crashes between  6,500-7,000  | crashes between   400-500   |
+    ///
+    /// Both profiles put one host re-entry at roughly **15-16 plain JS
+    /// frames**, which a direct stack-pointer probe agrees with (~318 bytes
+    /// per JS frame against ~4,924 bytes per host re-entry).
+    ///
+    /// Summing the two 1:1 -- the default, kept for compatibility -- therefore
+    /// calibrates for neither: a limit low enough to bound host recursion is
+    /// ~15x stricter than it needs to be for the JS-only recursion real pages
+    /// actually perform, and a limit high enough for JS recursion does not
+    /// bound host recursion at all. Because the two costs are *additive* (a
+    /// page can freely interleave them), two independent limits cannot fix
+    /// this either; only a single weighted budget bounds the real exposure.
+    ///
+    /// Default is 1, preserving the historical 1:1 accounting.
+    #[inline]
+    #[must_use]
+    pub const fn host_frame_cost(&self) -> usize {
+        self.host_frame_cost
+    }
+
+    /// Set the native-stack cost charged per host re-entry.
+    ///
+    /// See [`Self::host_frame_cost`] for how to pick a value.
+    #[inline]
+    pub fn set_host_frame_cost(&mut self, value: usize) {
+        self.host_frame_cost = value;
     }
 }
