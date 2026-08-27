@@ -393,6 +393,23 @@ impl DateTimeFormat {
             let dtf = dtf_object.borrow();
             let dtf = dtf.data();
 
+            let time_zone_str = match &dtf.time_zone {
+                FormatTimeZone::UtcOffset(offset) => {
+                    let seconds = offset.to_seconds();
+                    let hours = seconds / 3600;
+                    let minutes = (seconds.abs() % 3600) / 60;
+                    format!("{hours:+03}:{minutes:02}")
+                }
+                FormatTimeZone::Identifier((_tz, id)) => context
+                    .timezone_provider()
+                    .identifier(*id)
+                    .map_err(|error| {
+                        JsNativeError::range().with_message(format!(
+                            "Failed to resolve time zone identifier: {error:?}"
+                        ))
+                    })?
+                    .into_owned(),
+            };
             let mut options = ObjectInitializer::new(context);
             options.property(
                 js_string!("locale"),
@@ -416,15 +433,6 @@ impl DateTimeFormat {
                 );
             }
 
-            let time_zone_str = match &dtf.time_zone {
-                FormatTimeZone::UtcOffset(offset) => {
-                    let seconds = offset.to_seconds();
-                    let hours = seconds / 3600;
-                    let minutes = (seconds.abs() % 3600) / 60;
-                    format!("{hours:+03}:{minutes:02}")
-                }
-                FormatTimeZone::Identifier((tz, _id)) => tz.to_string(),
-            };
             options.property(
                 js_string!("timeZone"),
                 js_string!(time_zone_str),
@@ -701,9 +709,8 @@ pub(crate) fn create_date_time_format(
 
     // 16. If timeZone is undefined, then
     let time_zone = if time_zone.is_undefined() {
-        // TODO (nekevss): Resolve system time zone
         // a. Set timeZone to SystemTimeZoneIdentifier().
-        JsString::from("Etc/UTC")
+        context.host_hooks().local_timezone_identifier()
     // 17. Else,
     } else {
         // a. Set timeZone to ? ToString(timeZone).

@@ -1,6 +1,10 @@
 use indoc::indoc;
 
-use crate::{TestAction, js_string, run_test_actions};
+use std::rc::Rc;
+
+use crate::{
+    Context, JsString, Source, TestAction, context::HostHooks, js_string, run_test_actions,
+};
 
 use super::{UtcOffset, parse_offset_time_zone_identifier};
 
@@ -66,6 +70,41 @@ fn dtf_basic() {
         "}),
         TestAction::assert_eq("result === 'Sunday, 20 December 2020 at 14:23:16'", true),
     ]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn dtf_uses_the_host_timezone_when_time_zone_is_omitted() {
+    struct HelsinkiHooks;
+
+    impl HostHooks for HelsinkiHooks {
+        fn local_timezone_identifier(&self) -> JsString {
+            JsString::from("Europe/Helsinki")
+        }
+    }
+
+    let mut context = Context::builder()
+        .host_hooks(Rc::new(HelsinkiHooks))
+        .build()
+        .expect("context");
+    let result = context
+        .eval(Source::from_bytes(
+            r#"
+            const date = new Date('2020-12-20T03:23:16.738Z');
+            const formatter = new Intl.DateTimeFormat('en-GB', {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false,
+            });
+            `${formatter.resolvedOptions().timeZone}|${formatter.format(date)}`;
+            "#,
+        ))
+        .expect("format in host time zone")
+        .to_string(&mut context)
+        .expect("string result")
+        .to_std_string_escaped();
+
+    assert_eq!(result, "Europe/Helsinki|05:23");
 }
 
 #[cfg(feature = "intl_bundled")]

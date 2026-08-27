@@ -205,6 +205,17 @@ pub trait HostHooks {
             .map_or(0, UtcOffset::whole_seconds)
     }
 
+    /// Returns the host's default IANA time-zone identifier for ECMA-402
+    /// formatters whose `timeZone` option is omitted.
+    ///
+    /// Embedders should override this together with
+    /// [`Self::local_timezone_offset_seconds`] so `Date` and
+    /// `Intl.DateTimeFormat` observe the same local time zone. UTC remains the
+    /// conservative default for hosts that do not expose one.
+    fn local_timezone_identifier(&self) -> JsString {
+        JsString::from("Etc/UTC")
+    }
+
     /// Gets the maximum size in bits that can be allocated for an `ArrayBuffer` or a
     /// `SharedArrayBuffer`.
     ///
