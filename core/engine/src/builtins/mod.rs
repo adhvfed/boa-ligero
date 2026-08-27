@@ -354,6 +354,7 @@ impl Realm {
             intl::segmenter::Segments::init(self);
             intl::segmenter::SegmentIterator::init(self);
             intl::PluralRules::init(self);
+            intl::RelativeTimeFormat::init(self);
             intl::NumberFormat::init(self);
         }
 

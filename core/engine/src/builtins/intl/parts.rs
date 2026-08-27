@@ -146,6 +146,39 @@ pub(crate) fn range_parts_into_js_array(
     )
 }
 
+pub(crate) fn relative_time_parts_into_js_array(
+    parts: Vec<FormattedPart>,
+    unit: &'static str,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let result = Array::array_create(0, None, context)
+        .js_expect("creating an empty array with the default prototype must not fail")?;
+
+    for (index, part) in parts.into_iter().enumerate() {
+        let object = context
+            .intrinsics()
+            .templates()
+            .ordinary_object()
+            .create(OrdinaryObject, vec![]);
+        object
+            .create_data_property_or_throw(js_string!("type"), js_string!(part.kind), context)
+            .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        object
+            .create_data_property_or_throw(js_string!("value"), js_string!(part.value), context)
+            .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        if part.kind != "literal" {
+            object
+                .create_data_property_or_throw(js_string!("unit"), js_string!(unit), context)
+                .js_expect("creating a property on a fresh ordinary object must not fail")?;
+        }
+        result
+            .create_data_property_or_throw(index, object, context)
+            .js_expect("creating an indexed property on a fresh array must not fail")?;
+    }
+
+    Ok(result.into())
+}
+
 fn parts_into_js_array(
     parts: impl IntoIterator<Item = (&'static str, String, Option<&'static str>)>,
     context: &mut Context,

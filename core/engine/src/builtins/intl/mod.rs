@@ -37,6 +37,7 @@ pub(crate) use self::{
     locale::Locale,
     number_format::{IntlMathematicalValue, NumberFormat},
     plural_rules::PluralRules,
+    relative_time_format::RelativeTimeFormat,
     segmenter::Segmenter,
 };
 
@@ -89,6 +90,7 @@ pub(crate) mod list_format;
 pub(crate) mod locale;
 pub(crate) mod number_format;
 pub(crate) mod plural_rules;
+pub(crate) mod relative_time_format;
 pub(crate) mod segmenter;
 
 mod options;
@@ -101,6 +103,7 @@ const_assert! {!<Collator as Service>::LangMarker::INFO.is_singleton}
 const_assert! {!<ListFormat as Service>::LangMarker::INFO.is_singleton}
 const_assert! {!<NumberFormat as Service>::LangMarker::INFO.is_singleton}
 const_assert! {!<PluralRules as Service>::LangMarker::INFO.is_singleton}
+const_assert! {!<RelativeTimeFormat as Service>::LangMarker::INFO.is_singleton}
 const_assert! {!<Segmenter as Service>::LangMarker::INFO.is_singleton}
 const_assert! {!<DateTimeFormat as Service>::LangMarker::INFO.is_singleton}
 
@@ -164,6 +167,15 @@ impl IntrinsicObject for Intl {
                     .plural_rules()
                     .constructor(),
                 PluralRules::ATTRIBUTE,
+            )
+            .static_property(
+                RelativeTimeFormat::NAME,
+                realm
+                    .intrinsics()
+                    .constructors()
+                    .relative_time_format()
+                    .constructor(),
+                RelativeTimeFormat::ATTRIBUTE,
             )
             .static_property(
                 DateTimeFormat::NAME,

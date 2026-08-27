@@ -9,7 +9,6 @@ features = [
 
     "symbols-as-weakmap-keys",
     "Intl.DisplayNames",
-    "Intl.RelativeTimeFormat",
     "Intl-enumeration",
     "Intl.DurationFormat",
     "regexp-duplicate-named-groups",

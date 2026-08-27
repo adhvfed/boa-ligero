@@ -118,6 +118,30 @@ const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
     icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
     icu_experimental::dimension::provider::units::display_names::UnitsDisplayNamesV1::INFO,
     icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
+    icu_experimental::relativetime::provider::LongDayRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongHourRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongMinuteRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongMonthRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongQuarterRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongSecondRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongWeekRelativeV1::INFO,
+    icu_experimental::relativetime::provider::LongYearRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowDayRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowHourRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowMinuteRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowMonthRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowQuarterRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowSecondRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowWeekRelativeV1::INFO,
+    icu_experimental::relativetime::provider::NarrowYearRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortDayRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortHourRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortMinuteRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortMonthRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortQuarterRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortSecondRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortWeekRelativeV1::INFO,
+    icu_experimental::relativetime::provider::ShortYearRelativeV1::INFO,
 ];
 
 /// Boa's default buffer provider.
@@ -235,5 +259,28 @@ mod tests {
             .unwrap();
         let standard = response.payload.get().standard.as_ref().unwrap();
         assert_eq!((&*standard.prefix, &*standard.suffix), ("(", ")"));
+    }
+
+    #[test]
+    fn bundled_provider_includes_every_relative_time_width_and_unit() {
+        let provider = super::buffer();
+        let locale = "nb".parse().unwrap();
+        // The five dimension markers lead the table; the remaining 24 are
+        // relative-time data (three widths for each of eight units).
+        let relative_time_markers = &super::EXPERIMENTAL_MARKERS[5..];
+        let mut loaded = 0;
+        for marker in relative_time_markers {
+            provider
+                .load_data(
+                    *marker,
+                    DataRequest {
+                        id: DataIdentifierBorrowed::for_locale(&locale),
+                        ..DataRequest::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("missing {marker:?} for nb: {error}"));
+            loaded += 1;
+        }
+        assert_eq!(loaded, 24);
     }
 }
