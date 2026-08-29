@@ -920,9 +920,12 @@ impl Context {
         F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
     {
         if let Err(error) = self.consume_instruction_budget() {
-            let mut error = JsError::from(error);
-            self.capture_error_backtrace(&mut error);
-            return ControlFlow::Break(CompletionRecord::Throw(error));
+            // Instruction-budget exhaustion is an uncatchable engine error,
+            // but it still has to take the ordinary error-unwind path. Returning
+            // it directly leaves every nested frame and its registers on the VM
+            // stack; a later Context::eval then starts on that stale state and
+            // can dispatch unrelated property calls with corrupted operands.
+            return self.handle_error(error.into());
         }
 
         #[cfg(feature = "trace")]

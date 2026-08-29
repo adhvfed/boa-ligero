@@ -482,6 +482,38 @@ fn instruction_budget_is_persistent_resettable_and_optional() {
 }
 
 #[test]
+fn instruction_budget_exhaustion_unwinds_nested_frames() {
+    let mut context = Context::default();
+    context
+        .eval(Source::from_bytes(
+            "function burn() { let total = 0; total += 1; total += 2; total += 3; \
+             total += 4; total += 5; total += 6; total += 7; total += 8; } \
+             function outer() { return burn(); }",
+        ))
+        .expect("function definitions must succeed without a budget");
+    let baseline_frame_depth = context.vm.frames.len();
+
+    context.set_instruction_budget(12);
+    let error = context
+        .eval(Source::from_bytes("outer()"))
+        .expect_err("the nested call must exhaust its budget");
+    assert_eq!(error.as_engine(), Some(&EngineError::NoInstructionsRemain));
+    assert_eq!(
+        context.vm.frames.len(),
+        baseline_frame_depth,
+        "an uncatchable budget termination must unwind every nested frame"
+    );
+
+    context.set_instruction_budget(1_000);
+    assert_eq!(
+        context
+            .eval(Source::from_bytes("40 + 2"))
+            .expect("the context must remain usable after budget termination"),
+        JsValue::new(42)
+    );
+}
+
+#[test]
 fn recursion_runtime_limit() {
     run_test_actions([
         TestAction::run(indoc! {r#"
