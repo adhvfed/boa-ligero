@@ -382,6 +382,33 @@ fn get_property_by_name_set_inline_cache_on_property_load() -> JsResult<()> {
 }
 
 #[test]
+fn inherited_property_cache_misses_after_prototype_shape_changes() -> JsResult<()> {
+    let context = &mut Context::default();
+    let result = context.eval(Source::from_bytes(
+        r#"
+        function cachedUnshift() {
+            const values = [];
+            values.unshift("ok");
+            return values[0];
+        }
+
+        const before = cachedUnshift();
+        delete Array.prototype.sort;
+        Object.defineProperty(Array.prototype, "sort", {
+            value() { return this; },
+            writable: true,
+            configurable: true,
+        });
+        const after = cachedUnshift();
+        before + "/" + after;
+        "#,
+    ))?;
+
+    assert_eq!(result, js_string!("ok/ok").into());
+    Ok(())
+}
+
+#[test]
 fn getter_that_redefines_itself_seeds_cache_with_lookup_shape() -> JsResult<()> {
     let context = &mut Context::default();
     let result = context.eval(Source::from_bytes(

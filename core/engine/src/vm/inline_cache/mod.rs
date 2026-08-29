@@ -7,7 +7,10 @@ use boa_macros::{Finalize, Trace};
 
 use crate::{
     JsString,
-    object::shape::{Shape, WeakShape, slot::Slot},
+    object::shape::{
+        Shape, WeakShape,
+        slot::{Slot, SlotAttributes},
+    },
 };
 
 #[cfg(test)]
@@ -182,6 +185,16 @@ pub(crate) struct CacheEntry {
     /// `upgrade()` path is reserved for cold operations.
     pub(crate) shape: WeakShape,
 
+    /// Shape of the immediate prototype that owned an inherited property.
+    /// Receiver shapes do not change when their prototype object adds,
+    /// removes, or reconfigures a property, so inherited-property hits must
+    /// validate this second dependency as well. `None` denotes an own slot.
+    #[unsafe_ignore_trace]
+    prototype_shape_addr: Option<usize>,
+
+    /// Weak liveness guard paired with [`Self::prototype_shape_addr`].
+    prototype_shape: Option<WeakShape>,
+
     /// Slot within the shape's property table where the property lives.
     #[unsafe_ignore_trace]
     pub(crate) slot: Slot,
@@ -198,7 +211,20 @@ impl CacheEntry {
     /// minus the atomic ref-count traffic).
     #[inline]
     pub(crate) fn matches(&self, shape: &Shape) -> bool {
-        self.shape_addr == shape.to_addr_usize() && self.shape.is_upgradable()
+        if self.shape_addr != shape.to_addr_usize() || !self.shape.is_upgradable() {
+            return false;
+        }
+
+        let (Some(expected_addr), Some(expected_shape)) =
+            (self.prototype_shape_addr, self.prototype_shape.as_ref())
+        else {
+            return self.prototype_shape_addr.is_none() && self.prototype_shape.is_none();
+        };
+        let Some(prototype) = shape.prototype() else {
+            return false;
+        };
+        let prototype = prototype.borrow();
+        expected_addr == prototype.shape().to_addr_usize() && expected_shape.is_upgradable()
     }
 }
 
@@ -258,9 +284,26 @@ impl InlineCache {
         // `set` runs only on misses.
         entries.retain(|entry| entry.shape.is_upgradable());
 
+        let (prototype_shape_addr, prototype_shape) =
+            if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
+                let Some(prototype) = shape.prototype() else {
+                    return;
+                };
+                let prototype = prototype.borrow();
+                let prototype_shape = prototype.shape();
+                (
+                    Some(prototype_shape.to_addr_usize()),
+                    Some(prototype_shape.into()),
+                )
+            } else {
+                (None, None)
+            };
+
         let new_entry = CacheEntry {
             shape_addr: shape.to_addr_usize(),
             shape: shape.into(),
+            prototype_shape_addr,
+            prototype_shape,
             slot,
         };
 
