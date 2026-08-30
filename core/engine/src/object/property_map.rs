@@ -679,6 +679,21 @@ impl PropertyMap {
         None
     }
 
+    /// Borrow an own named data property's value without materializing a
+    /// [`PropertyDescriptor`]. Accessors and indexed properties deliberately
+    /// return `None` so callers can preserve their observable slow paths.
+    #[must_use]
+    pub(crate) fn get_own_named_data_property_value(&self, key: &PropertyKey) -> Option<&JsValue> {
+        if matches!(key, PropertyKey::Index(_)) {
+            return None;
+        }
+        let slot = self.shape.lookup(key)?;
+        if slot.attributes.is_accessor_descriptor() {
+            return None;
+        }
+        self.storage.get(slot.index as usize)
+    }
+
     /// Get the property with the given key from the [`PropertyMap`].
     #[must_use]
     pub(crate) fn get_storage(&self, Slot { index, attributes }: Slot) -> PropertyDescriptor {
@@ -872,6 +887,35 @@ impl PropertyMap {
         end: u32,
         search: &JsValue,
     ) -> Result<(Option<u32>, u64), (u32, u64)> {
+        // The common browser-collection shape stores contiguous boxed values.
+        // Match the storage kind once and compare borrowed values in place:
+        // cloning every `JsValue` used to add one GC refcount increment and
+        // decrement per element even though strict equality only borrows it.
+        if let IndexedProperties::DenseElement(values)
+        | IndexedProperties::DenseReadOnlyElement(values) = &self.indexed_properties
+        {
+            if start == end {
+                return Ok((None, 0));
+            }
+
+            let dense_len = u32::try_from(values.len()).unwrap_or(u32::MAX);
+            if start >= dense_len {
+                return Err((start, 0));
+            }
+            let scan_end = end.min(dense_len);
+            let mut scanned = 0u64;
+            for (offset, value) in values[start as usize..scan_end as usize].iter().enumerate() {
+                scanned += 1;
+                if search.strict_equals(value) {
+                    return Ok((Some(start + offset as u32), scanned));
+                }
+            }
+            if scan_end < end {
+                return Err((scan_end, scanned));
+            }
+            return Ok((None, scanned));
+        }
+
         let mut scanned = 0u64;
         for index in start..end {
             let value = match &self.indexed_properties {
@@ -887,12 +931,8 @@ impl PropertyMap {
                     };
                     JsValue::from(*value)
                 }
-                IndexedProperties::DenseElement(values)
-                | IndexedProperties::DenseReadOnlyElement(values) => {
-                    let Some(value) = values.get(index as usize) else {
-                        return Err((index, scanned));
-                    };
-                    value.clone()
+                IndexedProperties::DenseElement(_) | IndexedProperties::DenseReadOnlyElement(_) => {
+                    unreachable!("dense boxed storage returned through its borrowed fast path")
                 }
                 IndexedProperties::SparseElement(values) => {
                     let Some(value) = values.get(&index) else {

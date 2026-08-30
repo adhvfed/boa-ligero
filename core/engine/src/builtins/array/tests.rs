@@ -327,6 +327,13 @@ fn index_of_contiguous_own_data_fast_path_preserves_observable_fallbacks() {
             inherited[0] = "a";
             inherited[2] = "c";
 
+            let lengthReads = 0;
+            const lengthAccessor = {
+                get length() { lengthReads++; return 2; },
+                0: "a",
+                1: "b",
+            };
+
             let proxyReads = 0;
             const proxy = new Proxy({ length: 2, 0: "a", 1: "b" }, {
                 get(target, key, receiver) {
@@ -340,6 +347,8 @@ fn index_of_contiguous_own_data_fast_path_preserves_observable_fallbacks() {
         TestAction::assert_eq("Array.prototype.indexOf.call(accessor, 'b')", 1),
         TestAction::assert_eq("accessorReads", 1),
         TestAction::assert_eq("Array.prototype.indexOf.call(inherited, 'b')", 1),
+        TestAction::assert_eq("Array.prototype.indexOf.call(lengthAccessor, 'b')", 1),
+        TestAction::assert_eq("lengthReads", 1),
         TestAction::assert_eq("Array.prototype.indexOf.call(proxy, 'b')", 1),
         TestAction::assert_eq("proxyReads", 1),
     ]);

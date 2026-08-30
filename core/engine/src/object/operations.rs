@@ -664,6 +664,22 @@ impl JsObject {
                 .map(u64::from);
         }
 
+        // Ordinary array-like objects commonly expose a stable integer data
+        // property for `length`. Read that slot directly instead of building a
+        // descriptor, cloning its value, and dispatching through [[Get]]. Any
+        // accessor, inherited value, exotic object, or non-i32 primitive keeps
+        // the fully observable path below.
+        if self.uses_ordinary_property_reads() {
+            let borrowed_object = self.borrow();
+            if let Some(length) = borrowed_object
+                .properties()
+                .get_own_named_data_property_value(&StaticJsStrings::LENGTH.into())
+                .and_then(JsValue::as_i32)
+            {
+                return Ok(length.max(0) as u64);
+            }
+        }
+
         // 2. Return ℝ(? ToLength(? Get(obj, "length"))).
         self.get(StaticJsStrings::LENGTH, context)?
             .to_length(context)

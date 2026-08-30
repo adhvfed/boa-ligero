@@ -33,6 +33,23 @@ impl JsValue {
     /// For more information, check <https://tc39.es/ecma262/#sec-strict-equality-comparison>.
     #[must_use]
     pub fn strict_equals(&self, other: &Self) -> bool {
+        // Object strict equality is pointer identity. Handle it through
+        // borrow-style object views before materializing `JsVariant`s: the
+        // generic path would otherwise clone both GC handles here and clone
+        // them again in `same_value_non_numeric` for every comparison.
+        if self.is_object() {
+            let Some(other) = other.as_object_borrowed() else {
+                return false;
+            };
+            let this = self
+                .as_object_borrowed()
+                .expect("is_object guaranteed an object value");
+            return JsObject::equals(&this, &other);
+        }
+        if other.is_object() {
+            return false;
+        }
+
         // 1. If Type(x) is different from Type(y), return false.
         if self.get_type() != other.get_type() {
             return false;
@@ -249,5 +266,23 @@ impl JsValue {
             (JsVariant::Symbol(x), JsVariant::Symbol(y)) => x == y,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{JsObject, JsValue};
+
+    #[test]
+    fn strict_equals_uses_object_identity() {
+        let object = JsObject::with_null_proto();
+        let same = JsValue::from(object.clone());
+        let alias = JsValue::from(object);
+        let distinct = JsValue::from(JsObject::with_null_proto());
+
+        assert!(same.strict_equals(&alias));
+        assert!(!same.strict_equals(&distinct));
+        assert!(!same.strict_equals(&JsValue::null()));
+        assert!(!JsValue::null().strict_equals(&same));
     }
 }
