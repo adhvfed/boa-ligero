@@ -4677,6 +4677,46 @@ mod tests {
     }
 
     #[test]
+    fn native_admission_preserves_observed_method_summaries_without_penalizing_misses() {
+        let code = first_function_code(
+            "class Counter {\n\
+                 constructor() { this.value = 0; }\n\
+                 increment(amount) {\n\
+                     this.value = this.value + amount;\n\
+                     return this.value;\n\
+                 }\n\
+             }\n\
+             const counter = new Counter();\n\
+             function main() {\n\
+                 let last = 0;\n\
+                 for (let index = 0; index < 100; index++) {\n\
+                     last = counter.increment(1);\n\
+                 }\n\
+                 return last;\n\
+             }",
+        );
+        assert!(
+            InstructionIterator::new(&code.bytecode).any(|(_, _, instruction)| {
+                matches!(instruction, Instruction::PureMethodLoopIteration)
+            }),
+            "the bytecompiler must mark the method candidate before JIT admission"
+        );
+        assert!(
+            native::admission_profile(&code, false).is_ok(),
+            "an unproven method candidate must retain ordinary native lowering"
+        );
+
+        code.mark_pure_range_loop_observed();
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("native lowering must not discard an observed method range summary");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(
+            rejection.first_blocking_opcode,
+            Some(Opcode::PureMethodLoopIteration)
+        );
+    }
+
+    #[test]
     fn jit_executes_script_matches_interpreter() {
         // End-to-end: run a real script through the JIT trampoline and confirm
         // the result matches the interpreter exactly. The JIT runs native code

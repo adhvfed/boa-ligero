@@ -21,6 +21,8 @@ const MAX_PURE_READER_LOOP_CODE: usize = 512;
 const MAX_PURE_READER_LOOPS: usize = 8;
 const MAX_PURE_READER_CONTINUATION: usize = 16;
 const MAX_PURE_PROPERTY_WRITES: usize = 8;
+pub(crate) const PURE_PROPERTY_WRITE_GUARD_MISS: u8 = 1 << 0;
+pub(crate) const PURE_METHOD_GUARD_MISS: u8 = 1 << 1;
 
 #[derive(Clone, Copy, Debug)]
 enum PureReaderNode {
@@ -46,9 +48,28 @@ enum AffineSymbolicValue {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum ReceiverAffineSymbolicValue {
+    Unset,
+    Argument,
+    Receiver,
+    StateBefore,
+    Step(i32),
+    StateAfter,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureReceiverAffineStepPlan {
+    read_ic_index: u32,
+    write_ic_index: u32,
+    return_ic_index: u32,
+    argument_scale: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PureFunctionKind {
     Reader,
     AffineStep,
+    ReceiverAffineStep(PureReceiverAffineStepPlan),
 }
 
 /// One cached, source-free proof for the mutually exclusive pure-function
@@ -111,9 +132,24 @@ pub(crate) struct PurePropertyWriteLoopPlan {
     object_ic_index: Option<u32>,
     property_ic_indices: [u32; MAX_PURE_PROPERTY_WRITES],
     property_count: u8,
-    guard_bit: u8,
     index: usize,
     limit: usize,
+}
+
+/// A canonical `last = receiver.method(constant)` loop whose method advances
+/// one own i32 data slot and returns that same slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureMethodLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    exit_pc: u32,
+    receiver_binding_index: u32,
+    receiver_binding_ic_index: Option<u32>,
+    method_ic_index: u32,
+    argument: i32,
+    index: usize,
+    limit: usize,
+    accumulator: usize,
 }
 
 /// A statically proven loop shape. Reader and affine candidates use distinct
@@ -123,6 +159,7 @@ pub(crate) enum PureLoopPlan {
     Reader(PureReaderLoopPlan),
     Affine(PureAffineLoopPlan),
     PropertyWrite(PurePropertyWriteLoopPlan),
+    Method(PureMethodLoopPlan),
 }
 
 impl PureFunctionPlan {
@@ -327,7 +364,9 @@ impl PureFunctionPlan {
 
 impl PureFunctionPlan {
     pub(super) fn parse(code: &CodeBlock) -> Option<Self> {
-        Self::parse_reader(code).or_else(|| Self::parse_affine(code))
+        Self::parse_reader(code)
+            .or_else(|| Self::parse_affine(code))
+            .or_else(|| Self::parse_receiver_affine(code))
     }
 
     pub(super) fn reader_i32(&self, code: &CodeBlock, object: &JsObject) -> Option<i32> {
@@ -342,6 +381,13 @@ impl PureFunctionPlan {
             return None;
         };
         Some(*delta)
+    }
+
+    pub(super) fn receiver_affine_step(&self) -> Option<PureReceiverAffineStepPlan> {
+        let PureFunctionKind::ReceiverAffineStep(plan) = self.kind else {
+            return None;
+        };
+        Some(plan)
     }
 
     fn parse_affine(code: &CodeBlock) -> Option<Self> {
@@ -464,6 +510,170 @@ impl PureFunctionPlan {
 
         None
     }
+
+    fn parse_receiver_affine(code: &CodeBlock) -> Option<Self> {
+        if !code.is_ordinary()
+            || code.is_class_constructor()
+            || !code.handlers.is_empty()
+            || code.register_count > MAX_PURE_READER_REGISTERS
+        {
+            return None;
+        }
+
+        let mut registers = vec![ReceiverAffineSymbolicValue::Unset; code.register_count as usize];
+        let mut stack = Vec::new();
+        let mut state_read_ic = None;
+        let mut state_write_ic = None;
+        let mut state_return_ic = None;
+        let mut argument_scale = None;
+        let mut accumulator_set = false;
+        let mut instruction_count = 0usize;
+
+        for (_, _, instruction) in InstructionIterator::new(&code.bytecode) {
+            instruction_count = instruction_count.checked_add(1)?;
+            if instruction_count > MAX_PURE_READER_INSTRUCTIONS {
+                return None;
+            }
+
+            let read = |register: crate::vm::opcode::RegisterOperand| {
+                registers.get(usize::from(register)).copied()
+            };
+            let destination = |register: crate::vm::opcode::RegisterOperand| {
+                usize::from(register)
+                    .lt(&registers.len())
+                    .then_some(usize::from(register))
+            };
+
+            match instruction {
+                Instruction::GetArgument { index, dst } if u32::from(index) == 0 => {
+                    let dst = destination(dst)?;
+                    registers[dst] = ReceiverAffineSymbolicValue::Argument;
+                }
+                Instruction::Move { src, dst } => {
+                    let value = read(src)?;
+                    if matches!(value, ReceiverAffineSymbolicValue::Unset) {
+                        return None;
+                    }
+                    let dst = destination(dst)?;
+                    registers[dst] = value;
+                }
+                Instruction::This { dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = ReceiverAffineSymbolicValue::Receiver;
+                }
+                Instruction::GetPropertyByName {
+                    dst,
+                    value,
+                    ic_index,
+                } if matches!(read(value)?, ReceiverAffineSymbolicValue::Receiver) => {
+                    let dst = destination(dst)?;
+                    let ic_index = u32::from(ic_index);
+                    if state_write_ic.is_none() {
+                        if state_read_ic.replace(ic_index).is_some() {
+                            return None;
+                        }
+                        registers[dst] = ReceiverAffineSymbolicValue::StateBefore;
+                    } else {
+                        if state_return_ic.replace(ic_index).is_some() {
+                            return None;
+                        }
+                        registers[dst] = ReceiverAffineSymbolicValue::StateAfter;
+                    }
+                }
+                Instruction::Add { dst, lhs, rhs } if argument_scale.is_none() => {
+                    if !matches!(
+                        (read(lhs)?, read(rhs)?),
+                        (
+                            ReceiverAffineSymbolicValue::StateBefore,
+                            ReceiverAffineSymbolicValue::Argument
+                        ) | (
+                            ReceiverAffineSymbolicValue::Argument,
+                            ReceiverAffineSymbolicValue::StateBefore
+                        )
+                    ) {
+                        return None;
+                    }
+                    let dst = destination(dst)?;
+                    registers[dst] = ReceiverAffineSymbolicValue::Step(1);
+                    argument_scale = Some(1);
+                }
+                Instruction::Sub { dst, lhs, rhs } if argument_scale.is_none() => {
+                    if !matches!(
+                        (read(lhs)?, read(rhs)?),
+                        (
+                            ReceiverAffineSymbolicValue::StateBefore,
+                            ReceiverAffineSymbolicValue::Argument
+                        )
+                    ) {
+                        return None;
+                    }
+                    let dst = destination(dst)?;
+                    registers[dst] = ReceiverAffineSymbolicValue::Step(-1);
+                    argument_scale = Some(-1);
+                }
+                Instruction::SetPropertyByName {
+                    value,
+                    object,
+                    ic_index,
+                } if matches!(read(object)?, ReceiverAffineSymbolicValue::Receiver) => {
+                    let ReceiverAffineSymbolicValue::Step(scale) = read(value)? else {
+                        return None;
+                    };
+                    if argument_scale != Some(scale)
+                        || state_write_ic.replace(u32::from(ic_index)).is_some()
+                    {
+                        return None;
+                    }
+                }
+                Instruction::PushFromRegister { src } => {
+                    let value = read(src)?;
+                    if matches!(value, ReceiverAffineSymbolicValue::Unset) {
+                        return None;
+                    }
+                    stack.push(value);
+                }
+                Instruction::PopIntoRegister { dst } => {
+                    let value = stack.pop()?;
+                    let dst = destination(dst)?;
+                    registers[dst] = value;
+                }
+                Instruction::SetAccumulator { src } => {
+                    if !matches!(read(src)?, ReceiverAffineSymbolicValue::StateAfter)
+                        || accumulator_set
+                    {
+                        return None;
+                    }
+                    accumulator_set = true;
+                }
+                Instruction::CheckReturn => {}
+                Instruction::Return => {
+                    if !stack.is_empty() || !accumulator_set {
+                        return None;
+                    }
+                    let plan = PureReceiverAffineStepPlan {
+                        read_ic_index: state_read_ic?,
+                        write_ic_index: state_write_ic?,
+                        return_ic_index: state_return_ic?,
+                        argument_scale: argument_scale?,
+                    };
+                    let read_name = &code.ic.get(plan.read_ic_index as usize)?.name;
+                    let write_name = &code.ic.get(plan.write_ic_index as usize)?.name;
+                    let return_name = &code.ic.get(plan.return_ic_index as usize)?.name;
+                    if write_name != read_name || return_name != read_name {
+                        return None;
+                    }
+                    return Some(Self {
+                        nodes: Box::default(),
+                        root: 0,
+                        kind: PureFunctionKind::ReceiverAffineStep(plan),
+                    });
+                }
+                _ => return None,
+            }
+        }
+
+        None
+    }
 }
 
 impl PureLoopPlan {
@@ -508,11 +718,13 @@ impl PureLoopPlan {
             {
                 plans.push(Self::Affine(plan));
             } else if let Some(plan) =
+                PureMethodLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::Method(plan));
+            } else if let Some(plan) =
                 PurePropertyWriteLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
-                plans.push(Self::PropertyWrite(
-                    plan.with_guard_bit(1_u8 << plans.len()),
-                ));
+                plans.push(Self::PropertyWrite(plan));
             }
         }
         plans.into_boxed_slice()
@@ -1129,6 +1341,401 @@ impl PureAffineLoopPlan {
     }
 }
 
+impl PureMethodLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+        let receiver_load_index = loop_iteration_index.checked_add(3)?;
+        let method_load_index = loop_iteration_index.checked_add(4)?;
+        let receiver_push_index = loop_iteration_index.checked_add(5)?;
+        let method_push_index = loop_iteration_index.checked_add(6)?;
+        let argument_load_index = loop_iteration_index.checked_add(7)?;
+        let argument_push_index = loop_iteration_index.checked_add(8)?;
+        let call_index = loop_iteration_index.checked_add(9)?;
+        let pop_index = loop_iteration_index.checked_add(10)?;
+        let after_pop_index = loop_iteration_index.checked_add(11)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+
+        let increment = instructions.get(increment_index)?;
+        let Instruction::Inc { src, dst } = &increment.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+
+        let binding_read = |instruction_index: usize| {
+            let instruction = &instructions.get(instruction_index)?.instruction;
+            match instruction {
+                Instruction::GetName { dst, binding_index } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })?;
+                    Some((usize::from(*dst), binding_index, None))
+                }
+                Instruction::GetNameGlobal {
+                    dst,
+                    binding_index,
+                    ic_index,
+                } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                    Some((usize::from(*dst), binding_index, Some(u32::from(*ic_index))))
+                }
+                _ => None,
+            }
+        };
+        let (receiver_register, receiver_binding_index, receiver_binding_ic_index) =
+            binding_read(receiver_load_index)?;
+
+        let Instruction::GetPropertyByName {
+            dst,
+            value,
+            ic_index,
+        } = &instructions.get(method_load_index)?.instruction
+        else {
+            return None;
+        };
+        if usize::from(*value) != receiver_register {
+            return None;
+        }
+        let method_register = usize::from(*dst);
+        let method_ic_index = u32::from(*ic_index);
+
+        if !matches!(
+            &instructions.get(receiver_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == receiver_register
+        ) || !matches!(
+            &instructions.get(method_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == method_register
+        ) {
+            return None;
+        }
+
+        let (argument_register, argument) =
+            match &instructions.get(argument_load_index)?.instruction {
+                Instruction::StoreZero { dst } => (usize::from(*dst), 0),
+                Instruction::StoreOne { dst } => (usize::from(*dst), 1),
+                Instruction::StoreInt8 { value, dst } => (usize::from(*dst), i32::from(*value)),
+                Instruction::StoreInt16 { value, dst } => (usize::from(*dst), i32::from(*value)),
+                Instruction::StoreInt32 { value, dst } => (usize::from(*dst), *value),
+                _ => return None,
+            };
+        if !matches!(
+            &instructions.get(argument_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == argument_register
+        ) || !matches!(
+            &instructions.get(call_index)?.instruction,
+            Instruction::Call { argument_count } if u32::from(*argument_count) == 1
+        ) {
+            return None;
+        }
+
+        let Instruction::PopIntoRegister { dst } = &instructions.get(pop_index)?.instruction else {
+            return None;
+        };
+        let result = usize::from(*dst);
+        let (back_edge_index, accumulator) = if let Instruction::Move { src, dst } =
+            &instructions.get(after_pop_index)?.instruction
+        {
+            if usize::from(*src) != result {
+                return None;
+            }
+            (after_pop_index.checked_add(1)?, usize::from(*dst))
+        } else {
+            (after_pop_index, result)
+        };
+
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = &instructions.get(back_edge_index)?.instruction
+        else {
+            return None;
+        };
+        if back_edge_address.as_u32() as usize != loop_iteration.pc {
+            return None;
+        }
+
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let body_start_pc = instructions.get(receiver_load_index)?.pc;
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start_pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, accumulator];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+        {
+            return None;
+        }
+        let temporary_registers = [
+            receiver_register,
+            method_register,
+            argument_register,
+            result,
+        ];
+        if temporary_registers
+            .iter()
+            .any(|register| source_registers.contains(register))
+        {
+            return None;
+        }
+
+        let live_at_exit = continuation_live_registers(code, exit_pc)?;
+        if temporary_registers
+            .iter()
+            .any(|temporary| live_at_exit.get(*temporary).copied().unwrap_or(true))
+        {
+            return None;
+        }
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            exit_pc: u32::try_from(exit_pc).ok()?,
+            receiver_binding_index,
+            receiver_binding_ic_index,
+            method_ic_index,
+            argument,
+            index,
+            limit,
+            accumulator,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_METHOD_GUARD_MISS != 0 {
+            return None;
+        }
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let index = context.vm.get_register(self.index).as_i32()?;
+        let limit = context.vm.get_register(self.limit).as_i32()?;
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 0 {
+            return None;
+        }
+
+        let receiver = binding_data_value(
+            caller_code,
+            self.receiver_binding_index,
+            self.receiver_binding_ic_index,
+            context,
+        )?;
+        let Some(receiver) = receiver.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        if !receiver.is_ordinary() {
+            return self.suppress_for_frame(context);
+        }
+
+        let method = {
+            let receiver = receiver.borrow();
+            let ic = caller_code.ic.get(self.method_ic_index as usize)?;
+            let slot = ic.get(receiver.shape())?;
+            if slot.attributes.is_accessor_descriptor() {
+                return self.suppress_for_frame(context);
+            }
+            if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
+                let Some(prototype) = receiver.shape().prototype() else {
+                    return self.suppress_for_frame(context);
+                };
+                let prototype = prototype.borrow();
+                let Some(method) = prototype
+                    .properties()
+                    .storage
+                    .get(slot.index as usize)
+                    .cloned()
+                else {
+                    return self.suppress_for_frame(context);
+                };
+                method
+            } else {
+                let Some(method) = receiver
+                    .properties()
+                    .storage
+                    .get(slot.index as usize)
+                    .cloned()
+                else {
+                    return self.suppress_for_frame(context);
+                };
+                method
+            }
+        };
+        let Some(method) = method.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(ordinary) = method.downcast_ref::<crate::builtins::function::OrdinaryFunction>()
+        else {
+            return self.suppress_for_frame(context);
+        };
+        let step_code = ordinary.codeblock();
+        if !step_code.is_ordinary()
+            || step_code.is_class_constructor()
+            || step_code.has_binding_identifier()
+            || step_code.has_function_scope()
+        {
+            return self.suppress_for_frame(context);
+        }
+        #[cfg(feature = "trace")]
+        if step_code.traceable() {
+            return None;
+        }
+        let Some(step) = step_code.pure_receiver_affine_step() else {
+            return self.suppress_for_frame(context);
+        };
+
+        let (slot_index, state) = {
+            let receiver = receiver.borrow();
+            let shape = receiver.shape();
+            let read_slot = step_code.ic.get(step.read_ic_index as usize)?.get(shape)?;
+            let write_slot = step_code.ic.get(step.write_ic_index as usize)?.get(shape)?;
+            let return_slot = step_code
+                .ic
+                .get(step.return_ic_index as usize)?
+                .get(shape)?;
+            if read_slot.index != write_slot.index
+                || read_slot.index != return_slot.index
+                || read_slot.attributes.is_accessor_descriptor()
+                || write_slot.attributes.is_accessor_descriptor()
+                || return_slot.attributes.is_accessor_descriptor()
+                || read_slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                || write_slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                || return_slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                || !write_slot.attributes.contains(SlotAttributes::WRITABLE)
+            {
+                return self.suppress_for_frame(context);
+            }
+            let slot_index = read_slot.index as usize;
+            let Some(state) = receiver
+                .properties()
+                .storage
+                .get(slot_index)
+                .and_then(JsValue::as_i32)
+            else {
+                return self.suppress_for_frame(context);
+            };
+            (slot_index, state)
+        };
+
+        let delta = i128::from(self.argument) * i128::from(step.argument_scale);
+        let reduced = i128::from(state) + delta * i128::from(remaining);
+        let reduced = i32::try_from(reduced).ok()?;
+        let total_iterations = u64::try_from(remaining).ok()?.checked_add(1)?;
+
+        context.consume_loop_iterations(total_iterations).ok()?;
+        receiver.borrow_mut().properties_mut().storage[slot_index] = reduced.into();
+        context.vm.set_register(self.accumulator, reduced.into());
+        context.vm.set_register(self.index, limit.into());
+        context.vm.frame_mut().pc = self.exit_pc;
+        caller_code.mark_pure_range_loop_observed();
+        #[cfg(test)]
+        {
+            context.vm.pure_method_loop_reductions =
+                context.vm.pure_method_loop_reductions.saturating_add(1);
+            context.vm.pure_method_loop_calls_elided = context
+                .vm
+                .pure_method_loop_calls_elided
+                .saturating_add(u64::try_from(remaining).ok()?);
+        }
+        Some(())
+    }
+
+    fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
+        debug_assert!(self.loop_iteration_next_pc > self.loop_iteration_pc);
+        context.vm.frame_mut().pure_loop_guard_misses |= PURE_METHOD_GUARD_MISS;
+        None
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
+    }
+}
+
 impl PurePropertyWriteLoopPlan {
     fn parse_at(
         code: &CodeBlock,
@@ -1334,14 +1941,13 @@ impl PurePropertyWriteLoopPlan {
             object_ic_index,
             property_ic_indices,
             property_count: u8::try_from(property_count).ok()?,
-            guard_bit: 0,
             index,
             limit,
         })
     }
 
     pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
-        if context.vm.frame().pure_loop_guard_misses & self.guard_bit != 0 {
+        if context.vm.frame().pure_loop_guard_misses & PURE_PROPERTY_WRITE_GUARD_MISS != 0 {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
@@ -1432,13 +2038,9 @@ impl PurePropertyWriteLoopPlan {
     }
 
     fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
-        context.vm.frame_mut().pure_loop_guard_misses |= self.guard_bit;
+        debug_assert!(self.loop_iteration_next_pc > self.loop_iteration_pc);
+        context.vm.frame_mut().pure_loop_guard_misses |= PURE_PROPERTY_WRITE_GUARD_MISS;
         None
-    }
-
-    const fn with_guard_bit(mut self, guard_bit: u8) -> Self {
-        self.guard_bit = guard_bit;
-        self
     }
 
     pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
@@ -1456,6 +2058,7 @@ impl PureLoopPlan {
             Self::Reader(plan) => plan.loop_iteration_pc(),
             Self::Affine(plan) => plan.loop_iteration_pc(),
             Self::PropertyWrite(plan) => plan.loop_iteration_pc(),
+            Self::Method(plan) => plan.loop_iteration_pc(),
         }
     }
 }
@@ -1600,6 +2203,204 @@ mod tests {
         Context, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
     };
+
+    #[test]
+    fn canonical_method_loop_advances_receiver_slot_as_a_range() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 10;\n\
+                 class Counter {\n\
+                     constructor() { this.n = 0; }\n\
+                     inc(value) { this.n = this.n + value; return this.n; }\n\
+                 }\n\
+                 const counter = new Counter();\n\
+                 function main() {\n\
+                     let last = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         last = counter.inc(1);\n\
+                     }\n\
+                     return last;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical affine method loop must succeed");
+
+        assert_eq!(result, JsValue::new(10));
+        assert_eq!(
+            context.eval(Source::from_bytes("counter.n")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(context.vm.pure_method_loop_reductions, 1);
+        assert_eq!(context.vm.pure_method_loop_calls_elided, 9);
+    }
+
+    #[test]
+    fn method_loop_revalidates_rebound_receivers_methods_and_state_slots() {
+        let mut context = Context::default();
+        context
+            .eval(Source::from_bytes(
+                "const N = 10;\n\
+                 class Counter {\n\
+                     constructor() { this.n = 0; }\n\
+                     inc(value) { this.n = this.n + value; return this.n; }\n\
+                 }\n\
+                 let counter = new Counter();\n\
+                 function run() {\n\
+                     let last = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         last = counter.inc(1);\n\
+                     }\n\
+                     return last;\n\
+                 }",
+            ))
+            .expect("definitions must succeed");
+
+        assert_eq!(
+            context.eval(Source::from_bytes("run()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(context.vm.pure_method_loop_reductions, 1);
+
+        let accessor_state = context
+            .eval(Source::from_bytes(
+                "let stateReads = 0; let stateWrites = 0;\n\
+                 counter = {\n\
+                     value: 0,\n\
+                     inc: Counter.prototype.inc,\n\
+                     get n() { stateReads++; return this.value; },\n\
+                     set n(value) { stateWrites++; this.value = value; }\n\
+                 };\n\
+                 const accessorResult = run();\n\
+                 [accessorResult, stateReads, stateWrites].join(',');",
+            ))
+            .expect("accessor state must execute every method call");
+        assert_eq!(
+            accessor_state
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("10,20,10")
+        );
+        assert_eq!(context.vm.pure_method_loop_reductions, 1);
+
+        let accessor_method = context
+            .eval(Source::from_bytes(
+                "let methodReads = 0; let methodCalls = 0;\n\
+                 counter = {\n\
+                     n: 0,\n\
+                     get inc() {\n\
+                         methodReads++;\n\
+                         return function(value) {\n\
+                             methodCalls++;\n\
+                             this.n = this.n + value;\n\
+                             return this.n;\n\
+                         };\n\
+                     }\n\
+                 };\n\
+                 const methodResult = run();\n\
+                 [methodResult, methodReads, methodCalls].join(',');",
+            ))
+            .expect("accessor method must execute every lookup and call");
+        assert_eq!(
+            accessor_method
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("10,10,10")
+        );
+        assert_eq!(context.vm.pure_method_loop_reductions, 1);
+
+        assert_eq!(
+            context.eval(Source::from_bytes("counter = new Counter(); run()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(context.vm.pure_method_loop_reductions, 2);
+    }
+
+    #[test]
+    fn method_loop_shortcuts_preserve_effects_overflow_and_finite_accounting() {
+        let definition = "const N = 10;\n\
+            class Counter {\n\
+                constructor() { this.n = 0; }\n\
+                inc(value) { this.n = this.n + value; return this.n; }\n\
+            }\n\
+            const counter = new Counter();\n\
+            function main() {\n\
+                let last = 0;\n\
+                for (let index = 0; index < N; index++) {\n\
+                    last = counter.inc(1);\n\
+                }\n\
+                return last;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget case definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        assert_eq!(
+            budgeted.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(budgeted.vm.pure_method_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit case definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(3);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must execute every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_method_loop_reductions, 0);
+
+        let mut overflow = Context::default();
+        let result = overflow
+            .eval(Source::from_bytes(
+                "const N = 4;\n\
+                 class Counter {\n\
+                     constructor() { this.n = 2147483646; }\n\
+                     inc(value) { this.n = this.n + value; return this.n; }\n\
+                 }\n\
+                 const counter = new Counter();\n\
+                 function main() {\n\
+                     let last = 0;\n\
+                     for (let index = 0; index < N; index++) { last = counter.inc(1); }\n\
+                     return last;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("overflow case must preserve Number promotion");
+        assert_eq!(result, JsValue::new(2_147_483_650_f64));
+        assert_eq!(overflow.vm.pure_method_loop_reductions, 0);
+
+        let mut effectful = Context::default();
+        let result = effectful
+            .eval(Source::from_bytes(
+                "const N = 10; let effects = 0;\n\
+                 class Counter {\n\
+                     constructor() { this.n = 0; }\n\
+                     inc(value) { effects++; this.n = this.n + value; return this.n; }\n\
+                 }\n\
+                 const counter = new Counter();\n\
+                 function main() {\n\
+                     let last = 0;\n\
+                     for (let index = 0; index < N; index++) { last = counter.inc(1); }\n\
+                     return last + effects;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("near-match method must preserve every side effect");
+        assert_eq!(result, JsValue::new(20));
+        assert_eq!(effectful.vm.pure_method_loop_reductions, 0);
+    }
 
     #[test]
     fn canonical_property_write_loop_keeps_only_the_final_overwrite() {

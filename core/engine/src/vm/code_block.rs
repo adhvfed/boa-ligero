@@ -114,8 +114,8 @@ use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
     pure_reader::{
-        PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PurePropertyWriteLoopPlan,
-        PureReaderLoopPlan,
+        PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PureMethodLoopPlan,
+        PurePropertyWriteLoopPlan, PureReaderLoopPlan, PureReceiverAffineStepPlan,
     },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
@@ -520,6 +520,12 @@ impl CodeBlock {
         self.pure_function_plan()?.affine_delta()
     }
 
+    /// Return a cached proof that this method advances and returns one receiver
+    /// data slot by its first argument.
+    pub(crate) fn pure_receiver_affine_step(&self) -> Option<PureReceiverAffineStepPlan> {
+        self.pure_function_plan()?.receiver_affine_step()
+    }
+
     /// Return the statically cached pure-reader loop whose maintenance opcode
     /// just advanced to `next_pc`.
     #[inline]
@@ -534,7 +540,8 @@ impl CodeBlock {
                 }
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
-                | PureLoopPlan::PropertyWrite(_) => None,
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_) => None,
             })
     }
 
@@ -552,7 +559,8 @@ impl CodeBlock {
                 }
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
-                | PureLoopPlan::PropertyWrite(_) => None,
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_) => None,
             })
     }
 
@@ -573,7 +581,27 @@ impl CodeBlock {
                 }
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
-                | PureLoopPlan::PropertyWrite(_) => None,
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_) => None,
+            })
+    }
+
+    /// Return the cached affine-method loop whose maintenance opcode just
+    /// advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_method_loop_plan(&self, next_pc: u32) -> Option<PureMethodLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::Method(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_) => None,
             })
     }
 
@@ -607,6 +635,7 @@ impl CodeBlock {
                 PureLoopPlan::Reader(_) => Opcode::PureReaderLoopIteration,
                 PureLoopPlan::Affine(_) => Opcode::PureAffineLoopIteration,
                 PureLoopPlan::PropertyWrite(_) => Opcode::PurePropertyWriteLoopIteration,
+                PureLoopPlan::Method(_) => Opcode::PureMethodLoopIteration,
             }
             .encode();
         }
@@ -1224,6 +1253,7 @@ impl CodeBlock {
             | Instruction::PureReaderLoopIteration
             | Instruction::PureAffineLoopIteration
             | Instruction::PurePropertyWriteLoopIteration
+            | Instruction::PureMethodLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1233,8 +1263,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved9
-            | Instruction::Reserved10
+            Instruction::Reserved10
             | Instruction::Reserved11
             | Instruction::Reserved12
             | Instruction::Reserved13

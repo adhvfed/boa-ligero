@@ -1,4 +1,10 @@
-use crate::{Context, JsResult, vm::opcode::Operation};
+use crate::{
+    Context, JsResult,
+    vm::{
+        opcode::Operation,
+        pure_reader::{PURE_METHOD_GUARD_MISS, PURE_PROPERTY_WRITE_GUARD_MISS},
+    },
+};
 
 /// `IncrementLoopIteration` implements the Opcode Operation for `Opcode::IncrementLoopIteration`.
 ///
@@ -90,6 +96,9 @@ pub(crate) struct PurePropertyWriteLoopIteration;
 impl PurePropertyWriteLoopIteration {
     #[inline(always)]
     pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_PROPERTY_WRITE_GUARD_MISS != 0 {
+            return context.consume_loop_iterations(1);
+        }
         let plan = context
             .vm
             .frame()
@@ -108,5 +117,38 @@ impl PurePropertyWriteLoopIteration {
 impl Operation for PurePropertyWriteLoopIteration {
     const NAME: &'static str = "PurePropertyWriteLoopIteration";
     const INSTRUCTION: &'static str = "INST - PurePropertyWriteLoopIteration";
+    const COST: u8 = 3;
+}
+
+/// Loop-maintenance opcode installed on a canonical constant-argument method
+/// recurrence. A successful guard advances the receiver's proven data slot in
+/// one checked range step.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureMethodLoopIteration;
+
+impl PureMethodLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_METHOD_GUARD_MISS != 0 {
+            return context.consume_loop_iterations(1);
+        }
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_method_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PureMethodLoopIteration {
+    const NAME: &'static str = "PureMethodLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PureMethodLoopIteration";
     const COST: u8 = 3;
 }
