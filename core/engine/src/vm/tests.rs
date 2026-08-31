@@ -175,10 +175,12 @@ fn emotion_hash_summary_honors_builtin_replacements_and_runtime_limits() {
 
 #[test]
 fn emotion_hash_summary_preserves_exact_instruction_accounting() {
+    let strict_production = format!("\"use strict\";{EMOTION_HASH_PRODUCTION_SOURCE}");
     for source in [
         EMOTION_HASH_SOURCE,
         EMOTION_HASH_BLOCK_SOURCE,
         EMOTION_HASH_PRODUCTION_SOURCE,
+        strict_production.as_str(),
     ] {
         let mut summarized = Context::default();
         summarized
