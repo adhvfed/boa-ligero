@@ -2290,8 +2290,8 @@ generate_opcodes! {
     },
     /// Execute loop maintenance with a cached pure-reader range proof.
     PureReaderLoopIteration,
-    /// Reserved [`Opcode`].
-    Reserved7 => Reserved,
+    /// Execute loop maintenance with a cached pure-affine range proof.
+    PureAffineLoopIteration,
     /// Reserved [`Opcode`].
     Reserved8 => Reserved,
     /// Reserved [`Opcode`].

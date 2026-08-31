@@ -49,3 +49,34 @@ impl Operation for PureReaderLoopIteration {
     const INSTRUCTION: &'static str = "INST - PureReaderLoopIteration";
     const COST: u8 = 3;
 }
+
+/// Loop-maintenance opcode installed only on a canonical single-argument call
+/// recurrence. Before a runtime affine proof succeeds, the native tier may
+/// lower it as ordinary maintenance; an observed range summary keeps the code
+/// block in the faster interpreter path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureAffineLoopIteration;
+
+impl PureAffineLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_affine_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PureAffineLoopIteration {
+    const NAME: &'static str = "PureAffineLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PureAffineLoopIteration";
+    const COST: u8 = 3;
+}

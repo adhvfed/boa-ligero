@@ -1,10 +1,11 @@
-//! Cached proof and evaluation for small pure numeric property readers.
+//! Cached proofs and range summaries for small pure numeric calls.
 //!
 //! The accepted bytecode subset is deliberately narrow: a linear ordinary
 //! function may read cached data properties from argument zero, combine i32
-//! values with checked addition/subtraction, and return the result.  The plan
-//! contains no source text or GC-managed pointers, so it is safe to retain on
-//! the immutable [`CodeBlock`] and reuse from both interpreter and JIT paths.
+//! values with checked addition/subtraction, or apply one constant i32 offset
+//! to its argument. The plans contain no source text or GC-managed pointers,
+//! so they are safe to retain on the immutable [`CodeBlock`] and reuse from
+//! both interpreter and JIT paths.
 
 use crate::{
     Context, JsObject, JsValue,
@@ -35,11 +36,29 @@ enum SymbolicValue {
     Node(u8),
 }
 
-/// A source-free proof that a code block is a small pure i32 property reader.
+#[derive(Clone, Copy, Debug)]
+enum AffineSymbolicValue {
+    Unset,
+    Argument,
+    Constant(i32),
+    Step(i32),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PureFunctionKind {
+    Reader,
+    AffineStep,
+}
+
+/// One cached, source-free proof for the mutually exclusive pure-function
+/// subsets consumed by structural loop summaries. Affine offsets reuse a
+/// constant node so this remains the same compact `(box, root, tag)` layout as
+/// the original property-reader proof.
 #[derive(Clone, Debug)]
-pub(crate) struct PureReaderPlan {
+pub(crate) struct PureFunctionPlan {
     nodes: Box<[PureReaderNode]>,
     root: u8,
+    kind: PureFunctionKind,
 }
 
 #[derive(Clone)]
@@ -65,8 +84,30 @@ pub(crate) struct PureReaderLoopPlan {
     sum: usize,
 }
 
-impl PureReaderPlan {
-    pub(super) fn parse(code: &CodeBlock) -> Option<Self> {
+/// A canonical `accumulator = step(accumulator)` loop whose first completed
+/// iteration proves the current function and i32 representation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureAffineLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    exit_pc: u32,
+    function_binding_index: u32,
+    function_ic_index: Option<u32>,
+    index: usize,
+    limit: usize,
+    accumulator: usize,
+}
+
+/// A statically proven loop shape. Reader and affine candidates use distinct
+/// specialized opcodes because their runtime guards and tiering policy differ.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PureLoopPlan {
+    Reader(PureReaderLoopPlan),
+    Affine(PureAffineLoopPlan),
+}
+
+impl PureFunctionPlan {
+    fn parse_reader(code: &CodeBlock) -> Option<Self> {
         if !code.is_ordinary()
             || code.is_class_constructor()
             || !code.handlers.is_empty()
@@ -203,6 +244,7 @@ impl PureReaderPlan {
                     return Some(Self {
                         nodes: nodes.into_boxed_slice(),
                         root: accumulator?,
+                        kind: PureFunctionKind::Reader,
                     });
                 }
                 _ => return None,
@@ -214,7 +256,10 @@ impl PureReaderPlan {
 
     /// Evaluate the proven plan without allocating or invoking JavaScript.
     /// A miss is pre-effect and sends the caller through ordinary bytecode.
-    pub(super) fn evaluate(&self, code: &CodeBlock, object: &JsObject) -> Option<i32> {
+    fn evaluate_reader(&self, code: &CodeBlock, object: &JsObject) -> Option<i32> {
+        if !matches!(self.kind, PureFunctionKind::Reader) {
+            return None;
+        }
         if !object.uses_ordinary_property_reads() {
             return None;
         }
@@ -261,7 +306,148 @@ impl PureReaderPlan {
     }
 }
 
-impl PureReaderLoopPlan {
+impl PureFunctionPlan {
+    pub(super) fn parse(code: &CodeBlock) -> Option<Self> {
+        Self::parse_reader(code).or_else(|| Self::parse_affine(code))
+    }
+
+    pub(super) fn reader_i32(&self, code: &CodeBlock, object: &JsObject) -> Option<i32> {
+        self.evaluate_reader(code, object)
+    }
+
+    pub(super) fn affine_delta(&self) -> Option<i32> {
+        if !matches!(self.kind, PureFunctionKind::AffineStep) {
+            return None;
+        }
+        let PureReaderNode::Constant(delta) = self.nodes.get(usize::from(self.root))? else {
+            return None;
+        };
+        Some(*delta)
+    }
+
+    fn parse_affine(code: &CodeBlock) -> Option<Self> {
+        if !code.is_ordinary()
+            || code.is_class_constructor()
+            || !code.handlers.is_empty()
+            || code.register_count > MAX_PURE_READER_REGISTERS
+        {
+            return None;
+        }
+
+        let mut registers = vec![AffineSymbolicValue::Unset; code.register_count as usize];
+        let mut stack = Vec::new();
+        let mut accumulator = None;
+        let mut instruction_count = 0usize;
+        let mut arithmetic_seen = false;
+
+        for (_, _, instruction) in InstructionIterator::new(&code.bytecode) {
+            instruction_count = instruction_count.checked_add(1)?;
+            if instruction_count > MAX_PURE_READER_INSTRUCTIONS {
+                return None;
+            }
+
+            let read = |register: crate::vm::opcode::RegisterOperand| {
+                registers.get(usize::from(register)).copied()
+            };
+            let destination = |register: crate::vm::opcode::RegisterOperand| {
+                usize::from(register)
+                    .lt(&registers.len())
+                    .then_some(usize::from(register))
+            };
+
+            match instruction {
+                Instruction::GetArgument { index, dst } if u32::from(index) == 0 => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Argument;
+                }
+                Instruction::StoreZero { dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Constant(0);
+                }
+                Instruction::StoreOne { dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Constant(1);
+                }
+                Instruction::StoreInt8 { value, dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Constant(i32::from(value));
+                }
+                Instruction::StoreInt16 { value, dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Constant(i32::from(value));
+                }
+                Instruction::StoreInt32 { value, dst } => {
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Constant(value);
+                }
+                Instruction::Move { src, dst } => {
+                    let value = read(src)?;
+                    if matches!(value, AffineSymbolicValue::Unset) {
+                        return None;
+                    }
+                    let dst = destination(dst)?;
+                    registers[dst] = value;
+                }
+                Instruction::Add { dst, lhs, rhs } if !arithmetic_seen => {
+                    let ((AffineSymbolicValue::Argument, AffineSymbolicValue::Constant(delta))
+                    | (AffineSymbolicValue::Constant(delta), AffineSymbolicValue::Argument)) =
+                        (read(lhs)?, read(rhs)?)
+                    else {
+                        return None;
+                    };
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Step(delta);
+                    arithmetic_seen = true;
+                }
+                Instruction::Sub { dst, lhs, rhs } if !arithmetic_seen => {
+                    let (AffineSymbolicValue::Argument, AffineSymbolicValue::Constant(constant)) =
+                        (read(lhs)?, read(rhs)?)
+                    else {
+                        return None;
+                    };
+                    let dst = destination(dst)?;
+                    registers[dst] = AffineSymbolicValue::Step(constant.checked_neg()?);
+                    arithmetic_seen = true;
+                }
+                Instruction::PushFromRegister { src } => {
+                    let value = read(src)?;
+                    if matches!(value, AffineSymbolicValue::Unset) {
+                        return None;
+                    }
+                    stack.push(value);
+                }
+                Instruction::PopIntoRegister { dst } => {
+                    let value = stack.pop()?;
+                    let dst = destination(dst)?;
+                    registers[dst] = value;
+                }
+                Instruction::SetAccumulator { src } => {
+                    let AffineSymbolicValue::Step(delta) = read(src)? else {
+                        return None;
+                    };
+                    accumulator = Some(delta);
+                }
+                Instruction::CheckReturn => {}
+                Instruction::Return => {
+                    if !arithmetic_seen || !stack.is_empty() {
+                        return None;
+                    }
+                    let delta = accumulator?;
+                    return Some(Self {
+                        nodes: vec![PureReaderNode::Constant(delta)].into_boxed_slice(),
+                        root: 0,
+                        kind: PureFunctionKind::AffineStep,
+                    });
+                }
+                _ => return None,
+            }
+        }
+
+        None
+    }
+}
+
+impl PureLoopPlan {
     pub(super) fn parse_all(code: &CodeBlock) -> Box<[Self]> {
         // Most functions contain no loops. Avoid allocating and decoding an
         // instruction vector unless the byte stream could contain the loop
@@ -294,13 +480,21 @@ impl PureReaderLoopPlan {
             if plans.len() == MAX_PURE_READER_LOOPS {
                 break;
             }
-            if let Some(plan) = Self::parse_at(code, &instructions, loop_iteration_index) {
-                plans.push(plan);
+            if let Some(plan) =
+                PureReaderLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::Reader(plan));
+            } else if let Some(plan) =
+                PureAffineLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::Affine(plan));
             }
         }
         plans.into_boxed_slice()
     }
+}
 
+impl PureReaderLoopPlan {
     fn parse_at(
         code: &CodeBlock,
         instructions: &[DecodedInstruction],
@@ -440,6 +634,9 @@ impl PureReaderLoopPlan {
             return None;
         };
         let reader_result = usize::from(*dst);
+        if reader_result == saved_sum {
+            return None;
+        }
         let Instruction::Add { dst, lhs, rhs } = &instructions.get(add_index)?.instruction else {
             return None;
         };
@@ -628,6 +825,294 @@ impl PureReaderLoopPlan {
     }
 }
 
+impl PureAffineLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+        let body_start_index = loop_iteration_index.checked_add(3)?;
+        let function_load_index = loop_iteration_index.checked_add(4)?;
+        let function_push_index = loop_iteration_index.checked_add(5)?;
+        let argument_push_index = loop_iteration_index.checked_add(6)?;
+        let call_index = loop_iteration_index.checked_add(7)?;
+        let pop_index = loop_iteration_index.checked_add(8)?;
+        let after_pop_index = loop_iteration_index.checked_add(9)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+
+        let increment = instructions.get(increment_index)?;
+        let Instruction::Inc { src, dst } = &increment.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+
+        let body_start = instructions.get(body_start_index)?;
+        if !matches!(
+            &body_start.instruction,
+            Instruction::PushFromRegister { .. }
+        ) {
+            return None;
+        }
+
+        let binding_read = |instruction_index: usize| {
+            let instruction = &instructions.get(instruction_index)?.instruction;
+            match instruction {
+                Instruction::GetName { dst, binding_index } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })?;
+                    Some((usize::from(*dst), binding_index, None))
+                }
+                Instruction::GetNameGlobal {
+                    dst,
+                    binding_index,
+                    ic_index,
+                } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                    Some((usize::from(*dst), binding_index, Some(u32::from(*ic_index))))
+                }
+                _ => None,
+            }
+        };
+        let (function_register, function_binding_index, function_ic_index) =
+            binding_read(function_load_index)?;
+
+        if !matches!(
+            &instructions.get(function_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == function_register
+        ) {
+            return None;
+        }
+        let Instruction::PushFromRegister { src } =
+            &instructions.get(argument_push_index)?.instruction
+        else {
+            return None;
+        };
+        let accumulator = usize::from(*src);
+        if !matches!(
+            &instructions.get(call_index)?.instruction,
+            Instruction::Call { argument_count } if u32::from(*argument_count) == 1
+        ) {
+            return None;
+        }
+        let Instruction::PopIntoRegister { dst } = &instructions.get(pop_index)?.instruction else {
+            return None;
+        };
+        let result = usize::from(*dst);
+
+        let (back_edge_index, result_temporary) = if let Instruction::Move { src, dst } =
+            &instructions.get(after_pop_index)?.instruction
+        {
+            if usize::from(*src) != result || usize::from(*dst) != accumulator {
+                return None;
+            }
+            (after_pop_index.checked_add(1)?, Some(result))
+        } else {
+            if result != accumulator {
+                return None;
+            }
+            (after_pop_index, None)
+        };
+
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = &instructions.get(back_edge_index)?.instruction
+        else {
+            return None;
+        };
+        if back_edge_address.as_u32() as usize != loop_iteration.pc {
+            return None;
+        }
+
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start.pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, accumulator];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+            || source_registers.contains(&function_register)
+        {
+            return None;
+        }
+
+        let live_at_exit = continuation_live_registers(code, exit_pc)?;
+        if live_at_exit.get(function_register).copied().unwrap_or(true)
+            || result_temporary
+                .is_some_and(|temporary| live_at_exit.get(temporary).copied().unwrap_or(true))
+        {
+            return None;
+        }
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            exit_pc: u32::try_from(exit_pc).ok()?,
+            function_binding_index,
+            function_ic_index,
+            index,
+            limit,
+            accumulator,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let index = context.vm.get_register(self.index).as_i32()?;
+        let limit = context.vm.get_register(self.limit).as_i32()?;
+        let accumulator = context.vm.get_register(self.accumulator).as_i32()?;
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 0 {
+            return None;
+        }
+
+        let function = binding_data_value(
+            caller_code,
+            self.function_binding_index,
+            self.function_ic_index,
+            context,
+        )?;
+        let function = function.as_object()?;
+        let ordinary = function.downcast_ref::<crate::builtins::function::OrdinaryFunction>()?;
+        let step_code = ordinary.codeblock();
+        if !step_code.is_ordinary()
+            || step_code.is_class_constructor()
+            || step_code.has_binding_identifier()
+            || step_code.has_function_scope()
+        {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if step_code.traceable() {
+            return None;
+        }
+        let delta = step_code.pure_affine_step_delta()?;
+
+        // The first source iteration proved the call, representation, and
+        // runtime checks. A constant offset is monotone, so i32 endpoints also
+        // prove that every skipped intermediate call remains an i32 operation.
+        let reduced = i128::from(accumulator) + i128::from(delta) * i128::from(remaining);
+        let reduced = i32::try_from(reduced).ok()?;
+        let total_iterations = u64::try_from(remaining).ok()?.checked_add(1)?;
+
+        context.consume_loop_iterations(total_iterations).ok()?;
+        context.vm.set_register(self.accumulator, reduced.into());
+        context.vm.set_register(self.index, limit.into());
+        context.vm.frame_mut().pc = self.exit_pc;
+        caller_code.mark_pure_affine_loop_observed();
+        #[cfg(test)]
+        {
+            context.vm.pure_affine_loop_reductions =
+                context.vm.pure_affine_loop_reductions.saturating_add(1);
+            context.vm.pure_affine_loop_calls_elided = context
+                .vm
+                .pure_affine_loop_calls_elided
+                .saturating_add(u64::try_from(remaining).ok()?);
+        }
+        Some(())
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
+    }
+}
+
+impl PureLoopPlan {
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        match self {
+            Self::Reader(plan) => plan.loop_iteration_pc(),
+            Self::Affine(plan) => plan.loop_iteration_pc(),
+        }
+    }
+}
+
 fn instruction_targets_range(instruction: &Instruction, start: usize, end: usize) -> bool {
     let in_range = |address: crate::vm::opcode::Address| {
         let address = address.as_u32() as usize;
@@ -768,6 +1253,158 @@ mod tests {
         Context, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
     };
+
+    #[test]
+    fn canonical_affine_call_loop_reduces_after_one_feedback_iteration() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 1000;\n\
+                 function step(value) { return value + 1; }\n\
+                 function main() {\n\
+                     let accumulator = 0;\n\
+                     for (let i = 0; i < N; i++) accumulator = step(accumulator);\n\
+                     return accumulator;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical affine call loop must succeed");
+
+        assert_eq!(result, JsValue::new(1000));
+        assert_eq!(context.vm.pure_affine_loop_reductions, 1);
+        assert_eq!(context.vm.pure_affine_loop_calls_elided, 999);
+    }
+
+    #[test]
+    fn affine_call_loop_revalidates_function_and_rejects_effects() {
+        let mut context = Context::default();
+        context
+            .eval(Source::from_bytes(
+                "const N = 8;\n\
+                 function increment(value) { return value + 1; }\n\
+                 let step = increment;\n\
+                 function main() {\n\
+                     let accumulator = 10;\n\
+                     for (let i = 0; i < N; i++) accumulator = step(accumulator);\n\
+                     return accumulator;\n\
+                 }",
+            ))
+            .expect("definitions must succeed");
+
+        assert_eq!(
+            context.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(18))
+        );
+        assert_eq!(context.vm.pure_affine_loop_reductions, 1);
+
+        assert_eq!(
+            context.eval(Source::from_bytes(
+                "step = function (value) { return value - 2; }; main()"
+            )),
+            Ok(JsValue::new(-6))
+        );
+        assert_eq!(context.vm.pure_affine_loop_reductions, 2);
+
+        assert_eq!(
+            context
+                .eval(Source::from_bytes(
+                    "let callEffects = 0;\n\
+                     step = function (value) { callEffects++; return value + 1; };\n\
+                     main() === 18 && callEffects === 8",
+                ))
+                .expect("effectful replacement must execute normally")
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(context.vm.pure_affine_loop_reductions, 2);
+    }
+
+    #[test]
+    fn affine_call_loop_rejects_promotion_and_near_matches() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 4;\n\
+                 function step(value) { return value + 1; }\n\
+                 function main() {\n\
+                     let accumulator = 2147483646;\n\
+                     for (let i = 0; i < N; i++) accumulator = step(accumulator);\n\
+                     return accumulator;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("overflowing accumulator must retain Number promotion");
+        assert_eq!(result.as_number(), Some(2_147_483_650.0));
+        assert_eq!(context.vm.pure_affine_loop_reductions, 0);
+
+        assert_eq!(
+            context.eval(Source::from_bytes(
+                "function nearMatch() {\n\
+                     let accumulator = 0;\n\
+                     for (let i = 0; i < N; i++) {\n\
+                         if (i === 2) continue;\n\
+                         accumulator = step(accumulator);\n\
+                     }\n\
+                     return accumulator;\n\
+                 }\n\
+                 nearMatch();"
+            )),
+            Ok(JsValue::new(3))
+        );
+        assert_eq!(context.vm.pure_affine_loop_reductions, 0);
+
+        assert_eq!(
+            context.eval(Source::from_bytes(
+                "function twoSteps(value) { return value + 1 + 1; }\n\
+                 function twoStepMain() {\n\
+                     let accumulator = 0;\n\
+                     for (let i = 0; i < N; i++) accumulator = twoSteps(accumulator);\n\
+                     return accumulator;\n\
+                 }\n\
+                 twoStepMain();"
+            )),
+            Ok(JsValue::new(8))
+        );
+        assert_eq!(context.vm.pure_affine_loop_reductions, 0);
+    }
+
+    #[test]
+    fn affine_call_shortcuts_preserve_finite_accounting_modes() {
+        let definition = "const N = 10;\n\
+            function step(value) { return value + 1; }\n\
+            function main() {\n\
+                let accumulator = 0;\n\
+                for (let i = 0; i < N; i++) accumulator = step(accumulator);\n\
+                return accumulator;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget case definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        assert_eq!(
+            budgeted.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(budgeted.vm.pure_affine_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit case definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(3);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must execute every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_affine_loop_reductions, 0);
+    }
 
     #[test]
     fn canonical_reader_loop_reduces_after_one_feedback_iteration() {

@@ -113,7 +113,7 @@ impl JitTieringCache {
 use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
-    pure_reader::{PureReaderLoopPlan, PureReaderPlan},
+    pure_reader::{PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PureReaderLoopPlan},
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
 
@@ -253,15 +253,22 @@ pub struct CodeBlock {
     /// Named-property inline caches (by-name PIC, 4-way polymorphic).
     pub(crate) ic: Box<[InlineCache]>,
 
-    /// Source-free proof for a small pure numeric reader, including cached
-    /// rejection. The code block is immutable once published, so this plan
-    /// remains valid for its lifetime; runtime object/IC guards are separate.
+    /// Source-free proof for one small pure numeric function subset, including
+    /// cached rejection. The code block is immutable once published, so this
+    /// plan remains valid for its lifetime; runtime guards are separate.
     #[unsafe_ignore_trace]
-    pub(crate) pure_reader_plan: OnceCell<Option<PureReaderPlan>>,
+    pub(crate) pure_function_plan: OnceCell<Option<PureFunctionPlan>>,
 
-    /// Canonical pure-reader loops indexed by their maintenance opcode.
+    /// Canonical pure-call loops indexed by their maintenance opcode.
     #[unsafe_ignore_trace]
-    pub(crate) pure_reader_loop_plans: OnceCell<Box<[PureReaderLoopPlan]>>,
+    pub(crate) pure_loop_plans: OnceCell<Box<[PureLoopPlan]>>,
+
+    /// Whether this code block has completed an affine range summary. Until a
+    /// candidate succeeds, the native tier may lower its maintenance opcode as
+    /// an ordinary loop iteration; after success, keeping the caller in the
+    /// interpreter preserves the cheaper range summary.
+    #[unsafe_ignore_trace]
+    pub(crate) pure_affine_loop_observed: Cell<bool>,
 
     /// Element-access inline caches — one entry per `GetPropertyByValue` /
     /// `GetPropertyByValuePush` / `SetPropertyByValue` site. Monomorphic;
@@ -318,8 +325,9 @@ impl CodeBlock {
             parameter_length: 0,
             handlers: ThinVec::default(),
             ic: Box::default(),
-            pure_reader_plan: OnceCell::new(),
-            pure_reader_loop_plans: OnceCell::new(),
+            pure_function_plan: OnceCell::new(),
+            pure_loop_plans: OnceCell::new(),
+            pure_affine_loop_observed: Cell::new(false),
             element_ic: Box::default(),
             source_info: SourceInfo::new(
                 SourceMap::new(Box::default(), SourcePath::None),
@@ -491,35 +499,75 @@ impl CodeBlock {
         self.flags.get().has_function_scope()
     }
 
-    /// Return the cached proof that this code is a pure i32 property reader.
+    /// Return the cached proof for this code's accepted pure function subset.
     #[inline]
-    pub(crate) fn pure_reader_plan(&self) -> Option<&PureReaderPlan> {
-        self.pure_reader_plan
-            .get_or_init(|| PureReaderPlan::parse(self))
+    fn pure_function_plan(&self) -> Option<&PureFunctionPlan> {
+        self.pure_function_plan
+            .get_or_init(|| PureFunctionPlan::parse(self))
             .as_ref()
     }
 
     /// Evaluate a cached proof that this code is a pure i32 property reader.
     pub(crate) fn pure_reader_i32(&self, object: &JsObject) -> Option<i32> {
-        self.pure_reader_plan()?.evaluate(self, object)
+        self.pure_function_plan()?.reader_i32(self, object)
+    }
+
+    /// Return the constant i32 offset of a cached pure affine step.
+    pub(crate) fn pure_affine_step_delta(&self) -> Option<i32> {
+        self.pure_function_plan()?.affine_delta()
     }
 
     /// Return the statically cached pure-reader loop whose maintenance opcode
     /// just advanced to `next_pc`.
     #[inline]
     pub(crate) fn pure_reader_loop_plan(&self, next_pc: u32) -> Option<PureReaderLoopPlan> {
-        self.pure_reader_loop_plans
-            .get_or_init(|| PureReaderLoopPlan::parse_all(self))
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
             .iter()
             .copied()
-            .find(|plan| plan.loop_iteration_next_pc() == next_pc)
+            .find_map(|plan| match plan {
+                PureLoopPlan::Reader(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_) | PureLoopPlan::Affine(_) => None,
+            })
     }
 
-    /// Parse canonical reader loops once and specialize only their zero-width
+    /// Return the statically cached pure affine loop whose maintenance opcode
+    /// just advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_affine_loop_plan(&self, next_pc: u32) -> Option<PureAffineLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::Affine(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_) | PureLoopPlan::Affine(_) => None,
+            })
+    }
+
+    /// Record that at least one affine loop in this code block passed every
+    /// runtime guard and was reduced as a range.
+    #[inline]
+    pub(crate) fn mark_pure_affine_loop_observed(&self) {
+        self.pure_affine_loop_observed.set(true);
+    }
+
+    /// Whether native admission must retain the interpreter's affine summary.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn pure_affine_loop_observed(&self) -> bool {
+        self.pure_affine_loop_observed.get()
+    }
+
+    /// Parse canonical pure-call loops once and specialize only their zero-width
     /// maintenance opcode. All ordinary loops keep the original handler and
     /// therefore incur no runtime probe for this optimization.
-    pub(crate) fn initialize_pure_reader_loop_plans(&mut self) {
-        let plans = PureReaderLoopPlan::parse_all(self);
+    pub(crate) fn initialize_pure_loop_plans(&mut self) {
+        let plans = PureLoopPlan::parse_all(self);
         for plan in &plans {
             let opcode = self
                 .bytecode
@@ -527,11 +575,15 @@ impl CodeBlock {
                 .get_mut(plan.loop_iteration_pc() as usize)
                 .expect("proven loop-maintenance pc must be in bytecode");
             debug_assert_eq!(Opcode::decode(*opcode), Opcode::IncrementLoopIteration);
-            *opcode = Opcode::PureReaderLoopIteration.encode();
+            *opcode = match plan {
+                PureLoopPlan::Reader(_) => Opcode::PureReaderLoopIteration,
+                PureLoopPlan::Affine(_) => Opcode::PureAffineLoopIteration,
+            }
+            .encode();
         }
-        self.pure_reader_loop_plans
+        self.pure_loop_plans
             .set(plans)
-            .expect("pure-reader loop plans must initialize exactly once");
+            .expect("pure-call loop plans must initialize exactly once");
     }
 
     /// Find exception [`Handler`] in the code block given the current program counter (`pc`).
@@ -1141,6 +1193,7 @@ impl CodeBlock {
             | Instruction::PopEnvironment
             | Instruction::IncrementLoopIteration
             | Instruction::PureReaderLoopIteration
+            | Instruction::PureAffineLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1150,8 +1203,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved7
-            | Instruction::Reserved8
+            Instruction::Reserved8
             | Instruction::Reserved9
             | Instruction::Reserved10
             | Instruction::Reserved11

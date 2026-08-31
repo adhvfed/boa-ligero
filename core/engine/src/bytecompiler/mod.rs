@@ -3104,8 +3104,9 @@ impl<'ctx> ByteCompiler<'ctx> {
             handlers: self.handlers,
             flags: Cell::new(self.code_block_flags),
             ic: self.ic.into_boxed_slice(),
-            pure_reader_plan: std::cell::OnceCell::new(),
-            pure_reader_loop_plans: std::cell::OnceCell::new(),
+            pure_function_plan: std::cell::OnceCell::new(),
+            pure_loop_plans: std::cell::OnceCell::new(),
+            pure_affine_loop_observed: Cell::new(false),
             element_ic: self.element_ic.into_boxed_slice(),
             source_info: SourceInfo::new(
                 SourceMap::new(source_map_entries, self.source_path),
@@ -3123,7 +3124,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
         };
-        code.initialize_pure_reader_loop_plans();
+        code.initialize_pure_loop_plans();
         code
     }
 

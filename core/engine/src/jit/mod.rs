@@ -4610,6 +4610,40 @@ mod tests {
     }
 
     #[test]
+    fn native_admission_preserves_observed_affine_summaries_without_penalizing_misses() {
+        let code = first_function_code(
+            "function main() {\n\
+                 let accumulator = 0;\n\
+                 for (let index = 0; index < 100; index++) {\n\
+                     accumulator = step(accumulator);\n\
+                 }\n\
+                 return accumulator;\n\
+             }\n\
+             function step(value) { return value + 1; }",
+        );
+        assert!(
+            InstructionIterator::new(&code.bytecode).any(|(_, _, instruction)| {
+                matches!(instruction, Instruction::PureAffineLoopIteration)
+            }),
+            "the bytecompiler must mark the candidate loop before JIT admission"
+        );
+
+        assert!(
+            native::admission_profile(&code, false).is_ok(),
+            "an unproven affine candidate must retain ordinary native lowering"
+        );
+
+        code.mark_pure_affine_loop_observed();
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("native lowering must not discard an observed affine range summary");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(
+            rejection.first_blocking_opcode,
+            Some(Opcode::PureAffineLoopIteration)
+        );
+    }
+
+    #[test]
     fn jit_executes_script_matches_interpreter() {
         // End-to-end: run a real script through the JIT trampoline and confirm
         // the result matches the interpreter exactly. The JIT runs native code
@@ -4716,9 +4750,11 @@ mod tests {
     fn native_caller_enters_prepared_tiny_leaf_without_interpreter_dispatch() {
         let mut context = Context::default();
         context.enable_jit();
+        // The leaf is deliberately outside the VM's affine proof. This keeps
+        // the canonical call loop eligible for ordinary native lowering.
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function leaf(value) { return value + 1; } function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = leaf(total); } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = hot(10); } answer",
+                "function leaf(value) { return (value + 1) | 0; } function hot(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = leaf(total); } return total; } let answer = 0; for (let index = 0; index < 80; index++) { answer = hot(10); } answer",
             ),
             None,
             &mut context,
@@ -9432,9 +9468,11 @@ mod tests {
     fn context_owned_jit_reads_current_global_object_function_binding() {
         let mut context = Context::default();
         context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        // These leaves deliberately miss the VM's affine proof, keeping the
+        // canonical loop on the native global-call binding path.
         let setup = crate::Script::parse(
             crate::Source::from_bytes(
-                "function increment(value) { return value + 1; } function decrement(value) { return value - 1; } function run(value, count) { for (let index = 0; index < count; index++) { value = increment(value); } return value; } let answer = 0; for (let index = 0; index < 80; index++) { answer = run(0, 3); } answer",
+                "function increment(value) { return (value + 1) | 0; } function decrement(value) { return (value - 1) | 0; } function run(value, count) { for (let index = 0; index < count; index++) { value = increment(value); } return value; } let answer = 0; for (let index = 0; index < 80; index++) { answer = run(0, 3); } answer",
             ),
             None,
             &mut context,
