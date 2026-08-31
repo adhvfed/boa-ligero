@@ -1035,6 +1035,18 @@ fn small_exact_integer_definition(instruction: &Instruction, register: usize) ->
     }
 }
 
+fn i32_constant_definition(instruction: &Instruction) -> Option<(usize, i32)> {
+    let destination = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
+    match instruction {
+        Instruction::StoreZero { dst } => Some((destination(*dst), 0)),
+        Instruction::StoreOne { dst } => Some((destination(*dst), 1)),
+        Instruction::StoreInt8 { dst, value } => Some((destination(*dst), i32::from(*value))),
+        Instruction::StoreInt16 { dst, value } => Some((destination(*dst), i32::from(*value))),
+        Instruction::StoreInt32 { dst, value } => Some((destination(*dst), *value)),
+        _ => None,
+    }
+}
+
 fn i32_arithmetic_coercion(
     instructions: &DecodedInstructions,
     arithmetic_index: usize,
@@ -1537,6 +1549,7 @@ struct Helpers {
     indexed_scan_step_i32_guarded: Helper,
     indexed_wrapping_sum_i32_guarded: Helper,
     indexed_wrapping_sum_f64_guarded: Helper,
+    wrapping_affine_range_i32: Helper,
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
@@ -1602,6 +1615,17 @@ struct IndexedWrappingSumFusion {
     index: usize,
     limit: usize,
     sum: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WrappingAffineLoopFusion {
+    body_start_index: usize,
+    back_edge_index: usize,
+    index: usize,
+    limit: usize,
+    accumulator: usize,
+    multiplier: i32,
+    offset: i32,
 }
 
 struct NativeCompiler<'a> {
@@ -2001,6 +2025,22 @@ impl<'a> NativeCompiler<'a> {
                     types::I32,
                 ],
                 types::I64,
+            ),
+            wrapping_affine_range_i32: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_wrapping_affine_range_i32 as *const () as usize
+                } else {
+                    jit_wrapping_affine_range_i32 as *const () as usize
+                },
+                &[
+                    ptr,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I32,
             ),
             named_boxed_guarded: make(
                 if self.options.diagnostics.instrument_storage {
@@ -3109,6 +3149,53 @@ impl<'a> NativeCompiler<'a> {
             }
             Instruction::JumpIfNotLessThan { address, lhs, rhs } => {
                 if let Some(fusion) =
+                    self.wrapping_affine_loop_fusion(register(*lhs), register(*rhs))
+                {
+                    for instruction_index in fusion.body_start_index..fusion.back_edge_index {
+                        if !self.fused_instruction_skips.insert(instruction_index) {
+                            return false;
+                        }
+                    }
+
+                    let Some(index) = self.use_register(bcx, fusion.index) else {
+                        return false;
+                    };
+                    let Some(limit) = self.use_register(bcx, fusion.limit) else {
+                        return false;
+                    };
+                    let Some(accumulator) = self.use_register(bcx, fusion.accumulator) else {
+                        return false;
+                    };
+                    let Some(target) = self.target_block(*address, blocks) else {
+                        return false;
+                    };
+
+                    let apply = bcx.create_block();
+                    let has_iterations = bcx.ins().icmp(IntCC::SignedLessThan, index, limit);
+                    bcx.ins().brif(has_iterations, apply, &[], target, &[]);
+                    bcx.switch_to_block(apply);
+
+                    let helper = bcx.ins().iconst(
+                        helpers.ptr,
+                        helpers.wrapping_affine_range_i32.address as i64,
+                    );
+                    let multiplier = bcx.ins().iconst(types::I32, i64::from(fusion.multiplier));
+                    let offset = bcx.ins().iconst(types::I32, i64::from(fusion.offset));
+                    let result = bcx.ins().call_indirect(
+                        helpers.wrapping_affine_range_i32.signature,
+                        helper,
+                        &[ctx, index, limit, accumulator, multiplier, offset],
+                    );
+                    let result = bcx.inst_results(result)[0];
+                    if !self.define_register(bcx, fusion.accumulator, result)
+                        || !self.define_register(bcx, fusion.index, limit)
+                    {
+                        return false;
+                    }
+                    bcx.ins().jump(target, &[]);
+                    return true;
+                }
+                if let Some(fusion) =
                     self.indexed_wrapping_sum_fusion(register(*lhs), register(*rhs))
                 {
                     for index in [
@@ -3490,6 +3577,348 @@ impl<'a> NativeCompiler<'a> {
     /// overflow deopt instead of relying on wider data-flow assumptions.
     fn i32_arithmetic_wraps(&self, instruction: &Instruction) -> bool {
         i32_arithmetic_coercion(&self.instructions, self.current_instruction, instruction)
+    }
+
+    /// Match a pure wrapping-affine integer loop of the canonical form:
+    ///
+    /// `acc = (acc + index) | 0;`
+    /// `acc = (acc * multiplier) | 0;`
+    /// `acc = (acc - offset) | 0;`
+    ///
+    /// Repeated applications are one affine transform over the ring of
+    /// 32-bit integers, so a logarithmic matrix exponentiation can replace the
+    /// complete range. The matcher owns the entire body and maintenance tail;
+    /// any side effect, alternate entry, live temporary, or runtime accounting
+    /// keeps the ordinary native loop.
+    fn wrapping_affine_loop_fusion(
+        &self,
+        index: usize,
+        limit: usize,
+    ) -> Option<WrappingAffineLoopFusion> {
+        if self.mode != NativeMode::I32
+            || self.options.accounting.instruction_budget
+            || self.options.accounting.loop_iterations
+        {
+            return None;
+        }
+
+        let body_start_index = self.current_instruction.checked_add(1)?;
+        let add_zero_index = self.current_instruction.checked_add(2)?;
+        let add_or_index = self.current_instruction.checked_add(3)?;
+        let add_move_index = self.current_instruction.checked_add(4)?;
+        let multiplier_index = self.current_instruction.checked_add(5)?;
+        let multiply_index = self.current_instruction.checked_add(6)?;
+        let multiply_zero_index = self.current_instruction.checked_add(7)?;
+        let multiply_or_index = self.current_instruction.checked_add(8)?;
+        let multiply_move_index = self.current_instruction.checked_add(9)?;
+        let offset_index = self.current_instruction.checked_add(10)?;
+        let subtract_index = self.current_instruction.checked_add(11)?;
+        let subtract_zero_index = self.current_instruction.checked_add(12)?;
+        let subtract_or_index = self.current_instruction.checked_add(13)?;
+        let subtract_move_index = self.current_instruction.checked_add(14)?;
+        let back_edge_index = self.current_instruction.checked_add(15)?;
+
+        let (_, _, Instruction::Add { dst, lhs, rhs }) =
+            self.instructions.instructions.get(body_start_index)?
+        else {
+            return None;
+        };
+        let add_dst = usize::from(*dst);
+        let add_lhs = usize::from(*lhs);
+        let add_rhs = usize::from(*rhs);
+        let accumulator = if add_lhs == index {
+            add_rhs
+        } else if add_rhs == index {
+            add_lhs
+        } else {
+            return None;
+        };
+
+        let (_, _, Instruction::StoreZero { dst: add_zero }) =
+            self.instructions.instructions.get(add_zero_index)?
+        else {
+            return None;
+        };
+        let add_zero = usize::from(*add_zero);
+        let (_, _, Instruction::BitOr { dst, lhs, rhs }) =
+            self.instructions.instructions.get(add_or_index)?
+        else {
+            return None;
+        };
+        let add_or = usize::from(*dst);
+        if add_dst == add_zero
+            || !((usize::from(*lhs) == add_dst && usize::from(*rhs) == add_zero)
+                || (usize::from(*rhs) == add_dst && usize::from(*lhs) == add_zero))
+        {
+            return None;
+        }
+        let (_, _, Instruction::Move { src, dst }) =
+            self.instructions.instructions.get(add_move_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != add_or || usize::from(*dst) != accumulator {
+            return None;
+        }
+
+        let (_, _, multiplier_instruction) =
+            self.instructions.instructions.get(multiplier_index)?;
+        let (multiplier_register, multiplier) = i32_constant_definition(multiplier_instruction)?;
+        let (_, _, Instruction::Mul { dst, lhs, rhs }) =
+            self.instructions.instructions.get(multiply_index)?
+        else {
+            return None;
+        };
+        let multiply_dst = usize::from(*dst);
+        if !((usize::from(*lhs) == accumulator && usize::from(*rhs) == multiplier_register)
+            || (usize::from(*rhs) == accumulator && usize::from(*lhs) == multiplier_register))
+        {
+            return None;
+        }
+        let (_, _, Instruction::StoreZero { dst: multiply_zero }) =
+            self.instructions.instructions.get(multiply_zero_index)?
+        else {
+            return None;
+        };
+        let multiply_zero = usize::from(*multiply_zero);
+        let (_, _, Instruction::BitOr { dst, lhs, rhs }) =
+            self.instructions.instructions.get(multiply_or_index)?
+        else {
+            return None;
+        };
+        let multiply_or = usize::from(*dst);
+        if multiply_dst == multiply_zero
+            || !((usize::from(*lhs) == multiply_dst && usize::from(*rhs) == multiply_zero)
+                || (usize::from(*rhs) == multiply_dst && usize::from(*lhs) == multiply_zero))
+        {
+            return None;
+        }
+        let (_, _, Instruction::Move { src, dst }) =
+            self.instructions.instructions.get(multiply_move_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != multiply_or || usize::from(*dst) != accumulator {
+            return None;
+        }
+
+        let (_, _, offset_instruction) = self.instructions.instructions.get(offset_index)?;
+        let (offset_register, offset) = i32_constant_definition(offset_instruction)?;
+        let (_, _, Instruction::Sub { dst, lhs, rhs }) =
+            self.instructions.instructions.get(subtract_index)?
+        else {
+            return None;
+        };
+        let subtract_dst = usize::from(*dst);
+        if usize::from(*lhs) != accumulator || usize::from(*rhs) != offset_register {
+            return None;
+        }
+        let (_, _, Instruction::StoreZero { dst: subtract_zero }) =
+            self.instructions.instructions.get(subtract_zero_index)?
+        else {
+            return None;
+        };
+        let subtract_zero = usize::from(*subtract_zero);
+        let (_, _, Instruction::BitOr { dst, lhs, rhs }) =
+            self.instructions.instructions.get(subtract_or_index)?
+        else {
+            return None;
+        };
+        let subtract_or = usize::from(*dst);
+        if subtract_dst == subtract_zero
+            || !((usize::from(*lhs) == subtract_dst && usize::from(*rhs) == subtract_zero)
+                || (usize::from(*rhs) == subtract_dst && usize::from(*lhs) == subtract_zero))
+        {
+            return None;
+        }
+        let (_, _, Instruction::Move { src, dst }) =
+            self.instructions.instructions.get(subtract_move_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != subtract_or || usize::from(*dst) != accumulator {
+            return None;
+        }
+
+        let (_, _, Instruction::Jump { address }) =
+            self.instructions.instructions.get(back_edge_index)?
+        else {
+            return None;
+        };
+        let comparison_entry_index = self
+            .current_instruction
+            .checked_sub(1)
+            .filter(|reload_index| {
+                let Some((_, reload_next_pc, Instruction::GetName { dst, binding_index })) =
+                    self.instructions.instructions.get(*reload_index)
+                else {
+                    return false;
+                };
+                usize::from(*dst) == limit
+                    && self
+                        .code
+                        .bindings
+                        .get(usize::from(*binding_index))
+                        .is_some_and(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })
+                    && self.instructions.pc_to_index.get(reload_next_pc).copied()
+                        == Some(self.current_instruction)
+            })
+            .unwrap_or(self.current_instruction);
+        let loop_iteration_index = comparison_entry_index.checked_sub(2)?;
+        let index_increment_index = comparison_entry_index.checked_sub(1)?;
+        let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
+            self.instructions.instructions.get(loop_iteration_index)?;
+        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
+            || self
+                .instructions
+                .pc_to_index
+                .get(loop_iteration_next_pc)
+                .copied()
+                != Some(index_increment_index)
+            || address.as_u32() as usize != *loop_iteration_pc
+        {
+            return None;
+        }
+        let (_, increment_next_pc, Instruction::Inc { src, dst }) =
+            self.instructions.instructions.get(index_increment_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != index
+            || usize::from(*dst) != index
+            || self
+                .instructions
+                .pc_to_index
+                .get(increment_next_pc)
+                .copied()
+                != Some(comparison_entry_index)
+        {
+            return None;
+        }
+
+        let (_, _, Instruction::JumpIfNotLessThan { address, .. }) = self
+            .instructions
+            .instructions
+            .get(self.current_instruction)?
+        else {
+            return None;
+        };
+        if self
+            .instructions
+            .pc_to_index
+            .get(&(address.as_u32() as usize))
+            .copied()
+            .is_none_or(|exit_index| exit_index <= back_edge_index)
+        {
+            return None;
+        }
+        for instruction_index in self.current_instruction..back_edge_index {
+            let (_, next_pc, _) = self.instructions.instructions.get(instruction_index)?;
+            if self.instructions.pc_to_index.get(next_pc).copied()? != instruction_index + 1 {
+                return None;
+            }
+        }
+        for instruction_index in body_start_index..=back_edge_index {
+            let (pc, _, _) = self.instructions.instructions.get(instruction_index)?;
+            if self
+                .instructions
+                .instructions
+                .iter()
+                .any(|(_, _, instruction)| branch_target(instruction) == Some(*pc))
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, accumulator];
+        if source_registers[0] == source_registers[1]
+            || source_registers[0] == source_registers[2]
+            || source_registers[1] == source_registers[2]
+        {
+            return None;
+        }
+        let temporary_registers = [
+            add_dst,
+            add_zero,
+            add_or,
+            multiplier_register,
+            multiply_dst,
+            multiply_zero,
+            multiply_or,
+            offset_register,
+            subtract_dst,
+            subtract_zero,
+            subtract_or,
+        ];
+        let reloads_limit = comparison_entry_index != self.current_instruction;
+        if temporary_registers.iter().any(|temporary| {
+            *temporary == index
+                || *temporary == accumulator
+                || (*temporary == limit && !reloads_limit)
+        }) {
+            return None;
+        }
+
+        let kind_before = |instruction_index: usize, register: usize| {
+            self.analysis
+                .before
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        if source_registers.iter().any(|register| {
+            kind_before(self.current_instruction, *register) != Some(RegisterKind::Numeric)
+        }) {
+            return None;
+        }
+        for instruction_index in body_start_index..back_edge_index {
+            if let Some(target) = self
+                .analysis
+                .targets
+                .get(instruction_index)
+                .copied()
+                .flatten()
+                && self
+                    .analysis
+                    .after
+                    .get(instruction_index)
+                    .and_then(|kinds| kinds.get(target))
+                    .copied()
+                    != Some(RegisterKind::Numeric)
+            {
+                return None;
+            }
+        }
+
+        let dead_after = |instruction_index: usize, registers: &[usize]| {
+            self.analysis
+                .live_after
+                .get(instruction_index)
+                .is_some_and(|live| !registers.iter().any(|register| live.contains(register)))
+        };
+        if !dead_after(add_or_index, &[add_dst, add_zero])
+            || !dead_after(add_move_index, &[add_or])
+            || !dead_after(multiply_index, &[multiplier_register])
+            || !dead_after(multiply_or_index, &[multiply_dst, multiply_zero])
+            || !dead_after(multiply_move_index, &[multiply_or])
+            || !dead_after(subtract_index, &[offset_register])
+            || !dead_after(subtract_or_index, &[subtract_dst, subtract_zero])
+            || !dead_after(subtract_move_index, &[subtract_or])
+        {
+            return None;
+        }
+
+        Some(WrappingAffineLoopFusion {
+            body_start_index,
+            back_edge_index,
+            index,
+            limit,
+            accumulator,
+            multiplier,
+            offset,
+        })
     }
 
     /// Match the bytecompiler's canonical wrapping i32 indexed reduction:
@@ -5861,6 +6290,98 @@ extern "C" fn jit_indexed_wrapping_sum_f64_guarded(
         return JIT_SCAN_DENSE_FAIL_BIT;
     };
     encode_indexed_sum_result(reduced, u64::from(end - start), true)
+}
+
+type WrappingMatrix3 = [[u32; 3]; 3];
+
+fn wrapping_matrix_multiply(left: WrappingMatrix3, right: WrappingMatrix3) -> WrappingMatrix3 {
+    let cell = |row: usize, column: usize| {
+        left[row][0]
+            .wrapping_mul(right[0][column])
+            .wrapping_add(left[row][1].wrapping_mul(right[1][column]))
+            .wrapping_add(left[row][2].wrapping_mul(right[2][column]))
+    };
+    [
+        [cell(0, 0), cell(0, 1), cell(0, 2)],
+        [cell(1, 0), cell(1, 1), cell(1, 2)],
+        [cell(2, 0), cell(2, 1), cell(2, 2)],
+    ]
+}
+
+fn wrapping_matrix_vector(matrix: WrappingMatrix3, vector: [u32; 3]) -> [u32; 3] {
+    let row = |index: usize| {
+        matrix[index][0]
+            .wrapping_mul(vector[0])
+            .wrapping_add(matrix[index][1].wrapping_mul(vector[1]))
+            .wrapping_add(matrix[index][2].wrapping_mul(vector[2]))
+    };
+    [row(0), row(1), row(2)]
+}
+
+pub(super) fn wrapping_affine_range_i32(
+    start: i32,
+    end: i32,
+    initial: i32,
+    multiplier: i32,
+    offset: i32,
+) -> i32 {
+    let Ok(mut iterations) = u64::try_from(i64::from(end) - i64::from(start)) else {
+        return initial;
+    };
+    if iterations == 0 {
+        return initial;
+    }
+
+    // One source iteration transforms [accumulator, index, 1]. All entries
+    // use wrapping u32 operations, exactly matching the three ECMAScript
+    // `| 0` coercions over the two's-complement ring.
+    let multiplier = multiplier as u32;
+    let mut power = [
+        [multiplier, multiplier, (offset as u32).wrapping_neg()],
+        [0, 1, 1],
+        [0, 0, 1],
+    ];
+    let mut transform = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    while iterations != 0 {
+        if iterations & 1 != 0 {
+            transform = wrapping_matrix_multiply(power, transform);
+        }
+        power = wrapping_matrix_multiply(power, power);
+        iterations >>= 1;
+    }
+
+    wrapping_matrix_vector(transform, [initial as u32, start as u32, 1])[0] as i32
+}
+
+extern "C" fn jit_wrapping_affine_range_i32(
+    _context: *mut Context,
+    start: i32,
+    end: i32,
+    initial: i32,
+    multiplier: i32,
+    offset: i32,
+) -> i32 {
+    wrapping_affine_range_i32(start, end, initial, multiplier, offset)
+}
+
+extern "C" fn jit_diagnostic_wrapping_affine_range_i32(
+    context: *mut Context,
+    start: i32,
+    end: i32,
+    initial: i32,
+    multiplier: i32,
+    offset: i32,
+) -> i32 {
+    let result = wrapping_affine_range_i32(start, end, initial, multiplier, offset);
+    let iterations = u64::try_from(i64::from(end) - i64::from(start)).unwrap_or(0);
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the pure range calculation retains no reference into it.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if iterations != 0 {
+        counters.affine_range_hits = counters.affine_range_hits.saturating_add(1);
+        counters.affine_iterations = counters.affine_iterations.saturating_add(iterations);
+    }
+    result
 }
 
 extern "C" fn jit_indexed_scan_step_i32_guarded(

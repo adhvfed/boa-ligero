@@ -400,7 +400,7 @@ pub struct JitOsrCounters {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 10;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 11;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -813,6 +813,10 @@ pub struct JitNativeStorageRecord {
     pub dense_guard_misses: u64,
     /// Dense-element helper loads following successful guards.
     pub dense_loads: u64,
+    /// Pure wrapping-affine loop ranges collapsed by one native helper.
+    pub affine_range_hits: u64,
+    /// Source loop iterations represented by successful affine ranges.
+    pub affine_iterations: u64,
 }
 
 impl JitNativeStorageRecord {
@@ -827,6 +831,12 @@ impl JitNativeStorageRecord {
             .dense_guard_misses
             .saturating_add(other.dense_guard_misses);
         self.dense_loads = self.dense_loads.saturating_add(other.dense_loads);
+        self.affine_range_hits = self
+            .affine_range_hits
+            .saturating_add(other.affine_range_hits);
+        self.affine_iterations = self
+            .affine_iterations
+            .saturating_add(other.affine_iterations);
     }
 }
 
@@ -7271,6 +7281,124 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_affine_range_matches_naive_i32_iterations() {
+        let cases = [
+            (-17, 1_000, i32::MAX - 7, -3, 7),
+            (0, 10_000, 0, 3, 7),
+            (19, 276, i32::MIN + 11, 0, -91),
+            (-300, -43, -1, 1, i32::MIN),
+            (42, 42, 123, -1, 5),
+            (42, -1, 123, -1, 5),
+        ];
+
+        for (start, end, initial, multiplier, offset) in cases {
+            let mut expected = initial;
+            for index in start..end {
+                expected = expected.wrapping_add(index);
+                expected = expected.wrapping_mul(multiplier);
+                expected = expected.wrapping_sub(offset);
+            }
+            assert_eq!(
+                native::wrapping_affine_range_i32(start, end, initial, multiplier, offset),
+                expected,
+                "start={start}, end={end}, initial={initial}, multiplier={multiplier}, offset={offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_owned_jit_bulk_reduces_wrapping_affine_integer_loop() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const affineStart = -17; let affineLimit = 1000; const affineInitial = 2147483640; function affineRun() { let accumulator = affineInitial; for (let index = affineStart; index < affineLimit; index++) { accumulator = (accumulator + index) | 0; accumulator = (accumulator * -3) | 0; accumulator = (accumulator - 7) | 0; } return accumulator; } let affineAnswer = 0; for (let warmup = 0; warmup < 80; warmup++) { affineAnswer = affineRun(); } affineAnswer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        let expected = native::wrapping_affine_range_i32(-17, 1_000, 2_147_483_640, -3, 7);
+        assert_eq!(result.as_i32(), Some(expected));
+
+        boa_gc::force_collect();
+        let after_gc =
+            crate::Script::parse(crate::Source::from_bytes("affineRun()"), None, &mut context)
+                .expect("parse after GC");
+        assert_eq!(
+            after_gc
+                .evaluate(&mut context)
+                .expect("evaluate after GC")
+                .as_i32(),
+            Some(expected)
+        );
+
+        let no_iterations = crate::Script::parse(
+            crate::Source::from_bytes("affineLimit = -100; affineRun()"),
+            None,
+            &mut context,
+        )
+        .expect("parse empty range");
+        assert_eq!(
+            no_iterations
+                .evaluate(&mut context)
+                .expect("evaluate empty range")
+                .as_i32(),
+            Some(2_147_483_640),
+            "an initially false loop must preserve its accumulator"
+        );
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(
+            diagnostics.native_storage.affine_range_hits > 0,
+            "diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.native_storage.affine_iterations,
+            diagnostics.native_storage.affine_range_hits * 1_017,
+            "one range must represent every source iteration: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_affine_reduction_preserves_loop_body_effects() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const effectAffineLimit = 10; function affineWithEffects() { let accumulator = 1; let effects = 0; for (let index = 0; index < effectAffineLimit; index++) { accumulator = (accumulator + index) | 0; accumulator = (accumulator * 3) | 0; accumulator = (accumulator - 7) | 0; effects = (effects + 1) | 0; } return accumulator + effects; } let effectAffineAnswer = 0; for (let warmup = 0; warmup < 80; warmup++) { effectAffineAnswer = affineWithEffects(); } effectAffineAnswer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        let expected = native::wrapping_affine_range_i32(0, 10, 1, 3, 7) + 10;
+        assert_eq!(result.as_i32(), Some(expected));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert_eq!(
+            diagnostics.native_storage.affine_range_hits, 0,
+            "effectful loop bodies must retain ordinary iteration: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn context_owned_jit_runs_native_floating_point_loop() {
         let mut context = Context::default();
         context.enable_jit();
@@ -8132,6 +8260,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_owned_jit_affine_reduction_preserves_loop_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const meteredAffineLimit = 10; function meteredAffine() { let accumulator = 1; for (let index = 0; index < meteredAffineLimit; index++) { accumulator = (accumulator + index) | 0; accumulator = (accumulator * 3) | 0; accumulator = (accumulator - 7) | 0; } return accumulator; } let meteredAffineWarm = 0; for (let warmup = 0; warmup < 80; warmup++) { meteredAffineWarm = meteredAffine(); }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("warm up");
+        let unmetered_compilations = context.jit_stats().expect("JIT was enabled").compilations;
+
+        context.runtime_limits_mut().set_loop_iteration_limit(3);
+        let limited = crate::Script::parse(
+            crate::Source::from_bytes("meteredAffine()"),
+            None,
+            &mut context,
+        )
+        .expect("parse limited call");
+        let error = limited
+            .evaluate(&mut context)
+            .expect_err("affine reduction must preserve every loop charge");
+
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(
+            stats.compilations,
+            unmetered_compilations + 1,
+            "loop metering must compile a distinct unfused artifact: {stats:?}"
+        );
+    }
+
     fn warmed_sum_context(jit: bool) -> Context {
         let mut context = Context::builder().jit(jit).build().unwrap();
         if jit {
@@ -8239,6 +8406,46 @@ mod tests {
                 .expect("interpreter sum");
         let result = evaluate_with_instruction_budget(&mut context, "budgetBulkSum(10)", 10_000)
             .expect("native sum");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats.deopts, before.deopts, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_affine_reduction_preserves_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::builder().jit(jit).build().unwrap();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "const budgetAffineLimit = 10; function budgetAffine() { let accumulator = 1; for (let index = 0; index < budgetAffineLimit; index++) { accumulator = (accumulator + index) | 0; accumulator = (accumulator * 3) | 0; accumulator = (accumulator - 7) | 0; } return accumulator; } let budgetAffineWarm = 0; for (let warmup = 0; warmup < 80; warmup++) { budgetAffineWarm = budgetAffine(); }",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+        let expected = evaluate_with_instruction_budget(&mut interpreter, "budgetAffine()", 10_000)
+            .expect("interpreter affine loop");
+        let result = evaluate_with_instruction_budget(&mut context, "budgetAffine()", 10_000)
+            .expect("native affine loop");
 
         assert_eq!(result, expected);
         assert_eq!(
