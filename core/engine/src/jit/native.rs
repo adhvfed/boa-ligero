@@ -1102,6 +1102,10 @@ enum RegisterKind {
 struct RegisterDefinition {
     source: Option<usize>,
     kind: RegisterKind,
+    /// This value comes from a dynamically typed VM source. If it is used as
+    /// an ordinary call argument, keep the traced `JsValue` in the VM register
+    /// instead of guessing a numeric native representation.
+    box_when_passed: bool,
 }
 
 struct RegisterAnalysis {
@@ -1129,13 +1133,14 @@ fn analyze_registers(
         .map(|_| RegisterDefinition {
             source: None,
             kind: RegisterKind::Numeric,
+            box_when_passed: false,
         })
         .collect();
     let mut current: Vec<usize> = (0..register_count).collect();
     let mut before_ids = Vec::with_capacity(instructions.instructions.len());
     let mut after_ids = Vec::with_capacity(instructions.instructions.len());
     let mut targets = Vec::with_capacity(instructions.instructions.len());
-    let call_boxed_pushes = call_boxed_push_operands(instructions)?;
+    let call_pushes = call_push_operands(instructions)?;
 
     for (index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
         before_ids.push(current.clone());
@@ -1144,22 +1149,33 @@ fn analyze_registers(
             let definition = current.get(register).copied()?;
             mark_definition(definition, &mut definitions);
         }
-        if call_boxed_pushes.contains(&index)
+        if call_pushes.boxed.contains(&index)
             && let Instruction::PushFromRegister { src } = instruction
         {
             let definition = current.get(usize::from(*src)).copied()?;
             mark_definition(definition, &mut definitions);
+        } else if call_pushes.arguments.contains(&index)
+            && let Instruction::PushFromRegister { src } = instruction
+        {
+            let definition = current.get(usize::from(*src)).copied()?;
+            if definitions.get(definition)?.box_when_passed {
+                mark_definition(definition, &mut definitions);
+            }
         }
 
         let mut target = None;
-        if let Some((register, source, kind)) =
+        if let Some((register, source, kind, box_when_passed)) =
             output_definition(instruction, &current, &definitions)
         {
             if register >= current.len() {
                 return None;
             }
             let definition = definitions.len();
-            definitions.push(RegisterDefinition { source, kind });
+            definitions.push(RegisterDefinition {
+                source,
+                kind,
+                box_when_passed,
+            });
             if let Some(current_definition) = current.get_mut(register) {
                 *current_definition = definition;
             }
@@ -1328,20 +1344,27 @@ fn object_operands(instruction: &Instruction) -> Vec<usize> {
     }
 }
 
-/// Identify the two boxed prologue operands (`this`, function) for each
-/// supported call-convention group.
+struct CallPushOperands {
+    boxed: BTreeSet<usize>,
+    arguments: BTreeSet<usize>,
+}
+
+/// Identify the two boxed prologue operands (`this`, function) and the
+/// argument operands for each supported call-convention group.
 ///
 /// Arguments may have arbitrary register-only bytecode between their
 /// `PushFromRegister` instructions, so adjacency to `Call` is not a valid role
-/// test. Walk backward to recover all `argument_count + 2` pushes, then mark
-/// only the first two in forward order as boxed. Numeric arguments remain in
-/// the native representation and are boxed by their push helper.
+/// test. Walk backward to recover all `argument_count + 2` pushes. The first
+/// two are always boxed. Binding-sourced dynamic values in the remaining
+/// argument positions are boxed too, while known numeric definitions remain
+/// in SSA and use the numeric push helper.
 ///
 /// A nested call, stack pop, or control-flow edge before the complete group is
 /// ambiguous without full value-stack dataflow. Reject that shape instead of
 /// guessing which register contains the callable object.
-fn call_boxed_push_operands(instructions: &DecodedInstructions) -> Option<BTreeSet<usize>> {
+fn call_push_operands(instructions: &DecodedInstructions) -> Option<CallPushOperands> {
     let mut boxed_pushes = BTreeSet::new();
+    let mut argument_pushes = BTreeSet::new();
     for (call_index, (_, _, instruction)) in instructions.instructions.iter().enumerate() {
         let Instruction::Call { argument_count } = instruction else {
             continue;
@@ -1368,31 +1391,41 @@ fn call_boxed_push_operands(instructions: &DecodedInstructions) -> Option<BTreeS
             previous = push_index;
         }
         group.reverse();
-        boxed_pushes.extend(group.into_iter().take(2));
+        boxed_pushes.extend(group.iter().copied().take(2));
+        argument_pushes.extend(group.into_iter().skip(2));
     }
-    Some(boxed_pushes)
+    Some(CallPushOperands {
+        boxed: boxed_pushes,
+        arguments: argument_pushes,
+    })
 }
 
 fn output_definition(
     instruction: &Instruction,
     current: &[usize],
     definitions: &[RegisterDefinition],
-) -> Option<(usize, Option<usize>, RegisterKind)> {
-    let numeric = |register: usize| (register, None, RegisterKind::Numeric);
-    let boolean = |register: usize| (register, None, RegisterKind::Boolean);
-    let boxed = |register: usize| (register, None, RegisterKind::Boxed);
+) -> Option<(usize, Option<usize>, RegisterKind, bool)> {
+    let numeric = |register: usize| (register, None, RegisterKind::Numeric, false);
+    let dynamic = |register: usize| (register, None, RegisterKind::Numeric, true);
+    let boolean = |register: usize| (register, None, RegisterKind::Boolean, false);
+    let boxed = |register: usize| (register, None, RegisterKind::Boxed, false);
     let moved = |dst: usize, src: usize| {
-        let kind = definitions
-            .get(current.get(src).copied().unwrap_or(usize::MAX))
-            .map_or(RegisterKind::Boxed, |definition| definition.kind);
-        (dst, current.get(src).copied(), kind)
+        let source = current.get(src).copied();
+        let definition = source.and_then(|source| definitions.get(source));
+        (
+            dst,
+            source,
+            definition.map_or(RegisterKind::Boxed, |definition| definition.kind),
+            definition.is_some_and(|definition| definition.box_when_passed),
+        )
     };
 
     match instruction {
         Instruction::This { dst } => Some(boxed(usize::from(*dst))),
+        Instruction::GetName { dst, .. } | Instruction::GetNameGlobal { dst, .. } => {
+            Some(dynamic(usize::from(*dst)))
+        }
         Instruction::GetArgument { dst, .. }
-        | Instruction::GetName { dst, .. }
-        | Instruction::GetNameGlobal { dst, .. }
         | Instruction::StoreZero { dst }
         | Instruction::StoreOne { dst }
         | Instruction::StoreInt8 { dst, .. }

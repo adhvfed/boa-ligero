@@ -4756,12 +4756,12 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_caller_enters_prepared_small_property_reader() {
+    fn caller_enters_prepared_small_property_reader_without_binding_deopt() {
         let mut context = Context::default();
         context.enable_jit();
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function read(object) { return object.x + object.y + object.z; } const object = { x: 1, y: 2, z: 3 }; function main() { let total = 0; for (let index = 0; index < 100; index++) { total += read(object); } return total; } main()",
+                "function read(object) { return object.x + object.y + object.z; } let object = { x: 1, y: 2, z: 3 }; function main() { let total = 0; for (let index = 0; index < 100; index++) { total += read(object); } return total; } main()",
             ),
             None,
             &mut context,
@@ -4775,6 +4775,39 @@ mod tests {
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_leaf_entries > 0, "stats: {stats:?}");
         assert_eq!(stats.scheduler_call_exits, 0, "stats: {stats:?}");
+
+        let initial_deopts = stats.deopts;
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes("main()"))
+                .expect("evaluate warm property reader")
+                .as_i32(),
+            Some(600)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(
+            stats.deopts, initial_deopts,
+            "a global object passed as an argument must stay boxed: {stats:?}"
+        );
+
+        boa_gc::force_collect();
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "object = { x: 4, y: 5, z: 6 }; main()",
+                ))
+                .expect("evaluate replaced property reader argument")
+                .as_i32(),
+            Some(1_500)
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert_eq!(
+            stats.deopts, initial_deopts,
+            "a replacement object with the cached shape must stay native: {stats:?}"
+        );
+        context
+            .eval(crate::Source::from_bytes("object = { x: 1, y: 2, z: 3 }"))
+            .expect("restore property reader argument");
 
         let native_leaf_entries = stats.native_leaf_entries;
         context.set_instruction_budget(100_000);
