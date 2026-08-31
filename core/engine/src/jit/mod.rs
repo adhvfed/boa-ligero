@@ -7475,7 +7475,7 @@ mod tests {
     #[test]
     fn context_owned_jit_scans_readonly_indexed_objects() {
         let mut context = Context::default();
-        context.enable_jit();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
         let script = crate::Script::parse(
             crate::Source::from_bytes(
                 "const list = { length: 3 }; const first = {}; const needle = {}; const last = {}; Object.defineProperty(list, 0, { value: first, enumerable: true, configurable: true }); Object.defineProperty(list, 1, { value: needle, enumerable: true, configurable: true }); Object.defineProperty(list, 2, { value: last, enumerable: true, configurable: true }); function find(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = find(list, needle, 10); } answer",
@@ -7487,6 +7487,91 @@ mod tests {
 
         let result = script.evaluate(&mut context).expect("evaluate");
         assert_eq!(result.as_i32(), Some(10));
+
+        boa_gc::force_collect();
+        let after_gc = crate::Script::parse(
+            crate::Source::from_bytes("find(list, needle, 10)"),
+            None,
+            &mut context,
+        )
+        .expect("parse after GC");
+        let result = after_gc.evaluate(&mut context).expect("evaluate after GC");
+        assert_eq!(result.as_i32(), Some(10));
+
+        let no_match = crate::Script::parse(
+            crate::Source::from_bytes("const missing = {}; find(list, missing, 10)"),
+            None,
+            &mut context,
+        )
+        .expect("parse no-match scan");
+        let result = no_match
+            .evaluate(&mut context)
+            .expect("evaluate no-match scan");
+        assert_eq!(result.as_i32(), Some(0));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.native_storage.dense_guard_hits > 0);
+        assert_eq!(
+            diagnostics.native_storage.dense_loads,
+            diagnostics.native_storage.dense_guard_hits
+        );
+        assert!(
+            diagnostics.native_storage.dense_loads > diagnostics.native_storage.named_loads,
+            "one guarded scan should cover multiple indexed loads: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_bulk_scans_global_readonly_indexed_objects() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const globalList = { length: 3 }; const globalFirst = {}; const globalSecond = {}; const globalNeedle = {}; Object.defineProperty(globalList, 0, { value: globalFirst, enumerable: true, configurable: true }); Object.defineProperty(globalList, 1, { value: globalSecond, enumerable: true, configurable: true }); Object.defineProperty(globalList, 2, { value: globalNeedle, enumerable: true, configurable: true }); function globalFind(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < globalList.length; index++) { if (globalList[index] === globalNeedle) { checksum += index; break; } } } return checksum; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = globalFind(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(20));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.native_storage.named_loads > 0);
+        assert_eq!(
+            diagnostics.native_storage.dense_loads,
+            diagnostics.native_storage.named_loads * 3,
+            "the global scan should enter its helper once per three values: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_readonly_indexed_scan_preserves_non_match_effects() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const list = { length: 3 }; const first = {}; const second = {}; const needle = {}; Object.defineProperty(list, 0, { value: first, configurable: true }); Object.defineProperty(list, 1, { value: second, configurable: true }); Object.defineProperty(list, 2, { value: needle, configurable: true }); function findWithEffects(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } checksum += 100; } } return checksum; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = findWithEffects(list, needle, 10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(2020));
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
@@ -7500,7 +7585,7 @@ mod tests {
         context.enable_jit();
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "const list = { length: 3 }; const first = {}; const needle = {}; const last = {}; Object.defineProperty(list, 0, { value: first, enumerable: true, configurable: true }); Object.defineProperty(list, 1, { value: needle, enumerable: true, configurable: true }); Object.defineProperty(list, 2, { value: last, enumerable: true, configurable: true }); function find(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { find(list, needle, 10); } Object.defineProperty(list, 1, { get() { return first; }, configurable: true }); find(list, needle, 10)",
+                "const list = { length: 3 }; const first = {}; const needle = {}; const last = {}; Object.defineProperty(list, 0, { value: first, enumerable: true, configurable: true }); Object.defineProperty(list, 1, { value: needle, enumerable: true, configurable: true }); Object.defineProperty(list, 2, { value: last, enumerable: true, configurable: true }); function find(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { find(list, needle, 10); } let getterCalls = 0; Object.defineProperty(list, 1, { get() { getterCalls += 1; return first; }, configurable: true }); find(list, needle, 10); getterCalls",
             ),
             None,
             &mut context,
@@ -7508,11 +7593,32 @@ mod tests {
         .expect("parse");
 
         let result = script.evaluate(&mut context).expect("evaluate");
-        assert_eq!(result.as_i32(), Some(0));
+        assert_eq!(result.as_i32(), Some(10));
 
         let stats = context.jit_stats().expect("JIT was enabled");
         assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_deopts_readonly_indexed_scan_on_observable_length() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const lengthList = { length: 3 }; const lengthFirst = {}; const lengthNeedle = {}; const lengthLast = {}; Object.defineProperty(lengthList, 0, { value: lengthFirst, enumerable: true, configurable: true }); Object.defineProperty(lengthList, 1, { value: lengthNeedle, enumerable: true, configurable: true }); Object.defineProperty(lengthList, 2, { value: lengthLast, enumerable: true, configurable: true }); function findWithLength(list, needle, runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < list.length; index++) { if (list[index] === needle) { checksum += index; break; } } } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { findWithLength(lengthList, lengthNeedle, 10); } let lengthGets = 0; Object.defineProperty(lengthList, 'length', { get() { lengthGets += 1; return 3; }, configurable: true }); findWithLength(lengthList, lengthNeedle, 10); lengthGets",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(20));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
         assert!(stats.deopts >= 1, "stats: {stats:?}");
     }
 
@@ -7919,6 +8025,46 @@ mod tests {
         let script = crate::Script::parse(crate::Source::from_bytes(source), None, context)
             .expect("parse budgeted script");
         script.evaluate(context)
+    }
+
+    #[test]
+    fn context_owned_jit_readonly_indexed_scan_preserves_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::builder().jit(jit).build().unwrap();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "const budgetList = { length: 3 }; const budgetFirst = {}; const budgetNeedle = {}; const budgetLast = {}; Object.defineProperty(budgetList, 0, { value: budgetFirst, enumerable: true, configurable: true }); Object.defineProperty(budgetList, 1, { value: budgetNeedle, enumerable: true, configurable: true }); Object.defineProperty(budgetList, 2, { value: budgetLast, enumerable: true, configurable: true }); function budgetFind(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { for (let index = 0; index < budgetList.length; index++) { if (budgetList[index] === budgetNeedle) { checksum += index; break; } } } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { budgetFind(10); }",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+        let expected = evaluate_with_instruction_budget(&mut interpreter, "budgetFind(10)", 10_000)
+            .expect("interpreter scan");
+        let result = evaluate_with_instruction_budget(&mut context, "budgetFind(10)", 10_000)
+            .expect("native scan");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats.deopts, before.deopts, "stats: {stats:?}");
     }
 
     #[test]

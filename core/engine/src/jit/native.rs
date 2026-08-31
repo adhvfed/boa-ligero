@@ -26,6 +26,11 @@ use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, StackSlotData, StackSl
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module};
 
+const JIT_SCAN_DENSE_FAIL_BIT: u64 = 1 << 60;
+const JIT_SCAN_MATCH_BIT: u64 = 1 << 59;
+const JIT_SCAN_COUNT_SHIFT: u32 = 32;
+const JIT_SCAN_COUNT_MASK: u64 = (1 << 27) - 1;
+
 /// Compile an ordinary numeric code block to native code.
 ///
 /// The current native subset is deliberately conservative: primitive values
@@ -1528,6 +1533,7 @@ struct Helpers {
     dense_f64_guarded: Helper,
     dense_boxed_i32_guarded: Helper,
     dense_boxed_f64_guarded: Helper,
+    indexed_scan_step_i32_guarded: Helper,
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
@@ -1557,6 +1563,24 @@ struct Helpers {
     refund_instruction_budget: Helper,
 }
 
+#[derive(Clone, Copy)]
+struct IndexedScanStepFusion {
+    compare_index: usize,
+    object_move_index: usize,
+    key_move_index: usize,
+    property_index: usize,
+    property_pc: usize,
+    property_ic_index: u32,
+    property_object_dst: usize,
+    property_key_dst: usize,
+    strict_eq_index: usize,
+    branch_index: usize,
+    index: usize,
+    other: usize,
+    other_binding_index: Option<u32>,
+    other_load_index: Option<usize>,
+}
+
 struct NativeCompiler<'a> {
     backend: &'a mut JitBackend,
     code: &'a CodeBlock,
@@ -1571,6 +1595,11 @@ struct NativeCompiler<'a> {
     flag_defined: Option<cranelift_codegen::ir::Value>,
     flag_undefined: Option<cranelift_codegen::ir::Value>,
     dirty: BTreeSet<usize>,
+    /// Encoded scan-step results produced by a dominating length-property
+    /// block and consumed by its comparison and equality branch.
+    fused_scan_step_results: HashMap<usize, cranelift_codegen::ir::Value>,
+    /// Pure bytecodes already performed by a fused scan-step helper.
+    fused_scan_step_skips: BTreeSet<usize>,
     options: NativeCompileOptions,
 }
 
@@ -1595,6 +1624,8 @@ impl<'a> NativeCompiler<'a> {
             flag_defined: None,
             flag_undefined: None,
             dirty: BTreeSet::new(),
+            fused_scan_step_results: HashMap::new(),
+            fused_scan_step_skips: BTreeSet::new(),
             options,
         })
     }
@@ -1893,6 +1924,25 @@ impl<'a> NativeCompiler<'a> {
                 &[ptr, types::I32, types::F64, types::I32, types::I32],
                 types::I64,
             ),
+            indexed_scan_step_i32_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_indexed_scan_step_i32_guarded as *const () as usize
+                } else {
+                    jit_indexed_scan_step_i32_guarded as *const () as usize
+                },
+                &[
+                    ptr,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I64,
+            ),
             named_boxed_guarded: make(
                 if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_boxed_guarded as *const () as usize
@@ -2105,6 +2155,9 @@ impl<'a> NativeCompiler<'a> {
         break_block: Block,
     ) -> bool {
         let register = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
+        if self.fused_scan_step_skips.remove(&self.current_instruction) {
+            return true;
+        }
 
         match instruction {
             Instruction::This { dst } => {
@@ -2368,11 +2421,127 @@ impl<'a> NativeCompiler<'a> {
                 ic_index,
                 ..
             } => {
-                if self.register_kind(usize::from(*value)) != RegisterKind::Boxed {
+                let object_register = usize::from(*value);
+                if self.register_kind(object_register) != RegisterKind::Boxed {
                     return false;
                 }
                 let dst = register(*dst);
-                let object = bcx.ins().iconst(types::I32, usize::from(*value) as i64);
+                let scan_step = matches!(instruction, Instruction::GetLengthProperty { .. })
+                    .then(|| self.indexed_scan_step_fusion(dst, object_register))
+                    .flatten();
+                if let Some(fusion) = scan_step {
+                    let Some(index) = self.use_register(bcx, fusion.index) else {
+                        return false;
+                    };
+                    let helper = bcx.ins().iconst(
+                        helpers.ptr,
+                        helpers.indexed_scan_step_i32_guarded.address as i64,
+                    );
+                    let object = bcx.ins().iconst(types::I32, object_register as i64);
+                    let length_ic = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(u32::from(*ic_index)));
+                    let property_ic = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.property_ic_index));
+                    let other = bcx.ins().iconst(types::I32, fusion.other as i64);
+                    let other_binding = bcx.ins().iconst(
+                        types::I32,
+                        i64::from(fusion.other_binding_index.unwrap_or(u32::MAX)),
+                    );
+                    let property_object_dst = bcx
+                        .ins()
+                        .iconst(types::I32, fusion.property_object_dst as i64);
+                    let property_key_dst =
+                        bcx.ins().iconst(types::I32, fusion.property_key_dst as i64);
+                    self.emit_set_pc(bcx, ctx, helpers, next_pc);
+                    let result = bcx.ins().call_indirect(
+                        helpers.indexed_scan_step_i32_guarded.signature,
+                        helper,
+                        &[
+                            ctx,
+                            object,
+                            index,
+                            length_ic,
+                            property_ic,
+                            other,
+                            other_binding,
+                            property_object_dst,
+                            property_key_dst,
+                        ],
+                    );
+                    let result = bcx.inst_results(result)[0];
+
+                    let named_deopt = bcx.create_block();
+                    let dense_check = bcx.create_block();
+                    let dense_deopt = bcx.create_block();
+                    let cont = bcx.create_block();
+                    let named_fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let named_failed = bcx.ins().band(result, named_fail_mask);
+                    bcx.ins()
+                        .brif(named_failed, named_deopt, &[], dense_check, &[]);
+
+                    bcx.switch_to_block(named_deopt);
+                    if !self.emit_guard_deopt(bcx, ctx, helpers, pc, JitExitReason::NamedProperty) {
+                        return false;
+                    }
+
+                    bcx.switch_to_block(dense_check);
+                    let dense_fail_mask =
+                        bcx.ins().iconst(types::I64, JIT_SCAN_DENSE_FAIL_BIT as i64);
+                    let dense_failed = bcx.ins().band(result, dense_fail_mask);
+                    bcx.ins().brif(dense_failed, dense_deopt, &[], cont, &[]);
+
+                    bcx.switch_to_block(dense_deopt);
+                    let failure_index = bcx.ins().ireduce(types::I32, result);
+                    if !self.define_register(bcx, fusion.index, failure_index) {
+                        return false;
+                    }
+                    if !self.emit_guard_deopt(
+                        bcx,
+                        ctx,
+                        helpers,
+                        fusion.property_pc,
+                        JitExitReason::DenseElement,
+                    ) {
+                        return false;
+                    }
+
+                    bcx.switch_to_block(cont);
+                    let scan_index = bcx.ins().ireduce(types::I32, result);
+                    if !self.define_register(bcx, fusion.index, scan_index) {
+                        return false;
+                    }
+                    if self
+                        .fused_scan_step_results
+                        .insert(fusion.compare_index, result)
+                        .is_some()
+                        || self
+                            .fused_scan_step_results
+                            .insert(fusion.branch_index, result)
+                            .is_some()
+                    {
+                        return false;
+                    }
+                    for index in [
+                        fusion.object_move_index,
+                        fusion.key_move_index,
+                        fusion.property_index,
+                        fusion.strict_eq_index,
+                    ] {
+                        if !self.fused_scan_step_skips.insert(index) {
+                            return false;
+                        }
+                    }
+                    if let Some(index) = fusion.other_load_index
+                        && !self.fused_scan_step_skips.insert(index)
+                    {
+                        return false;
+                    }
+                    return true;
+                }
+
+                let object = bcx.ins().iconst(types::I32, object_register as i64);
                 let ic_index = bcx
                     .ins()
                     .iconst(types::I32, i64::from(u32::from(*ic_index)));
@@ -2843,6 +3012,21 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().jump(target, &[]);
             }
             Instruction::JumpIfFalse { address, value } => {
+                if let Some(result) = self
+                    .fused_scan_step_results
+                    .remove(&self.current_instruction)
+                {
+                    let match_mask = bcx.ins().iconst(types::I64, JIT_SCAN_MATCH_BIT as i64);
+                    let is_match = bcx.ins().band(result, match_mask);
+                    let Some(target) = self.target_block(*address, blocks) else {
+                        return false;
+                    };
+                    let Some(fallthrough) = self.next_block(next_pc, blocks) else {
+                        return false;
+                    };
+                    bcx.ins().brif(is_match, fallthrough, &[], target, &[]);
+                    return true;
+                }
                 let Some(value) = self.use_register(bcx, register(*value)) else {
                     return false;
                 };
@@ -2861,6 +3045,21 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().brif(is_true, fallthrough, &[], target, &[]);
             }
             Instruction::JumpIfNotLessThan { address, lhs, rhs } => {
+                if let Some(result) = self
+                    .fused_scan_step_results
+                    .remove(&self.current_instruction)
+                {
+                    let match_mask = bcx.ins().iconst(types::I64, JIT_SCAN_MATCH_BIT as i64);
+                    let is_match = bcx.ins().band(result, match_mask);
+                    let Some(target) = self.target_block(*address, blocks) else {
+                        return false;
+                    };
+                    let Some(fallthrough) = self.next_block(next_pc, blocks) else {
+                        return false;
+                    };
+                    bcx.ins().brif(is_match, fallthrough, &[], target, &[]);
+                    return true;
+                }
                 if !self.emit_compare_branch(
                     bcx,
                     register(*lhs),
@@ -3109,6 +3308,369 @@ impl<'a> NativeCompiler<'a> {
     /// overflow deopt instead of relying on wider data-flow assumptions.
     fn i32_arithmetic_wraps(&self, instruction: &Instruction) -> bool {
         i32_arithmetic_coercion(&self.instructions, self.current_instruction, instruction)
+    }
+
+    /// Match the bytecompiler's canonical indexed identity-scan step:
+    ///
+    /// `length load -> bounds branch -> object/key setup -> indexed load ->
+    /// strict equality -> equality branch`.
+    ///
+    /// Every interior block must have exactly the linear predecessor, and all
+    /// elided temporaries must die at their canonical consumer. Budgeted code
+    /// keeps the ordinary bytecode lowering because it must be resumable
+    /// between every instruction.
+    fn indexed_scan_step_fusion(
+        &self,
+        length_dst: usize,
+        object: usize,
+    ) -> Option<IndexedScanStepFusion> {
+        if self.options.accounting.instruction_budget
+            || self.options.accounting.loop_iterations
+            || self.mode != NativeMode::I32
+        {
+            return None;
+        }
+
+        let compare_index = self.current_instruction.checked_add(1)?;
+        let object_move_index = self.current_instruction.checked_add(2)?;
+        let key_move_index = self.current_instruction.checked_add(3)?;
+        let property_index = self.current_instruction.checked_add(4)?;
+        let strict_or_other_index = self.current_instruction.checked_add(5)?;
+
+        let (_, _, compare) = self.instructions.instructions.get(compare_index)?;
+        let Instruction::JumpIfNotLessThan {
+            lhs: index,
+            rhs: length,
+            ..
+        } = compare
+        else {
+            return None;
+        };
+        let index = usize::from(*index);
+        if usize::from(*length) != length_dst {
+            return None;
+        }
+
+        let (_, _, object_move) = self.instructions.instructions.get(object_move_index)?;
+        let (property_object_dst, object_binding_index) = match object_move {
+            Instruction::Move {
+                src: object_source,
+                dst,
+            } if usize::from(*object_source) == object => (usize::from(*dst), None),
+            Instruction::GetName { dst, binding_index } => {
+                let binding_index = u32::from(*binding_index);
+                let previous_index = self.current_instruction.checked_sub(1)?;
+                let (_, _, previous) = self.instructions.instructions.get(previous_index)?;
+                let Instruction::GetName {
+                    dst: previous_dst,
+                    binding_index: previous_binding,
+                } = previous
+                else {
+                    return None;
+                };
+                if usize::from(*previous_dst) != object
+                    || u32::from(*previous_binding) != binding_index
+                    || self
+                        .code
+                        .bindings
+                        .get(binding_index as usize)
+                        .is_none_or(|binding| {
+                            binding.scope() != BindingLocatorScope::GlobalDeclarative
+                        })
+                {
+                    return None;
+                }
+                (usize::from(*dst), Some(binding_index))
+            }
+            _ => return None,
+        };
+
+        let (_, _, key_move) = self.instructions.instructions.get(key_move_index)?;
+        let Instruction::Move {
+            src: key_source,
+            dst: property_key_dst,
+        } = key_move
+        else {
+            return None;
+        };
+        let property_key_dst = usize::from(*property_key_dst);
+        if usize::from(*key_source) != index {
+            return None;
+        }
+
+        let (property_pc, _, property) = self.instructions.instructions.get(property_index)?;
+        let Instruction::GetPropertyByValue {
+            dst: property_dst,
+            key,
+            receiver,
+            object: property_object,
+            ic_index: property_ic_index,
+        } = property
+        else {
+            return None;
+        };
+        let property_dst = usize::from(*property_dst);
+        if usize::from(*key) != property_key_dst
+            || usize::from(*receiver) != property_object_dst
+            || usize::from(*property_object) != property_object_dst
+        {
+            return None;
+        }
+
+        let (_, _, strict_or_other) = self.instructions.instructions.get(strict_or_other_index)?;
+        let (strict_eq_index, expected_other, other_binding_index, other_load_index) =
+            match strict_or_other {
+                Instruction::StrictEq { .. } if object_binding_index.is_none() => {
+                    (strict_or_other_index, None, None, None)
+                }
+                Instruction::GetName { dst, binding_index }
+                    if object_binding_index.is_some()
+                        && self
+                            .code
+                            .bindings
+                            .get(usize::from(*binding_index))
+                            .is_some_and(|binding| {
+                                binding.scope() == BindingLocatorScope::GlobalDeclarative
+                            }) =>
+                {
+                    (
+                        strict_or_other_index.checked_add(1)?,
+                        Some(usize::from(*dst)),
+                        Some(u32::from(*binding_index)),
+                        Some(strict_or_other_index),
+                    )
+                }
+                _ => return None,
+            };
+        let branch_index = strict_eq_index.checked_add(1)?;
+
+        for instruction_index in self.current_instruction..branch_index {
+            let (_, next_pc, _) = self.instructions.instructions.get(instruction_index)?;
+            if self.instructions.pc_to_index.get(next_pc).copied()? != instruction_index + 1 {
+                return None;
+            }
+        }
+        for instruction_index in compare_index..=branch_index {
+            let (pc, _, _) = self.instructions.instructions.get(instruction_index)?;
+            if self
+                .instructions
+                .instructions
+                .iter()
+                .any(|(_, _, instruction)| branch_target(instruction) == Some(*pc))
+            {
+                return None;
+            }
+        }
+
+        let (_, _, strict_eq) = self.instructions.instructions.get(strict_eq_index)?;
+        let Instruction::StrictEq { dst, lhs, rhs } = strict_eq else {
+            return None;
+        };
+        let strict_eq_dst = usize::from(*dst);
+        let lhs = usize::from(*lhs);
+        let rhs = usize::from(*rhs);
+        let other = match (lhs == property_dst, rhs == property_dst) {
+            (true, false) => rhs,
+            (false, true) => lhs,
+            _ => return None,
+        };
+        if expected_other.is_some_and(|expected| expected != other) {
+            return None;
+        }
+
+        let (_, _, branch) = self.instructions.instructions.get(branch_index)?;
+        let Instruction::JumpIfFalse {
+            value,
+            address: false_address,
+        } = branch
+        else {
+            return None;
+        };
+        if usize::from(*value) != strict_eq_dst {
+            return None;
+        }
+
+        // A bulk scan skips all preceding non-matching iterations. Prove that
+        // their false path contains only the bytecompiler's loop-maintenance
+        // tail; otherwise calls, assignments, or any other user-visible work
+        // between the comparison and back-edge would be skipped as well.
+        let loop_iteration_index = self
+            .current_instruction
+            .checked_sub(if object_binding_index.is_some() { 3 } else { 2 })?;
+        let index_increment_index = loop_iteration_index.checked_add(1)?;
+        let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
+            self.instructions.instructions.get(loop_iteration_index)?;
+        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
+            || self
+                .instructions
+                .pc_to_index
+                .get(loop_iteration_next_pc)
+                .copied()
+                != Some(index_increment_index)
+        {
+            return None;
+        }
+        let (_, increment_next_pc, increment) =
+            self.instructions.instructions.get(index_increment_index)?;
+        let Instruction::Inc {
+            src: increment_src,
+            dst: increment_dst,
+        } = increment
+        else {
+            return None;
+        };
+        let increment_successor = if object_binding_index.is_some() {
+            self.current_instruction.checked_sub(1)?
+        } else {
+            self.current_instruction
+        };
+        if usize::from(*increment_src) != index
+            || usize::from(*increment_dst) != index
+            || self
+                .instructions
+                .pc_to_index
+                .get(increment_next_pc)
+                .copied()
+                != Some(increment_successor)
+        {
+            return None;
+        }
+        let false_index = self
+            .instructions
+            .pc_to_index
+            .get(&(false_address.as_u32() as usize))
+            .copied()?;
+        let (_, _, false_instruction) = self.instructions.instructions.get(false_index)?;
+        let Instruction::Jump { address: back_edge } = false_instruction else {
+            return None;
+        };
+        if back_edge.as_u32() as usize != *loop_iteration_pc {
+            return None;
+        }
+
+        if object_binding_index.is_some() {
+            let registers = [
+                object,
+                index,
+                length_dst,
+                property_object_dst,
+                property_key_dst,
+            ];
+            if registers
+                .iter()
+                .enumerate()
+                .any(|(position, register)| registers[..position].contains(register))
+                || property_dst != object
+                || other != property_object_dst
+                || strict_eq_dst != length_dst
+            {
+                return None;
+            }
+        } else {
+            let source_registers = [object, index, other];
+            let temporary_registers = [
+                length_dst,
+                property_object_dst,
+                property_key_dst,
+                property_dst,
+            ];
+            if source_registers.iter().any(|source| {
+                temporary_registers
+                    .iter()
+                    .any(|temporary| source == temporary)
+            }) || temporary_registers
+                .iter()
+                .enumerate()
+                .any(|(position, register)| temporary_registers[..position].contains(register))
+                || (strict_eq_dst != length_dst
+                    && (source_registers.contains(&strict_eq_dst)
+                        || temporary_registers.contains(&strict_eq_dst)))
+            {
+                return None;
+            }
+        }
+
+        let kind_before = |instruction_index: usize, register: usize| {
+            self.analysis
+                .before
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        let kind_after = |instruction_index: usize, register: usize| {
+            self.analysis
+                .after
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        let other_is_boxed = other_load_index.map_or_else(
+            || kind_before(self.current_instruction, other) == Some(RegisterKind::Boxed),
+            |instruction_index| kind_after(instruction_index, other) == Some(RegisterKind::Boxed),
+        );
+        if kind_before(self.current_instruction, object) != Some(RegisterKind::Boxed)
+            || kind_before(self.current_instruction, index) != Some(RegisterKind::Numeric)
+            || !other_is_boxed
+            || kind_after(self.current_instruction, length_dst) != Some(RegisterKind::Numeric)
+            || kind_after(object_move_index, property_object_dst) != Some(RegisterKind::Boxed)
+            || kind_after(key_move_index, property_key_dst) != Some(RegisterKind::Numeric)
+            || kind_after(property_index, property_dst) != Some(RegisterKind::Boxed)
+            || kind_after(strict_eq_index, strict_eq_dst) != Some(RegisterKind::Boolean)
+        {
+            return None;
+        }
+
+        if self
+            .analysis
+            .live_after
+            .get(compare_index)?
+            .contains(&length_dst)
+            || self
+                .analysis
+                .live_after
+                .get(property_index)?
+                .contains(&property_object_dst)
+            || self
+                .analysis
+                .live_after
+                .get(property_index)?
+                .contains(&property_key_dst)
+            || self
+                .analysis
+                .live_after
+                .get(strict_eq_index)?
+                .contains(&property_dst)
+            || (other_load_index.is_some()
+                && self
+                    .analysis
+                    .live_after
+                    .get(strict_eq_index)?
+                    .contains(&other))
+            || self
+                .analysis
+                .live_after
+                .get(branch_index)?
+                .contains(&strict_eq_dst)
+        {
+            return None;
+        }
+
+        Some(IndexedScanStepFusion {
+            compare_index,
+            object_move_index,
+            key_move_index,
+            property_index,
+            property_pc: *property_pc,
+            property_ic_index: u32::from(*property_ic_index),
+            property_object_dst,
+            property_key_dst,
+            strict_eq_index,
+            branch_index,
+            index,
+            other,
+            other_binding_index,
+            other_load_index,
+        })
     }
 
     fn register_kind(&self, register: usize) -> RegisterKind {
@@ -4609,6 +5171,148 @@ extern "C" fn jit_dense_array_boxed_f64_guarded(
     1
 }
 
+type IndexedScanResult = Result<(Option<u32>, u64), (u32, u64)>;
+
+fn dense_array_index_of_at(
+    context: &Context,
+    register: u32,
+    start: u32,
+    end: u32,
+    ic_index: u32,
+    other: &JsValue,
+) -> Option<IndexedScanResult> {
+    let value = context.vm.get_register(register as usize);
+    let object = value.as_object_borrowed()?;
+    let object = object.borrow();
+    let ic = context
+        .vm
+        .frame()
+        .code_block()
+        .element_ic
+        .get(ic_index as usize)?;
+    ic.matches(object.shape())?;
+    Some(
+        object
+            .properties()
+            .index_of_contiguous_own_data(start, end, other),
+    )
+}
+
+fn encode_indexed_scan_result(index: i32, scanned: u64, matched: bool) -> u64 {
+    u64::from(index as u32)
+        | (scanned.min(JIT_SCAN_COUNT_MASK) << JIT_SCAN_COUNT_SHIFT)
+        | if matched { JIT_SCAN_MATCH_BIT } else { 0 }
+}
+
+fn materialize_indexed_scan_property_operands(
+    context: &mut Context,
+    register: u32,
+    index: i32,
+    property_object_dst: u32,
+    property_key_dst: u32,
+) {
+    let object = context.vm.get_register(register as usize).clone();
+    context
+        .vm
+        .set_register(property_object_dst as usize, object);
+    context
+        .vm
+        .set_register(property_key_dst as usize, JsValue::from(index));
+}
+
+fn global_declarative_binding_value(context: &Context, binding_index: u32) -> Option<JsValue> {
+    if !context.binding_locator_stable() {
+        return None;
+    }
+    let frame = context.vm.frame();
+    let binding = frame.code_block.bindings.get(binding_index as usize)?;
+    if binding.scope() != BindingLocatorScope::GlobalDeclarative {
+        return None;
+    }
+    frame.realm.environment().get(binding.binding_index())
+}
+
+extern "C" fn jit_indexed_scan_step_i32_guarded(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    length_ic_index: u32,
+    property_ic_index: u32,
+    other: u32,
+    other_binding_index: u32,
+    property_object_dst: u32,
+    property_key_dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    let global_other = if other_binding_index == u32::MAX {
+        None
+    } else {
+        let Some(value) = global_declarative_binding_value(context, other_binding_index) else {
+            return JIT_GUARD_FAIL_BIT;
+        };
+        Some(value)
+    };
+    let other = global_other
+        .as_ref()
+        .unwrap_or_else(|| context.vm.get_register(other as usize));
+    let Some(length) =
+        named_property_value(context, register, length_ic_index).and_then(|value| value.as_i32())
+    else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    if index >= length {
+        return encode_indexed_scan_result(index, 0, false);
+    }
+
+    let Ok(start) = u32::try_from(index) else {
+        // The interpreter resumes at `GetPropertyByValue`, after the two Move
+        // bytecodes elided by this helper. Publish those exact operands only
+        // on the cold guard-failure path.
+        materialize_indexed_scan_property_operands(
+            context,
+            register,
+            index,
+            property_object_dst,
+            property_key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT | u64::from(index as u32);
+    };
+    let Some(result) = dense_array_index_of_at(
+        context,
+        register,
+        start,
+        length as u32,
+        property_ic_index,
+        other,
+    ) else {
+        materialize_indexed_scan_property_operands(
+            context,
+            register,
+            index,
+            property_object_dst,
+            property_key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT | u64::from(index as u32);
+    };
+
+    match result {
+        Ok((Some(found), scanned)) => encode_indexed_scan_result(found as i32, scanned, true),
+        Ok((None, scanned)) => encode_indexed_scan_result(length, scanned, false),
+        Err((failed, scanned)) => {
+            let failed = failed as i32;
+            materialize_indexed_scan_property_operands(
+                context,
+                register,
+                failed,
+                property_object_dst,
+                property_key_dst,
+            );
+            JIT_SCAN_DENSE_FAIL_BIT | encode_indexed_scan_result(failed, scanned, false)
+        }
+    }
+}
+
 extern "C" fn jit_diagnostic_dense_array_i32_guarded(
     context: *mut Context,
     register: u32,
@@ -4684,6 +5388,46 @@ extern "C" fn jit_diagnostic_dense_array_boxed_f64_guarded(
     } else {
         counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
         counters.dense_loads = counters.dense_loads.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_indexed_scan_step_i32_guarded(
+    context: *mut Context,
+    register: u32,
+    index: i32,
+    length_ic_index: u32,
+    property_ic_index: u32,
+    other: u32,
+    other_binding_index: u32,
+    property_object_dst: u32,
+    property_key_dst: u32,
+) -> u64 {
+    let result = jit_indexed_scan_step_i32_guarded(
+        context,
+        register,
+        index,
+        length_ic_index,
+        property_ic_index,
+        other,
+        other_binding_index,
+        property_object_dst,
+        property_key_dst,
+    );
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrows ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result & JIT_GUARD_FAIL_BIT != 0 {
+        counters.named_guard_misses = counters.named_guard_misses.saturating_add(1);
+        return result;
+    }
+    counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
+    counters.named_loads = counters.named_loads.saturating_add(1);
+    let scanned = (result >> JIT_SCAN_COUNT_SHIFT) & JIT_SCAN_COUNT_MASK;
+    counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(scanned);
+    counters.dense_loads = counters.dense_loads.saturating_add(scanned);
+    if result & JIT_SCAN_DENSE_FAIL_BIT != 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
     }
     result
 }
