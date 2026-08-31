@@ -46,6 +46,45 @@ fn basic_op() {
 }
 
 #[test]
+fn primitive_char_code_at_and_imul_calls_use_guarded_native_fast_paths() {
+    let mut context = Context::default();
+    let result = context
+        .eval(Source::from_bytes(
+            r#"JSON.stringify(["AZ".charCodeAt(1), Math.imul(-7, 6)])"#,
+        ))
+        .expect("canonical primitive built-ins must evaluate");
+    assert_eq!(result, js_string!("[90,-42]").into());
+    assert_eq!(context.vm.native_builtin_fast_calls, 2);
+
+    let patched = context
+        .eval(Source::from_bytes(
+            r#"
+                String.prototype.charCodeAt = function () { return 77; };
+                Math.imul = function () { return 81; };
+                JSON.stringify(["AZ".charCodeAt(1), Math.imul(-7, 6)]);
+            "#,
+        ))
+        .expect("monkey-patched built-ins must evaluate normally");
+    assert_eq!(patched, js_string!("[77,81]").into());
+    assert_eq!(
+        context.vm.native_builtin_fast_calls, 2,
+        "resolved replacements must bypass the pointer-identity fast paths"
+    );
+}
+
+#[test]
+fn native_builtin_fast_paths_fall_back_for_javascript_coercions() {
+    let mut context = Context::default();
+    let result = context
+        .eval(Source::from_bytes(
+            r#"JSON.stringify(["AZ".charCodeAt("1"), "AZ".charCodeAt(9), Math.imul("-7", 6)])"#,
+        ))
+        .expect("coercing built-in calls must evaluate through the generic path");
+    assert_eq!(result, js_string!("[90,null,-42]").into());
+    assert_eq!(context.vm.native_builtin_fast_calls, 0);
+}
+
+#[test]
 fn position() {
     let context = &mut Context::default();
     context

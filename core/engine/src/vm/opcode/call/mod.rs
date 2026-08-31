@@ -6,10 +6,11 @@ use dynify::Dynify;
 use super::{IndexOperand, RegisterOperand};
 use crate::{
     Context, JsError, JsExpect, JsObject, JsResult, JsValue, NativeFunction,
-    builtins::{Promise, function::OrdinaryFunction, promise::PromiseCapability},
+    builtins::{Math, Promise, String, function::OrdinaryFunction, promise::PromiseCapability},
     error::JsNativeError,
     job::NativeAsyncJob,
     module::{ImportAttribute, Module, ModuleKind, ModuleRequest, Referrer},
+    native_function::NativeFunctionObject,
     object::{FunctionObjectBuilder, internal_methods::InternalMethodCallContext},
     vm::opcode::Operation,
 };
@@ -227,6 +228,77 @@ impl Call {
                 &mut InternalMethodCallContext::new(context),
             )?
             .resolve(context);
+        }
+
+        // Emotion's generated-style hash and many other production bundles
+        // call these two side-effect-free built-ins in tight loops. Going
+        // through the generic native-function path clones the function
+        // object, allocates an argument Vec, swaps realms, and maintains a
+        // native shadow frame for every code unit or integer multiply. When
+        // the resolved function still is the realm's original pointer and the
+        // operands already have the exact primitive types required by the
+        // algorithms, complete the call directly on the VM stack. Any
+        // monkey-patch, coercion, missing argument, or exceptional input falls
+        // through unchanged.
+        let native = object.downcast_ref::<NativeFunctionObject>();
+        let is_char_code_at = native
+            .as_ref()
+            .is_some_and(|native| native.f.is_pointer(String::char_code_at));
+        let is_imul = native
+            .as_ref()
+            .is_some_and(|native| native.f.is_pointer(Math::imul));
+        drop(native);
+
+        if is_char_code_at
+            && argument_count >= 1
+            && let Some(string) = context
+                .vm
+                .stack
+                .calling_convention_get_this(argument_count)
+                .as_string()
+            && let Some(index) = context
+                .vm
+                .stack
+                .calling_convention_get_argument(argument_count, 0)
+                .and_then(JsValue::as_i32)
+            && index >= 0
+            && let Some(code_unit) = string.code_unit_at(index as usize)
+        {
+            context
+                .vm
+                .stack
+                .calling_convention_complete_fast_call(argument_count, JsValue::from(code_unit));
+            #[cfg(test)]
+            {
+                context.vm.native_builtin_fast_calls =
+                    context.vm.native_builtin_fast_calls.saturating_add(1);
+            }
+            return Ok(true);
+        }
+
+        if is_imul
+            && argument_count >= 2
+            && let Some(left) = context
+                .vm
+                .stack
+                .calling_convention_get_argument(argument_count, 0)
+                .and_then(JsValue::as_i32)
+            && let Some(right) = context
+                .vm
+                .stack
+                .calling_convention_get_argument(argument_count, 1)
+                .and_then(JsValue::as_i32)
+        {
+            context.vm.stack.calling_convention_complete_fast_call(
+                argument_count,
+                JsValue::from(left.wrapping_mul(right)),
+            );
+            #[cfg(test)]
+            {
+                context.vm.native_builtin_fast_calls =
+                    context.vm.native_builtin_fast_calls.saturating_add(1);
+            }
+            return Ok(true);
         }
 
         object.__call__(argument_count).resolve(context)

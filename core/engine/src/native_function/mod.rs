@@ -312,6 +312,20 @@ impl NativeFunction {
     pub fn to_js_function(self, realm: &Realm) -> JsFunction {
         FunctionObjectBuilder::new(realm, self).build()
     }
+
+    /// Whether this native function stores exactly `function` as its pointer
+    /// implementation.
+    ///
+    /// Built-in call sites use this only after resolving the actual property
+    /// value, so replacing a built-in method in JavaScript automatically
+    /// disables any corresponding fast path.
+    #[inline]
+    pub(crate) fn is_pointer(&self, function: NativeFunctionPointer) -> bool {
+        match self.inner {
+            Inner::PointerFn(candidate) => std::ptr::fn_addr_eq(candidate, function),
+            Inner::Closure(_) => false,
+        }
+    }
 }
 
 /// Call this object.

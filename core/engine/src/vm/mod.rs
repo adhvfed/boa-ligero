@@ -206,6 +206,9 @@ pub struct Vm {
 
     #[cfg(test)]
     pub(crate) pure_numeric_loop_cache_hits: u64,
+
+    #[cfg(test)]
+    pub(crate) native_builtin_fast_calls: u64,
 }
 
 /// The stack holds the [`JsValue`]s for the calling convention and registers.
@@ -381,6 +384,43 @@ impl Stack {
         self.stack
             .get(index)
             .expect("invalid calling convention function index")
+    }
+
+    /// Get the `this` value for a pending call without consuming its stack
+    /// record.
+    #[track_caller]
+    pub(crate) fn calling_convention_get_this(&self, argument_count: usize) -> &JsValue {
+        let index = self.stack.len() - 2 - argument_count;
+        self.stack
+            .get(index)
+            .expect("invalid calling convention this index")
+    }
+
+    /// Get one argument for a pending call without consuming its stack record.
+    #[track_caller]
+    pub(crate) fn calling_convention_get_argument(
+        &self,
+        argument_count: usize,
+        argument: usize,
+    ) -> Option<&JsValue> {
+        if argument >= argument_count {
+            return None;
+        }
+        let index = self.stack.len() - argument_count + argument;
+        self.stack.get(index)
+    }
+
+    /// Replace a complete pending-call record (`this`, function, arguments)
+    /// with its result.
+    #[track_caller]
+    pub(crate) fn calling_convention_complete_fast_call(
+        &mut self,
+        argument_count: usize,
+        result: JsValue,
+    ) {
+        let record_start = self.stack.len() - argument_count - 2;
+        self.stack.truncate(record_start);
+        self.stack.push(result);
     }
 
     /// Set the function object value at the top of the stack according to the calling convention.
@@ -613,6 +653,8 @@ impl Vm {
             pure_numeric_loop_iterations_elided: 0,
             #[cfg(test)]
             pure_numeric_loop_cache_hits: 0,
+            #[cfg(test)]
+            native_builtin_fast_calls: 0,
         }
     }
 
