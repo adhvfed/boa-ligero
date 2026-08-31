@@ -958,6 +958,27 @@ impl PropertyMap {
         Ok((None, scanned))
     }
 
+    /// Add a fully available range of dense i32 elements with wrapping i32
+    /// semantics. Returning `None` before iterating lets native callers replay
+    /// the original property access when the storage kind or range is not
+    /// exact.
+    pub(crate) fn wrapping_sum_contiguous_i32(
+        &self,
+        start: u32,
+        end: u32,
+        initial: i32,
+    ) -> Option<i32> {
+        let IndexedProperties::DenseI32(values) = &self.indexed_properties else {
+            return None;
+        };
+        let values = values.get(start as usize..end as usize)?;
+        Some(
+            values
+                .iter()
+                .fold(initial, |sum, value| sum.wrapping_add(*value)),
+        )
+    }
+
     pub(crate) fn set_dense_property(&mut self, index: u32, value: &JsValue) -> bool {
         let index = index as usize;
 
@@ -1322,8 +1343,9 @@ impl ExactSizeIterator for IndexPropertyValues<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexedProperties, PropertyDescriptorBuilder};
+    use super::{IndexedProperties, PropertyDescriptorBuilder, PropertyMap};
     use crate::JsValue;
+    use thin_vec::thin_vec;
 
     fn readonly(value: i32) -> crate::property::PropertyDescriptor {
         PropertyDescriptorBuilder::new()
@@ -1344,5 +1366,18 @@ mod tests {
             properties,
             IndexedProperties::DenseReadOnlyElement(_)
         ));
+    }
+
+    #[test]
+    fn contiguous_i32_sum_requires_an_exact_dense_range_and_wraps() {
+        let mut properties = PropertyMap::default();
+        properties.indexed_properties = IndexedProperties::DenseI32(thin_vec![i32::MAX, 1, 7, -2]);
+
+        assert_eq!(
+            properties.wrapping_sum_contiguous_i32(0, 2, 0),
+            Some(i32::MIN)
+        );
+        assert_eq!(properties.wrapping_sum_contiguous_i32(2, 4, 10), Some(15));
+        assert_eq!(properties.wrapping_sum_contiguous_i32(3, 5, 0), None);
     }
 }

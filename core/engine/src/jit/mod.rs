@@ -7313,6 +7313,108 @@ mod tests {
     }
 
     #[test]
+    fn context_owned_jit_bulk_sums_dense_integer_array() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const bulkValues = [2147483647, 1, 7, -2]; const bulkLength = 4; function bulkSum(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { let sum = 0; for (let index = 0; index < bulkLength; index++) { sum = (sum + bulkValues[index]) | 0; } checksum = (checksum + sum) | 0; } return checksum; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = bulkSum(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(50));
+
+        boa_gc::force_collect();
+        let after_gc =
+            crate::Script::parse(crate::Source::from_bytes("bulkSum(10)"), None, &mut context)
+                .expect("parse after GC");
+        let result = after_gc.evaluate(&mut context).expect("evaluate after GC");
+        assert_eq!(result.as_i32(), Some(50));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.native_storage.dense_guard_hits > 0);
+        assert_eq!(diagnostics.native_storage.dense_guard_misses, 0);
+        assert_eq!(
+            diagnostics.native_storage.dense_loads,
+            diagnostics.native_storage.dense_guard_hits * 4,
+            "one range guard should cover four dense values: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_bulk_integer_sum_deopts_before_observable_coercion() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let setup = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const mutableBulkValues = [1, 2, 3]; const mutableBulkLength = 3; function mutableBulkSum(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { let sum = 0; for (let index = 0; index < mutableBulkLength; index++) { sum = (sum + mutableBulkValues[index]) | 0; } checksum = (checksum + sum) | 0; } return checksum; } let warm = 0; for (let warmup = 0; warmup < 80; warmup++) { warm = mutableBulkSum(10); } warm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse setup");
+        let result = setup.evaluate(&mut context).expect("evaluate setup");
+        assert_eq!(result.as_i32(), Some(60));
+
+        let changed = crate::Script::parse(
+            crate::Source::from_bytes(
+                "let coercions = 0; mutableBulkValues[1] = { valueOf() { coercions += 1; return 4; } }; const changed = mutableBulkSum(1); changed * 10 + coercions",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse changed storage");
+        let result = changed
+            .evaluate(&mut context)
+            .expect("evaluate changed storage");
+        assert_eq!(result.as_i32(), Some(81));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.deopts >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_indexed_sum_preserves_loop_body_effects() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const effectValues = [1, 2, 3]; const effectLength = 3; function sumWithEffects(runs) { let checksum = 0; let effects = 0; for (let run = 0; run < runs; run++) { let sum = 0; for (let index = 0; index < effectLength; index++) { sum = (sum + effectValues[index]) | 0; effects += 1; } checksum = (checksum + sum) | 0; } return checksum + effects; } let answer = 0; for (let warmup = 0; warmup < 80; warmup++) { answer = sumWithEffects(10); } answer",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        let result = script.evaluate(&mut context).expect("evaluate");
+        assert_eq!(result.as_i32(), Some(90));
+
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_compilations >= 1, "stats: {stats:?}");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(stats.deopts, 0, "stats: {stats:?}");
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(diagnostics.native_storage.dense_guard_hits > 0);
+        assert_eq!(
+            diagnostics.native_storage.dense_loads, diagnostics.native_storage.dense_guard_hits,
+            "effectful loop bodies must retain one guard per load: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn context_owned_jit_preserves_dense_integer_payload_bits() {
         let mut context = Context::default();
         context.enable_jit();
@@ -7517,13 +7619,13 @@ mod tests {
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
         assert!(diagnostics.native_storage.dense_guard_hits > 0);
-        assert_eq!(
-            diagnostics.native_storage.dense_loads,
-            diagnostics.native_storage.dense_guard_hits
-        );
         assert!(
-            diagnostics.native_storage.dense_loads > diagnostics.native_storage.named_loads,
+            diagnostics.native_storage.dense_loads > diagnostics.native_storage.dense_guard_hits,
             "one guarded scan should cover multiple indexed loads: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.native_storage.dense_guard_hits,
+            diagnostics.native_storage.named_loads
         );
     }
 
@@ -7550,6 +7652,10 @@ mod tests {
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
         assert!(diagnostics.native_storage.named_loads > 0);
+        assert_eq!(
+            diagnostics.native_storage.dense_guard_hits,
+            diagnostics.native_storage.named_loads
+        );
         assert_eq!(
             diagnostics.native_storage.dense_loads,
             diagnostics.native_storage.named_loads * 3,

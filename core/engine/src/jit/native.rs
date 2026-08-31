@@ -28,6 +28,7 @@ use cranelift_module::{Linkage, Module};
 
 const JIT_SCAN_DENSE_FAIL_BIT: u64 = 1 << 60;
 const JIT_SCAN_MATCH_BIT: u64 = 1 << 59;
+const JIT_SUM_APPLIED_BIT: u64 = 1 << 59;
 const JIT_SCAN_COUNT_SHIFT: u32 = 32;
 const JIT_SCAN_COUNT_MASK: u64 = (1 << 27) - 1;
 
@@ -1534,6 +1535,8 @@ struct Helpers {
     dense_boxed_i32_guarded: Helper,
     dense_boxed_f64_guarded: Helper,
     indexed_scan_step_i32_guarded: Helper,
+    indexed_wrapping_sum_i32_guarded: Helper,
+    indexed_wrapping_sum_f64_guarded: Helper,
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
@@ -1581,6 +1584,26 @@ struct IndexedScanStepFusion {
     other_load_index: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct IndexedWrappingSumFusion {
+    object_load_index: usize,
+    object_pc: usize,
+    key_move_index: usize,
+    property_index: usize,
+    property_pc: usize,
+    add_index: usize,
+    zero_index: usize,
+    bit_or_index: usize,
+    result_move_index: usize,
+    object_binding_index: u32,
+    property_ic_index: u32,
+    object_dst: usize,
+    key_dst: usize,
+    index: usize,
+    limit: usize,
+    sum: usize,
+}
+
 struct NativeCompiler<'a> {
     backend: &'a mut JitBackend,
     code: &'a CodeBlock,
@@ -1598,8 +1621,8 @@ struct NativeCompiler<'a> {
     /// Encoded scan-step results produced by a dominating length-property
     /// block and consumed by its comparison and equality branch.
     fused_scan_step_results: HashMap<usize, cranelift_codegen::ir::Value>,
-    /// Pure bytecodes already performed by a fused scan-step helper.
-    fused_scan_step_skips: BTreeSet<usize>,
+    /// Pure bytecodes already performed by a fused bulk helper.
+    fused_instruction_skips: BTreeSet<usize>,
     options: NativeCompileOptions,
 }
 
@@ -1625,7 +1648,7 @@ impl<'a> NativeCompiler<'a> {
             flag_undefined: None,
             dirty: BTreeSet::new(),
             fused_scan_step_results: HashMap::new(),
-            fused_scan_step_skips: BTreeSet::new(),
+            fused_instruction_skips: BTreeSet::new(),
             options,
         })
     }
@@ -1943,6 +1966,42 @@ impl<'a> NativeCompiler<'a> {
                 ],
                 types::I64,
             ),
+            indexed_wrapping_sum_i32_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_indexed_wrapping_sum_i32_guarded as *const () as usize
+                } else {
+                    jit_indexed_wrapping_sum_i32_guarded as *const () as usize
+                },
+                &[
+                    ptr,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I64,
+            ),
+            indexed_wrapping_sum_f64_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_indexed_wrapping_sum_f64_guarded as *const () as usize
+                } else {
+                    jit_indexed_wrapping_sum_f64_guarded as *const () as usize
+                },
+                &[
+                    ptr,
+                    types::I32,
+                    types::F64,
+                    types::F64,
+                    types::F64,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I64,
+            ),
             named_boxed_guarded: make(
                 if self.options.diagnostics.instrument_storage {
                     jit_diagnostic_named_property_boxed_guarded as *const () as usize
@@ -2155,7 +2214,10 @@ impl<'a> NativeCompiler<'a> {
         break_block: Block,
     ) -> bool {
         let register = |operand: crate::vm::opcode::RegisterOperand| usize::from(operand);
-        if self.fused_scan_step_skips.remove(&self.current_instruction) {
+        if self
+            .fused_instruction_skips
+            .remove(&self.current_instruction)
+        {
             return true;
         }
 
@@ -2529,12 +2591,12 @@ impl<'a> NativeCompiler<'a> {
                         fusion.property_index,
                         fusion.strict_eq_index,
                     ] {
-                        if !self.fused_scan_step_skips.insert(index) {
+                        if !self.fused_instruction_skips.insert(index) {
                             return false;
                         }
                     }
                     if let Some(index) = fusion.other_load_index
-                        && !self.fused_scan_step_skips.insert(index)
+                        && !self.fused_instruction_skips.insert(index)
                     {
                         return false;
                     }
@@ -3045,6 +3107,124 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().brif(is_true, fallthrough, &[], target, &[]);
             }
             Instruction::JumpIfNotLessThan { address, lhs, rhs } => {
+                if let Some(fusion) =
+                    self.indexed_wrapping_sum_fusion(register(*lhs), register(*rhs))
+                {
+                    for index in [
+                        fusion.object_load_index,
+                        fusion.key_move_index,
+                        fusion.property_index,
+                        fusion.add_index,
+                        fusion.zero_index,
+                        fusion.bit_or_index,
+                        fusion.result_move_index,
+                    ] {
+                        if !self.fused_instruction_skips.insert(index) {
+                            return false;
+                        }
+                    }
+
+                    let Some(index) = self.use_register(bcx, fusion.index) else {
+                        return false;
+                    };
+                    let Some(limit) = self.use_register(bcx, fusion.limit) else {
+                        return false;
+                    };
+                    let Some(sum) = self.use_register(bcx, fusion.sum) else {
+                        return false;
+                    };
+                    let Some(target) = self.target_block(*address, blocks) else {
+                        return false;
+                    };
+                    let sum_helper = match self.mode {
+                        NativeMode::I32 => helpers.indexed_wrapping_sum_i32_guarded,
+                        NativeMode::F64 => helpers.indexed_wrapping_sum_f64_guarded,
+                    };
+                    let helper = bcx.ins().iconst(helpers.ptr, sum_helper.address as i64);
+                    let object_binding = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.object_binding_index));
+                    let property_ic = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.property_ic_index));
+                    let object_dst = bcx.ins().iconst(types::I32, fusion.object_dst as i64);
+                    let key_dst = bcx.ins().iconst(types::I32, fusion.key_dst as i64);
+                    self.emit_set_pc(bcx, ctx, helpers, fusion.object_pc);
+                    let result = bcx.ins().call_indirect(
+                        sum_helper.signature,
+                        helper,
+                        &[
+                            ctx,
+                            object_binding,
+                            index,
+                            limit,
+                            sum,
+                            property_ic,
+                            object_dst,
+                            key_dst,
+                        ],
+                    );
+                    let result = bcx.inst_results(result)[0];
+
+                    let binding_deopt = bcx.create_block();
+                    let dense_check = bcx.create_block();
+                    let dense_deopt = bcx.create_block();
+                    let applied_check = bcx.create_block();
+                    let applied = bcx.create_block();
+                    let binding_fail_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let binding_failed = bcx.ins().band(result, binding_fail_mask);
+                    bcx.ins()
+                        .brif(binding_failed, binding_deopt, &[], dense_check, &[]);
+
+                    bcx.switch_to_block(binding_deopt);
+                    if !self.emit_guard_deopt(
+                        bcx,
+                        ctx,
+                        helpers,
+                        fusion.object_pc,
+                        JitExitReason::BindingRead,
+                    ) {
+                        return false;
+                    }
+
+                    bcx.switch_to_block(dense_check);
+                    let dense_fail_mask =
+                        bcx.ins().iconst(types::I64, JIT_SCAN_DENSE_FAIL_BIT as i64);
+                    let dense_failed = bcx.ins().band(result, dense_fail_mask);
+                    bcx.ins()
+                        .brif(dense_failed, dense_deopt, &[], applied_check, &[]);
+
+                    bcx.switch_to_block(dense_deopt);
+                    if !self.emit_guard_deopt(
+                        bcx,
+                        ctx,
+                        helpers,
+                        fusion.property_pc,
+                        JitExitReason::DenseElement,
+                    ) {
+                        return false;
+                    }
+
+                    bcx.switch_to_block(applied_check);
+                    let applied_mask = bcx.ins().iconst(types::I64, JIT_SUM_APPLIED_BIT as i64);
+                    let was_applied = bcx.ins().band(result, applied_mask);
+                    bcx.ins().brif(was_applied, applied, &[], target, &[]);
+
+                    bcx.switch_to_block(applied);
+                    let reduced_sum = bcx.ins().ireduce(types::I32, result);
+                    let reduced_sum = if self.mode == NativeMode::F64 {
+                        bcx.ins().fcvt_from_sint(types::F64, reduced_sum)
+                    } else {
+                        reduced_sum
+                    };
+                    if !self.define_register(bcx, fusion.sum, reduced_sum)
+                        || !self.define_register(bcx, fusion.index, limit)
+                    {
+                        return false;
+                    }
+                    bcx.ins().jump(target, &[]);
+                    return true;
+                }
                 if let Some(result) = self
                     .fused_scan_step_results
                     .remove(&self.current_instruction)
@@ -3308,6 +3488,285 @@ impl<'a> NativeCompiler<'a> {
     /// overflow deopt instead of relying on wider data-flow assumptions.
     fn i32_arithmetic_wraps(&self, instruction: &Instruction) -> bool {
         i32_arithmetic_coercion(&self.instructions, self.current_instruction, instruction)
+    }
+
+    /// Match the bytecompiler's canonical wrapping i32 indexed reduction:
+    ///
+    /// `bounds branch -> global object load -> key move -> indexed load ->
+    /// add -> zero -> bit-or -> accumulator move -> loop back-edge`.
+    ///
+    /// The complete loop body and maintenance tail are proven pure before a
+    /// helper may replace multiple iterations. Metered code remains on the
+    /// ordinary lowering so every bytecode and loop iteration stays visible.
+    fn indexed_wrapping_sum_fusion(
+        &self,
+        index: usize,
+        limit: usize,
+    ) -> Option<IndexedWrappingSumFusion> {
+        if self.options.accounting.instruction_budget || self.options.accounting.loop_iterations {
+            return None;
+        }
+        let object_load_index = self.current_instruction.checked_add(1)?;
+        let key_move_index = self.current_instruction.checked_add(2)?;
+        let property_index = self.current_instruction.checked_add(3)?;
+        let add_index = self.current_instruction.checked_add(4)?;
+        let zero_index = self.current_instruction.checked_add(5)?;
+        let bit_or_index = self.current_instruction.checked_add(6)?;
+        let result_move_index = self.current_instruction.checked_add(7)?;
+        let back_edge_index = self.current_instruction.checked_add(8)?;
+
+        let (object_pc, _, object_load) = self.instructions.instructions.get(object_load_index)?;
+        let Instruction::GetName {
+            dst: object_dst,
+            binding_index: object_binding_index,
+        } = object_load
+        else {
+            return None;
+        };
+        let object_dst = usize::from(*object_dst);
+        let object_binding_index = u32::from(*object_binding_index);
+        if self
+            .code
+            .bindings
+            .get(object_binding_index as usize)
+            .is_none_or(|binding| binding.scope() != BindingLocatorScope::GlobalDeclarative)
+        {
+            return None;
+        }
+
+        let (_, _, key_move) = self.instructions.instructions.get(key_move_index)?;
+        let Instruction::Move {
+            src: key_source,
+            dst: key_dst,
+        } = key_move
+        else {
+            return None;
+        };
+        let key_dst = usize::from(*key_dst);
+        if usize::from(*key_source) != index {
+            return None;
+        }
+
+        let (property_pc, _, property) = self.instructions.instructions.get(property_index)?;
+        let Instruction::GetPropertyByValue {
+            dst: property_dst,
+            key,
+            receiver,
+            object,
+            ic_index: property_ic_index,
+        } = property
+        else {
+            return None;
+        };
+        let property_dst = usize::from(*property_dst);
+        if usize::from(*key) != key_dst
+            || usize::from(*receiver) != object_dst
+            || usize::from(*object) != object_dst
+        {
+            return None;
+        }
+
+        let (_, _, add) = self.instructions.instructions.get(add_index)?;
+        let Instruction::Add { dst, lhs, rhs } = add else {
+            return None;
+        };
+        let add_dst = usize::from(*dst);
+        let sum = usize::from(*lhs);
+        if usize::from(*rhs) != property_dst {
+            return None;
+        }
+
+        let (_, _, zero) = self.instructions.instructions.get(zero_index)?;
+        let Instruction::StoreZero { dst: zero_dst } = zero else {
+            return None;
+        };
+        let zero_dst = usize::from(*zero_dst);
+        if zero_dst != property_dst {
+            return None;
+        }
+
+        let (_, _, bit_or) = self.instructions.instructions.get(bit_or_index)?;
+        let Instruction::BitOr { dst, lhs, rhs } = bit_or else {
+            return None;
+        };
+        let bit_or_dst = usize::from(*dst);
+        let bit_lhs = usize::from(*lhs);
+        let bit_rhs = usize::from(*rhs);
+        if !((bit_lhs == add_dst && bit_rhs == zero_dst)
+            || (bit_rhs == add_dst && bit_lhs == zero_dst))
+        {
+            return None;
+        }
+
+        let (_, _, result_move) = self.instructions.instructions.get(result_move_index)?;
+        let Instruction::Move {
+            src: result_source,
+            dst: result_dst,
+        } = result_move
+        else {
+            return None;
+        };
+        if usize::from(*result_source) != bit_or_dst || usize::from(*result_dst) != sum {
+            return None;
+        }
+
+        let (_, _, back_edge) = self.instructions.instructions.get(back_edge_index)?;
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = back_edge
+        else {
+            return None;
+        };
+        let loop_iteration_index = self.current_instruction.checked_sub(2)?;
+        let index_increment_index = self.current_instruction.checked_sub(1)?;
+        let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
+            self.instructions.instructions.get(loop_iteration_index)?;
+        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
+            || self
+                .instructions
+                .pc_to_index
+                .get(loop_iteration_next_pc)
+                .copied()
+                != Some(index_increment_index)
+            || back_edge_address.as_u32() as usize != *loop_iteration_pc
+        {
+            return None;
+        }
+        let (_, increment_next_pc, increment) =
+            self.instructions.instructions.get(index_increment_index)?;
+        let Instruction::Inc {
+            src: increment_src,
+            dst: increment_dst,
+        } = increment
+        else {
+            return None;
+        };
+        if usize::from(*increment_src) != index
+            || usize::from(*increment_dst) != index
+            || self
+                .instructions
+                .pc_to_index
+                .get(increment_next_pc)
+                .copied()
+                != Some(self.current_instruction)
+        {
+            return None;
+        }
+        for instruction_index in self.current_instruction..back_edge_index {
+            let (_, next_pc, _) = self.instructions.instructions.get(instruction_index)?;
+            if self.instructions.pc_to_index.get(next_pc).copied()? != instruction_index + 1 {
+                return None;
+            }
+        }
+        for instruction_index in object_load_index..=back_edge_index {
+            let (pc, _, _) = self.instructions.instructions.get(instruction_index)?;
+            if self
+                .instructions
+                .instructions
+                .iter()
+                .any(|(_, _, instruction)| branch_target(instruction) == Some(*pc))
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, sum];
+        let temporary_registers = [object_dst, key_dst, property_dst, add_dst, bit_or_dst];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+            || temporary_registers
+                .iter()
+                .enumerate()
+                .any(|(position, register)| temporary_registers[..position].contains(register))
+            || source_registers.iter().any(|source| {
+                temporary_registers
+                    .iter()
+                    .any(|temporary| source == temporary)
+            })
+        {
+            return None;
+        }
+        let kind_before = |instruction_index: usize, register: usize| {
+            self.analysis
+                .before
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        let kind_after = |instruction_index: usize, register: usize| {
+            self.analysis
+                .after
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        if kind_before(self.current_instruction, index) != Some(RegisterKind::Numeric)
+            || kind_before(self.current_instruction, limit) != Some(RegisterKind::Numeric)
+            || kind_before(self.current_instruction, sum) != Some(RegisterKind::Numeric)
+            || kind_after(object_load_index, object_dst) != Some(RegisterKind::Boxed)
+            || kind_after(key_move_index, key_dst) != Some(RegisterKind::Numeric)
+            || kind_after(property_index, property_dst) != Some(RegisterKind::Numeric)
+            || kind_after(add_index, add_dst) != Some(RegisterKind::Numeric)
+            || kind_after(zero_index, zero_dst) != Some(RegisterKind::Numeric)
+            || kind_after(bit_or_index, bit_or_dst) != Some(RegisterKind::Numeric)
+            || kind_after(result_move_index, sum) != Some(RegisterKind::Numeric)
+        {
+            return None;
+        }
+
+        if self
+            .analysis
+            .live_after
+            .get(property_index)?
+            .contains(&object_dst)
+            || self
+                .analysis
+                .live_after
+                .get(property_index)?
+                .contains(&key_dst)
+            || self
+                .analysis
+                .live_after
+                .get(add_index)?
+                .contains(&property_dst)
+            || self
+                .analysis
+                .live_after
+                .get(bit_or_index)?
+                .contains(&add_dst)
+            || self
+                .analysis
+                .live_after
+                .get(bit_or_index)?
+                .contains(&zero_dst)
+            || self
+                .analysis
+                .live_after
+                .get(result_move_index)?
+                .contains(&bit_or_dst)
+        {
+            return None;
+        }
+        Some(IndexedWrappingSumFusion {
+            object_load_index,
+            object_pc: *object_pc,
+            key_move_index,
+            property_index,
+            property_pc: *property_pc,
+            add_index,
+            zero_index,
+            bit_or_index,
+            result_move_index,
+            object_binding_index,
+            property_ic_index: u32::from(*property_ic_index),
+            object_dst,
+            key_dst,
+            index,
+            limit,
+            sum,
+        })
     }
 
     /// Match the bytecompiler's canonical indexed identity-scan step:
@@ -5232,6 +5691,149 @@ fn global_declarative_binding_value(context: &Context, binding_index: u32) -> Op
     frame.realm.environment().get(binding.binding_index())
 }
 
+fn dense_array_wrapping_sum_i32(
+    context: &Context,
+    value: &JsValue,
+    start: u32,
+    end: u32,
+    initial: i32,
+    ic_index: u32,
+) -> Option<i32> {
+    let object = value.as_object_borrowed()?;
+    let object = object.borrow();
+    let ic = context
+        .vm
+        .frame()
+        .code_block()
+        .element_ic
+        .get(ic_index as usize)?;
+    if ic.matches(object.shape())? != IndexedKind::DenseI32 {
+        return None;
+    }
+    object
+        .properties()
+        .wrapping_sum_contiguous_i32(start, end, initial)
+}
+
+fn materialize_global_indexed_property_operands(
+    context: &mut Context,
+    object: &JsValue,
+    key: JsValue,
+    object_dst: u32,
+    key_dst: u32,
+) {
+    context.vm.set_register(object_dst as usize, object.clone());
+    context.vm.set_register(key_dst as usize, key);
+}
+
+fn encode_indexed_sum_result(sum: i32, scanned: u64, applied: bool) -> u64 {
+    u64::from(sum as u32)
+        | (scanned.min(JIT_SCAN_COUNT_MASK) << JIT_SCAN_COUNT_SHIFT)
+        | if applied { JIT_SUM_APPLIED_BIT } else { 0 }
+}
+
+extern "C" fn jit_indexed_wrapping_sum_i32_guarded(
+    context: *mut Context,
+    object_binding_index: u32,
+    index: i32,
+    limit: i32,
+    sum: i32,
+    property_ic_index: u32,
+    object_dst: u32,
+    key_dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    if index >= limit {
+        return encode_indexed_sum_result(sum, 0, false);
+    }
+    let Some(object) = global_declarative_binding_value(context, object_binding_index) else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let (Ok(start), Ok(end)) = (u32::try_from(index), u32::try_from(limit)) else {
+        materialize_global_indexed_property_operands(
+            context,
+            &object,
+            JsValue::from(index),
+            object_dst,
+            key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT | u64::from(sum as u32);
+    };
+    let Some(reduced) =
+        dense_array_wrapping_sum_i32(context, &object, start, end, sum, property_ic_index)
+    else {
+        materialize_global_indexed_property_operands(
+            context,
+            &object,
+            JsValue::from(index),
+            object_dst,
+            key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT | u64::from(sum as u32);
+    };
+    encode_indexed_sum_result(reduced, u64::from(end - start), true)
+}
+
+extern "C" fn jit_indexed_wrapping_sum_f64_guarded(
+    context: *mut Context,
+    object_binding_index: u32,
+    index: f64,
+    limit: f64,
+    sum: f64,
+    property_ic_index: u32,
+    object_dst: u32,
+    key_dst: u32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    if index.partial_cmp(&limit) != Some(std::cmp::Ordering::Less) {
+        return 0;
+    }
+    let Some(object) = global_declarative_binding_value(context, object_binding_index) else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let exact_u32 = |value: f64| {
+        (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX))
+            .then_some(value as u32)
+    };
+    let initial = f64_to_int32(sum);
+    let exact_initial = sum == 0.0 || f64::from(initial).to_bits() == sum.to_bits();
+    let (Some(start), Some(end)) = (exact_u32(index), exact_u32(limit)) else {
+        materialize_global_indexed_property_operands(
+            context,
+            &object,
+            JsValue::from(index),
+            object_dst,
+            key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT;
+    };
+    if !exact_initial {
+        materialize_global_indexed_property_operands(
+            context,
+            &object,
+            JsValue::from(index),
+            object_dst,
+            key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT;
+    }
+    let Some(reduced) =
+        dense_array_wrapping_sum_i32(context, &object, start, end, initial, property_ic_index)
+    else {
+        materialize_global_indexed_property_operands(
+            context,
+            &object,
+            JsValue::from(index),
+            object_dst,
+            key_dst,
+        );
+        return JIT_SCAN_DENSE_FAIL_BIT;
+    };
+    encode_indexed_sum_result(reduced, u64::from(end - start), true)
+}
+
 extern "C" fn jit_indexed_scan_step_i32_guarded(
     context: *mut Context,
     register: u32,
@@ -5424,10 +6026,87 @@ extern "C" fn jit_diagnostic_indexed_scan_step_i32_guarded(
     counters.named_guard_hits = counters.named_guard_hits.saturating_add(1);
     counters.named_loads = counters.named_loads.saturating_add(1);
     let scanned = (result >> JIT_SCAN_COUNT_SHIFT) & JIT_SCAN_COUNT_MASK;
-    counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(scanned);
     counters.dense_loads = counters.dense_loads.saturating_add(scanned);
     if result & JIT_SCAN_DENSE_FAIL_BIT != 0 {
         counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+    } else if scanned != 0 {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_indexed_wrapping_sum_i32_guarded(
+    context: *mut Context,
+    object_binding_index: u32,
+    index: i32,
+    limit: i32,
+    sum: i32,
+    property_ic_index: u32,
+    object_dst: u32,
+    key_dst: u32,
+) -> u64 {
+    let result = jit_indexed_wrapping_sum_i32_guarded(
+        context,
+        object_binding_index,
+        index,
+        limit,
+        sum,
+        property_ic_index,
+        object_dst,
+        key_dst,
+    );
+    if result & JIT_GUARD_FAIL_BIT != 0 {
+        return result;
+    }
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrows ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result & JIT_SCAN_DENSE_FAIL_BIT != 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+        return result;
+    }
+    let scanned = (result >> JIT_SCAN_COUNT_SHIFT) & JIT_SCAN_COUNT_MASK;
+    counters.dense_loads = counters.dense_loads.saturating_add(scanned);
+    if scanned != 0 {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
+    }
+    result
+}
+
+extern "C" fn jit_diagnostic_indexed_wrapping_sum_f64_guarded(
+    context: *mut Context,
+    object_binding_index: u32,
+    index: f64,
+    limit: f64,
+    sum: f64,
+    property_ic_index: u32,
+    object_dst: u32,
+    key_dst: u32,
+) -> u64 {
+    let result = jit_indexed_wrapping_sum_f64_guarded(
+        context,
+        object_binding_index,
+        index,
+        limit,
+        sum,
+        property_ic_index,
+        object_dst,
+        key_dst,
+    );
+    if result & JIT_GUARD_FAIL_BIT != 0 {
+        return result;
+    }
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrows ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result & JIT_SCAN_DENSE_FAIL_BIT != 0 {
+        counters.dense_guard_misses = counters.dense_guard_misses.saturating_add(1);
+        return result;
+    }
+    let scanned = (result >> JIT_SCAN_COUNT_SHIFT) & JIT_SCAN_COUNT_MASK;
+    counters.dense_loads = counters.dense_loads.saturating_add(scanned);
+    if scanned != 0 {
+        counters.dense_guard_hits = counters.dense_guard_hits.saturating_add(1);
     }
     result
 }
