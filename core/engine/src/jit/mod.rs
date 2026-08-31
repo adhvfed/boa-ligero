@@ -8093,6 +8093,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_owned_jit_bulk_indexed_sum_preserves_loop_limit() {
+        let mut context = Context::default();
+        context.enable_jit();
+        let definition = crate::Script::parse(
+            crate::Source::from_bytes(
+                "const meteredBulkValues = [1, 2, 3]; const meteredBulkLength = 3; function meteredBulkSum(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { let sum = 0; for (let index = 0; index < meteredBulkLength; index++) { sum = (sum + meteredBulkValues[index]) | 0; } checksum = (checksum + sum) | 0; } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { meteredBulkSum(10); }",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse definition");
+        definition.evaluate(&mut context).expect("warm up");
+        let unmetered_compilations = context.jit_stats().expect("JIT was enabled").compilations;
+
+        context.runtime_limits_mut().set_loop_iteration_limit(3);
+        let limited = crate::Script::parse(
+            crate::Source::from_bytes("meteredBulkSum(2)"),
+            None,
+            &mut context,
+        )
+        .expect("parse limited call");
+        let error = limited
+            .evaluate(&mut context)
+            .expect_err("bulk indexed sum must preserve every loop charge");
+
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(stats.native_entries >= 1, "stats: {stats:?}");
+        assert_eq!(
+            stats.compilations,
+            unmetered_compilations + 1,
+            "loop metering must compile a distinct unfused artifact: {stats:?}"
+        );
+    }
+
     fn warmed_sum_context(jit: bool) -> Context {
         let mut context = Context::builder().jit(jit).build().unwrap();
         if jit {
@@ -8159,6 +8198,47 @@ mod tests {
             .expect("interpreter scan");
         let result = evaluate_with_instruction_budget(&mut context, "budgetFind(10)", 10_000)
             .expect("native scan");
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining()
+        );
+        let stats = context.jit_stats().expect("JIT was enabled");
+        assert!(
+            stats.native_entries > before.native_entries,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats.deopts, before.deopts, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn context_owned_jit_bulk_indexed_sum_preserves_instruction_budget() {
+        let prepare = |jit: bool| {
+            let mut context = Context::builder().jit(jit).build().unwrap();
+            if jit {
+                context.enable_jit();
+            }
+            let script = crate::Script::parse(
+                crate::Source::from_bytes(
+                    "const budgetBulkValues = [1, 2, 3]; const budgetBulkLength = 3; function budgetBulkSum(runs) { let checksum = 0; for (let run = 0; run < runs; run++) { let sum = 0; for (let index = 0; index < budgetBulkLength; index++) { sum = (sum + budgetBulkValues[index]) | 0; } checksum = (checksum + sum) | 0; } return checksum; } for (let warmup = 0; warmup < 80; warmup++) { budgetBulkSum(10); }",
+                ),
+                None,
+                &mut context,
+            )
+            .expect("parse warmup");
+            script.evaluate(&mut context).expect("warm up");
+            context
+        };
+
+        let mut interpreter = prepare(false);
+        let mut context = prepare(true);
+        let before = context.jit_stats().expect("JIT was enabled");
+        let expected =
+            evaluate_with_instruction_budget(&mut interpreter, "budgetBulkSum(10)", 10_000)
+                .expect("interpreter sum");
+        let result = evaluate_with_instruction_budget(&mut context, "budgetBulkSum(10)", 10_000)
+            .expect("native sum");
 
         assert_eq!(result, expected);
         assert_eq!(

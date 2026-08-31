@@ -2559,12 +2559,13 @@ impl<'a> NativeCompiler<'a> {
                     if !self.define_register(bcx, fusion.index, failure_index) {
                         return false;
                     }
-                    if !self.emit_guard_deopt(
+                    if !self.emit_guard_deopt_preserving_vm_registers(
                         bcx,
                         ctx,
                         helpers,
                         fusion.property_pc,
                         JitExitReason::DenseElement,
+                        &[fusion.property_object_dst, fusion.property_key_dst],
                     ) {
                         return false;
                     }
@@ -3195,12 +3196,13 @@ impl<'a> NativeCompiler<'a> {
                         .brif(dense_failed, dense_deopt, &[], applied_check, &[]);
 
                     bcx.switch_to_block(dense_deopt);
-                    if !self.emit_guard_deopt(
+                    if !self.emit_guard_deopt_preserving_vm_registers(
                         bcx,
                         ctx,
                         helpers,
                         fusion.property_pc,
                         JitExitReason::DenseElement,
+                        &[fusion.object_dst, fusion.key_dst],
                     ) {
                         return false;
                     }
@@ -4321,6 +4323,22 @@ impl<'a> NativeCompiler<'a> {
         pc: usize,
         reason: JitExitReason,
     ) -> bool {
+        self.emit_guard_deopt_preserving_vm_registers(bcx, ctx, helpers, pc, reason, &[])
+    }
+
+    /// Exit at a helper-reconstructed bytecode while retaining VM operands
+    /// that helper already wrote. A stale native temporary for one of those
+    /// registers must not overwrite the authoritative replay value.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_guard_deopt_preserving_vm_registers(
+        &self,
+        bcx: &mut FunctionBuilder<'_>,
+        ctx: cranelift_codegen::ir::Value,
+        helpers: &Helpers,
+        pc: usize,
+        reason: JitExitReason,
+        preserved_vm_registers: &[usize],
+    ) -> bool {
         // Budgeted native entries have charged this bytecode already, but a
         // guard exit asks the interpreter to execute the same bytecode. Refund
         // that charge so the interpreter remains the single owner of it.
@@ -4333,7 +4351,18 @@ impl<'a> NativeCompiler<'a> {
                 .call_indirect(helpers.refund_instruction_budget.signature, helper, &[ctx]);
         }
 
-        if !self.emit_materialize_dirty_registers(bcx, ctx, helpers) {
+        let materialized = if preserved_vm_registers.is_empty() {
+            self.emit_materialize_dirty_registers(bcx, ctx, helpers)
+        } else {
+            let registers: Vec<usize> = self
+                .dirty
+                .iter()
+                .copied()
+                .filter(|register| !preserved_vm_registers.contains(register))
+                .collect();
+            self.emit_materialize_registers(bcx, ctx, helpers, &registers)
+        };
+        if !materialized {
             return false;
         }
         self.emit_set_pc(bcx, ctx, helpers, pc);
