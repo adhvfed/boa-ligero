@@ -400,7 +400,7 @@ pub struct JitOsrCounters {
 }
 
 /// Schema version for [`JitDiagnosticSnapshot`].
-pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 11;
+pub const JIT_DIAGNOSTIC_SCHEMA_VERSION: u32 = 12;
 
 /// Hard retention cap for each detailed JIT diagnostic record class.
 ///
@@ -817,6 +817,12 @@ pub struct JitNativeStorageRecord {
     pub affine_range_hits: u64,
     /// Source loop iterations represented by successful affine ranges.
     pub affine_iterations: u64,
+    /// Pure numeric reader loop ranges collapsed by one guarded helper.
+    pub pure_reader_range_hits: u64,
+    /// Reader-range guards that returned to the ordinary caller bytecodes.
+    pub pure_reader_guard_misses: u64,
+    /// Source-level ordinary calls represented by successful reader ranges.
+    pub pure_reader_calls_elided: u64,
 }
 
 impl JitNativeStorageRecord {
@@ -837,6 +843,15 @@ impl JitNativeStorageRecord {
         self.affine_iterations = self
             .affine_iterations
             .saturating_add(other.affine_iterations);
+        self.pure_reader_range_hits = self
+            .pure_reader_range_hits
+            .saturating_add(other.pure_reader_range_hits);
+        self.pure_reader_guard_misses = self
+            .pure_reader_guard_misses
+            .saturating_add(other.pure_reader_guard_misses);
+        self.pure_reader_calls_elided = self
+            .pure_reader_calls_elided
+            .saturating_add(other.pure_reader_calls_elided);
     }
 }
 
@@ -4825,6 +4840,149 @@ mod tests {
                 .native_leaf_entries,
             native_leaf_entries,
             "the unmetered property entry must not run under an instruction budget"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_bulk_reduces_pure_property_reader_calls() {
+        let mut context = Context::default();
+        context.enable_jit_diagnostics(JitDiagnosticLimits::default());
+        let script = crate::Script::parse(
+            crate::Source::from_bytes(
+                "function rangeRead(object) { return object.x + object.y + object.z; } let rangeObject = { x: 1, y: 2, z: 3 }; function rangeMain() { let total = 0; for (let index = 0; index < 100; index++) { total += rangeRead(rangeObject); } return total; } let rangeWarm = 0; for (let warmup = 0; warmup < 80; warmup++) { rangeWarm = rangeMain(); } rangeWarm",
+            ),
+            None,
+            &mut context,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            script.evaluate(&mut context).expect("evaluate").as_i32(),
+            Some(600)
+        );
+        let diagnostics = context
+            .jit_diagnostic_snapshot()
+            .expect("diagnostics were enabled");
+        assert!(
+            diagnostics.native_storage.pure_reader_range_hits > 0,
+            "diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.native_storage.pure_reader_calls_elided,
+            diagnostics.native_storage.pure_reader_range_hits * 100,
+            "each successful range must represent all source calls: {diagnostics:?}"
+        );
+
+        boa_gc::force_collect();
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "rangeObject = { x: 4, y: 5, z: 6 }; rangeMain()",
+                ))
+                .expect("evaluate replacement after GC")
+                .as_i32(),
+            Some(1_500)
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_pure_reader_rejects_effects_accessors_and_overflow() {
+        let mut context = Context::default();
+        context.enable_jit();
+        context
+            .eval(crate::Source::from_bytes(
+                "function guardedRead(object) { return object.x + object.y + object.z; } let guardedObject = { x: 1, y: 2, z: 3 }; function guardedMain() { let total = 0; for (let index = 0; index < 100; index++) { total += guardedRead(guardedObject); } return total; } for (let warmup = 0; warmup < 80; warmup++) { guardedMain(); }",
+            ))
+            .expect("warm pure reader");
+
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "let callEffects = 0; guardedRead = function (object) { callEffects++; return object.x + object.y + object.z; }; let callResult = guardedMain(); callResult === 600 && callEffects === 100",
+                ))
+                .expect("effectful replacement")
+                .as_boolean(),
+            Some(true),
+            "an effectful replacement function must execute every source call"
+        );
+
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "guardedRead = function (object) { return object.x + object.y + object.z; }; let getterEffects = 0; guardedObject = { get x() { getterEffects++; return 1; }, y: 2, z: 3 }; let getterResult = guardedMain(); getterResult === 600 && getterEffects === 100",
+                ))
+                .expect("accessor replacement")
+                .as_boolean(),
+            Some(true),
+            "an accessor receiver must execute every source property read"
+        );
+
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "guardedObject = { x: 2147483647, y: 0, z: 0 }; guardedMain()",
+                ))
+                .expect("overflowing reduction")
+                .as_number(),
+            Some(214_748_364_700.0),
+            "a range that leaves i32 must preserve ordinary Number promotion"
+        );
+    }
+
+    #[test]
+    fn context_owned_jit_pure_reader_preserves_runtime_accounting_and_call_limits() {
+        const DEFINITION: &str = "function limitedRead(object) { return object.x + object.y + object.z; } let limitedObject = { x: 1, y: 2, z: 3 }; function limitedMain() { let total = 0; for (let index = 0; index < 100; index++) { total += limitedRead(limitedObject); } return total; }";
+        const WARMUP: &str = "for (let warmup = 0; warmup < 80; warmup++) { limitedMain(); }";
+
+        let mut context = Context::default();
+        context.enable_jit();
+        context
+            .eval(crate::Source::from_bytes(DEFINITION))
+            .expect("define JIT case");
+        context
+            .eval(crate::Source::from_bytes(WARMUP))
+            .expect("warm JIT case");
+
+        context.runtime_limits_mut().set_loop_iteration_limit(3);
+        let error = context
+            .eval(crate::Source::from_bytes("limitedMain()"))
+            .expect_err("the metered variant must execute each source loop charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        context.runtime_limits_mut().disable_loop_iteration_limit();
+
+        context.runtime_limits_mut().set_recursion_limit(3);
+        assert_eq!(
+            context
+                .eval(crate::Source::from_bytes(
+                    "let limitedCaught = false; try { limitedMain(); } catch (error) { limitedCaught = error instanceof RangeError && error.message === 'Maximum call stack size exceeded'; } limitedCaught",
+                ))
+                .expect("catch reader call-depth failure")
+                .as_boolean(),
+            Some(true),
+            "the reduction must not bypass an ordinary call-depth failure"
+        );
+
+        let mut interpreter = Context::default();
+        interpreter
+            .eval(crate::Source::from_bytes(DEFINITION))
+            .expect("define interpreter budget case");
+        interpreter
+            .eval(crate::Source::from_bytes(WARMUP))
+            .expect("warm interpreter budget case");
+        context.runtime_limits_mut().set_recursion_limit(512);
+
+        let expected = evaluate_with_instruction_budget(&mut interpreter, "limitedMain()", 10_000)
+            .expect("interpreter budgeted reader");
+        let result = evaluate_with_instruction_budget(&mut context, "limitedMain()", 10_000)
+            .expect("JIT budgeted reader");
+        assert_eq!(result, expected);
+        assert_eq!(
+            context.instruction_budget_remaining(),
+            interpreter.instruction_budget_remaining(),
+            "the metered artifact must charge every elided-candidate bytecode"
         );
     }
 

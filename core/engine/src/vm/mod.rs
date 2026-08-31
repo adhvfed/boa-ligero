@@ -184,6 +184,13 @@ impl Stack {
         }
     }
 
+    /// Return the number of live value-stack slots.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.stack.len()
+    }
+
     /// Get a register value by index, relative to the given frame's `rp`.
     pub(crate) fn get_register(&self, frame: &CallFrame, index: usize) -> Option<&JsValue> {
         self.stack.get(frame.rp as usize + index)

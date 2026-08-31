@@ -31,6 +31,9 @@ const JIT_SCAN_MATCH_BIT: u64 = 1 << 59;
 const JIT_SUM_APPLIED_BIT: u64 = 1 << 59;
 const JIT_SCAN_COUNT_SHIFT: u32 = 32;
 const JIT_SCAN_COUNT_MASK: u64 = (1 << 27) - 1;
+const JIT_GLOBAL_DECLARATIVE_IC: u32 = u32::MAX;
+const MAX_PURE_READER_INSTRUCTIONS: usize = 64;
+const MAX_PURE_READER_PROPERTIES: usize = 8;
 
 /// Compile an ordinary numeric code block to native code.
 ///
@@ -1583,6 +1586,7 @@ struct Helpers {
     indexed_wrapping_sum_i32_guarded: Helper,
     indexed_wrapping_sum_f64_guarded: Helper,
     wrapping_affine_range_i32: Helper,
+    pure_reader_range_i32_guarded: Helper,
     named_boxed_guarded: Helper,
     named_i32_guarded: Helper,
     named_f64_guarded: Helper,
@@ -1659,6 +1663,20 @@ struct WrappingAffineLoopFusion {
     accumulator: usize,
     multiplier: i32,
     offset: i32,
+}
+
+#[derive(Clone, Copy)]
+struct PureReaderLoopFusion {
+    body_start_index: usize,
+    back_edge_index: usize,
+    body_pc: usize,
+    function_binding_index: u32,
+    function_ic_index: u32,
+    object_binding_index: u32,
+    object_ic_index: u32,
+    index: usize,
+    limit: usize,
+    sum: usize,
 }
 
 struct NativeCompiler<'a> {
@@ -2074,6 +2092,24 @@ impl<'a> NativeCompiler<'a> {
                     types::I32,
                 ],
                 types::I32,
+            ),
+            pure_reader_range_i32_guarded: make(
+                if self.options.diagnostics.instrument_storage {
+                    jit_diagnostic_pure_reader_range_i32_guarded as *const () as usize
+                } else {
+                    jit_pure_reader_range_i32_guarded as *const () as usize
+                },
+                &[
+                    ptr,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                    types::I32,
+                ],
+                types::I64,
             ),
             named_boxed_guarded: make(
                 if self.options.diagnostics.instrument_storage {
@@ -3181,6 +3217,94 @@ impl<'a> NativeCompiler<'a> {
                 bcx.ins().brif(is_true, fallthrough, &[], target, &[]);
             }
             Instruction::JumpIfNotLessThan { address, lhs, rhs } => {
+                if let Some(fusion) = self.pure_reader_loop_fusion(register(*lhs), register(*rhs)) {
+                    for instruction_index in fusion.body_start_index..fusion.back_edge_index {
+                        if !self.fused_instruction_skips.insert(instruction_index) {
+                            return false;
+                        }
+                    }
+
+                    let Some(index) = self.use_register(bcx, fusion.index) else {
+                        return false;
+                    };
+                    let Some(limit) = self.use_register(bcx, fusion.limit) else {
+                        return false;
+                    };
+                    let Some(sum) = self.use_register(bcx, fusion.sum) else {
+                        return false;
+                    };
+                    let Some(target) = self.target_block(*address, blocks) else {
+                        return false;
+                    };
+
+                    let apply = bcx.create_block();
+                    let has_iterations = bcx.ins().icmp(IntCC::SignedLessThan, index, limit);
+                    bcx.ins().brif(has_iterations, apply, &[], target, &[]);
+                    bcx.switch_to_block(apply);
+
+                    let guarded = helpers.pure_reader_range_i32_guarded;
+                    let helper = bcx.ins().iconst(helpers.ptr, guarded.address as i64);
+                    let function_binding = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.function_binding_index));
+                    let function_ic = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.function_ic_index));
+                    let object_binding = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.object_binding_index));
+                    let object_ic = bcx
+                        .ins()
+                        .iconst(types::I32, i64::from(fusion.object_ic_index));
+                    let result = bcx.ins().call_indirect(
+                        guarded.signature,
+                        helper,
+                        &[
+                            ctx,
+                            function_binding,
+                            function_ic,
+                            object_binding,
+                            object_ic,
+                            index,
+                            limit,
+                            sum,
+                        ],
+                    );
+                    let result = bcx.inst_results(result)[0];
+
+                    let deopt = bcx.create_block();
+                    let applied_check = bcx.create_block();
+                    let guard_mask = bcx.ins().iconst(types::I64, JIT_GUARD_FAIL_BIT as i64);
+                    let guard_failed = bcx.ins().band(result, guard_mask);
+                    bcx.ins().brif(guard_failed, deopt, &[], applied_check, &[]);
+
+                    bcx.switch_to_block(deopt);
+                    if !self.emit_guard_deopt(
+                        bcx,
+                        ctx,
+                        helpers,
+                        fusion.body_pc,
+                        JitExitReason::CallTarget,
+                    ) {
+                        return false;
+                    }
+
+                    bcx.switch_to_block(applied_check);
+                    let applied_mask = bcx.ins().iconst(types::I64, JIT_SUM_APPLIED_BIT as i64);
+                    let was_applied = bcx.ins().band(result, applied_mask);
+                    let applied = bcx.create_block();
+                    bcx.ins().brif(was_applied, applied, &[], target, &[]);
+
+                    bcx.switch_to_block(applied);
+                    let reduced_sum = bcx.ins().ireduce(types::I32, result);
+                    if !self.define_register(bcx, fusion.sum, reduced_sum)
+                        || !self.define_register(bcx, fusion.index, limit)
+                    {
+                        return false;
+                    }
+                    bcx.ins().jump(target, &[]);
+                    return true;
+                }
                 if let Some(fusion) =
                     self.wrapping_affine_loop_fusion(register(*lhs), register(*rhs))
                 {
@@ -3610,6 +3734,283 @@ impl<'a> NativeCompiler<'a> {
     /// overflow deopt instead of relying on wider data-flow assumptions.
     fn i32_arithmetic_wraps(&self, instruction: &Instruction) -> bool {
         i32_arithmetic_coercion(&self.instructions, self.current_instruction, instruction)
+    }
+
+    /// Match the bytecompiler's canonical `sum += reader(object)` loop.
+    ///
+    /// The caller proof owns the complete call-convention sequence and loop
+    /// maintenance tail. The callee is deliberately resolved and proved at
+    /// runtime: a mutable global may name a different function or object on
+    /// every entry, and only the currently installed ordinary function may
+    /// authorize the reduction. The guarded helper accepts a linear i32
+    /// expression over cached data properties and otherwise exits before the
+    /// first body bytecode.
+    fn pure_reader_loop_fusion(&self, index: usize, limit: usize) -> Option<PureReaderLoopFusion> {
+        if self.mode != NativeMode::I32
+            || self.options.accounting.instruction_budget
+            || self.options.accounting.loop_iterations
+        {
+            return None;
+        }
+
+        let body_start_index = self.current_instruction.checked_add(1)?;
+        let this_push_index = self.current_instruction.checked_add(2)?;
+        let function_load_index = self.current_instruction.checked_add(3)?;
+        let function_push_index = self.current_instruction.checked_add(4)?;
+        let object_load_index = self.current_instruction.checked_add(5)?;
+        let object_push_index = self.current_instruction.checked_add(6)?;
+        let call_index = self.current_instruction.checked_add(7)?;
+        let pop_index = self.current_instruction.checked_add(8)?;
+        let add_index = self.current_instruction.checked_add(9)?;
+        let result_move_index = self.current_instruction.checked_add(10)?;
+        let back_edge_index = self.current_instruction.checked_add(11)?;
+
+        let (body_pc, _, Instruction::Move { src, dst }) =
+            self.instructions.instructions.get(body_start_index)?
+        else {
+            return None;
+        };
+        let sum = usize::from(*src);
+        let saved_sum = usize::from(*dst);
+
+        let (_, _, Instruction::PushFromRegister { src: this_register }) =
+            self.instructions.instructions.get(this_push_index)?
+        else {
+            return None;
+        };
+        let this_register = usize::from(*this_register);
+
+        let binding_read = |instruction_index: usize| {
+            let (_, _, instruction) = self.instructions.instructions.get(instruction_index)?;
+            match instruction {
+                Instruction::GetName { dst, binding_index } => {
+                    let binding_index = u32::from(*binding_index);
+                    self.code
+                        .bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })?;
+                    Some((usize::from(*dst), binding_index, JIT_GLOBAL_DECLARATIVE_IC))
+                }
+                Instruction::GetNameGlobal {
+                    dst,
+                    binding_index,
+                    ic_index,
+                } => {
+                    let binding_index = u32::from(*binding_index);
+                    self.code
+                        .bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                    Some((usize::from(*dst), binding_index, u32::from(*ic_index)))
+                }
+                _ => None,
+            }
+        };
+        let (function_register, function_binding_index, function_ic_index) =
+            binding_read(function_load_index)?;
+        let (object_register, object_binding_index, object_ic_index) =
+            binding_read(object_load_index)?;
+
+        let (_, _, Instruction::PushFromRegister { src }) =
+            self.instructions.instructions.get(function_push_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != function_register {
+            return None;
+        }
+        let (_, _, Instruction::PushFromRegister { src }) =
+            self.instructions.instructions.get(object_push_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != object_register {
+            return None;
+        }
+        let (_, _, Instruction::Call { argument_count }) =
+            self.instructions.instructions.get(call_index)?
+        else {
+            return None;
+        };
+        if u32::from(*argument_count) != 1 {
+            return None;
+        }
+        let (_, _, Instruction::PopIntoRegister { dst }) =
+            self.instructions.instructions.get(pop_index)?
+        else {
+            return None;
+        };
+        let reader_result = usize::from(*dst);
+
+        let (_, _, Instruction::Add { dst, lhs, rhs }) =
+            self.instructions.instructions.get(add_index)?
+        else {
+            return None;
+        };
+        let add_result = usize::from(*dst);
+        let lhs = usize::from(*lhs);
+        let rhs = usize::from(*rhs);
+        if !((lhs == saved_sum && rhs == reader_result)
+            || (rhs == saved_sum && lhs == reader_result))
+        {
+            return None;
+        }
+        let (_, _, Instruction::Move { src, dst }) =
+            self.instructions.instructions.get(result_move_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != add_result || usize::from(*dst) != sum {
+            return None;
+        }
+
+        let (
+            _,
+            _,
+            Instruction::Jump {
+                address: back_edge_address,
+            },
+        ) = self.instructions.instructions.get(back_edge_index)?
+        else {
+            return None;
+        };
+        let loop_iteration_index = self.current_instruction.checked_sub(2)?;
+        let index_increment_index = self.current_instruction.checked_sub(1)?;
+        let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
+            self.instructions.instructions.get(loop_iteration_index)?;
+        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
+            || self
+                .instructions
+                .pc_to_index
+                .get(loop_iteration_next_pc)
+                .copied()
+                != Some(index_increment_index)
+            || back_edge_address.as_u32() as usize != *loop_iteration_pc
+        {
+            return None;
+        }
+        let (_, increment_next_pc, Instruction::Inc { src, dst }) =
+            self.instructions.instructions.get(index_increment_index)?
+        else {
+            return None;
+        };
+        if usize::from(*src) != index
+            || usize::from(*dst) != index
+            || self
+                .instructions
+                .pc_to_index
+                .get(increment_next_pc)
+                .copied()
+                != Some(self.current_instruction)
+        {
+            return None;
+        }
+
+        let (_, _, Instruction::JumpIfNotLessThan { address, .. }) = self
+            .instructions
+            .instructions
+            .get(self.current_instruction)?
+        else {
+            return None;
+        };
+        if self
+            .instructions
+            .pc_to_index
+            .get(&(address.as_u32() as usize))
+            .copied()
+            .is_none_or(|exit_index| exit_index <= back_edge_index)
+        {
+            return None;
+        }
+        for instruction_index in self.current_instruction..back_edge_index {
+            let (_, next_pc, _) = self.instructions.instructions.get(instruction_index)?;
+            if self.instructions.pc_to_index.get(next_pc).copied()? != instruction_index + 1 {
+                return None;
+            }
+        }
+        for instruction_index in body_start_index..=back_edge_index {
+            let (pc, _, _) = self.instructions.instructions.get(instruction_index)?;
+            if self
+                .instructions
+                .instructions
+                .iter()
+                .any(|(_, _, instruction)| branch_target(instruction) == Some(*pc))
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, sum];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+        {
+            return None;
+        }
+        let temporary_registers = [
+            saved_sum,
+            function_register,
+            object_register,
+            reader_result,
+            add_result,
+        ];
+        if source_registers
+            .iter()
+            .any(|source| temporary_registers.contains(source))
+        {
+            return None;
+        }
+
+        let kind_before = |instruction_index: usize, register: usize| {
+            self.analysis
+                .before
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        let kind_after = |instruction_index: usize, register: usize| {
+            self.analysis
+                .after
+                .get(instruction_index)
+                .and_then(|kinds| kinds.get(register))
+                .copied()
+        };
+        if source_registers.iter().any(|register| {
+            kind_before(self.current_instruction, *register) != Some(RegisterKind::Numeric)
+        }) || kind_before(this_push_index, this_register) != Some(RegisterKind::Boxed)
+            || kind_after(body_start_index, saved_sum) != Some(RegisterKind::Numeric)
+            || kind_after(function_load_index, function_register) != Some(RegisterKind::Boxed)
+            || kind_after(object_load_index, object_register) != Some(RegisterKind::Boxed)
+            || kind_after(pop_index, reader_result) != Some(RegisterKind::Numeric)
+            || kind_after(add_index, add_result) != Some(RegisterKind::Numeric)
+            || kind_after(result_move_index, sum) != Some(RegisterKind::Numeric)
+        {
+            return None;
+        }
+
+        let live_after_result = self.analysis.live_after.get(result_move_index)?;
+        if temporary_registers
+            .iter()
+            .any(|temporary| live_after_result.contains(temporary))
+        {
+            return None;
+        }
+
+        Some(PureReaderLoopFusion {
+            body_start_index,
+            back_edge_index,
+            body_pc: *body_pc,
+            function_binding_index,
+            function_ic_index,
+            object_binding_index,
+            object_ic_index,
+            index,
+            limit,
+            sum,
+        })
     }
 
     /// Match a pure wrapping-affine integer loop of the canonical form:
@@ -6182,6 +6583,283 @@ fn global_declarative_binding_value(context: &Context, binding_index: u32) -> Op
     frame.realm.environment().get(binding.binding_index())
 }
 
+/// Resolve one compile-time global binding through the active caller frame,
+/// accepting only ordinary data-property reads for global-object bindings.
+/// The `u32::MAX` IC sentinel denotes a global-declarative locator.
+fn global_binding_data_value(
+    context: &Context,
+    binding_index: u32,
+    ic_index: u32,
+) -> Option<JsValue> {
+    if ic_index == JIT_GLOBAL_DECLARATIVE_IC {
+        return global_declarative_binding_value(context, binding_index);
+    }
+    if !context.binding_locator_stable() {
+        return None;
+    }
+
+    let code = context.vm.frame().code_block().clone();
+    if code
+        .bindings
+        .get(binding_index as usize)
+        .is_none_or(|binding| binding.scope() != BindingLocatorScope::GlobalObject)
+    {
+        return None;
+    }
+    let global = context.global_object();
+    cached_named_data_property_value(&code, &global, ic_index)
+}
+
+#[derive(Clone, Copy)]
+enum PureReaderValue {
+    Unset,
+    Argument,
+    I32(i32),
+}
+
+/// Evaluate the reachable prefix of a small, linear ordinary function while
+/// proving that it can only read cached data properties from argument zero.
+/// Every unsupported opcode rejects the plan before the caller loop advances.
+fn pure_named_reader_i32(code: &CodeBlock, object: &JsObject) -> Option<i32> {
+    if !code.is_ordinary()
+        || code.is_class_constructor()
+        || !code.handlers.is_empty()
+        || code.register_count > 128
+    {
+        return None;
+    }
+
+    let mut registers = vec![PureReaderValue::Unset; code.register_count as usize];
+    let mut stack = Vec::new();
+    let mut accumulator = None;
+    let mut property_reads = 0usize;
+    let mut instruction_count = 0usize;
+
+    for (_, _, instruction) in InstructionIterator::new(&code.bytecode) {
+        instruction_count = instruction_count.checked_add(1)?;
+        if instruction_count > MAX_PURE_READER_INSTRUCTIONS {
+            return None;
+        }
+        let read = |register: crate::vm::opcode::RegisterOperand| {
+            registers.get(usize::from(register)).copied()
+        };
+        let destination = |register: crate::vm::opcode::RegisterOperand| {
+            usize::from(register)
+                .lt(&registers.len())
+                .then_some(usize::from(register))
+        };
+
+        match instruction {
+            Instruction::GetArgument { index, dst } if u32::from(index) == 0 => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::Argument;
+            }
+            Instruction::StoreZero { dst } => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(0);
+            }
+            Instruction::StoreOne { dst } => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(1);
+            }
+            Instruction::StoreInt8 { value, dst } => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(i32::from(value));
+            }
+            Instruction::StoreInt16 { value, dst } => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(i32::from(value));
+            }
+            Instruction::StoreInt32 { value, dst } => {
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(value);
+            }
+            Instruction::Move { src, dst } => {
+                let value = read(src)?;
+                if matches!(value, PureReaderValue::Unset) {
+                    return None;
+                }
+                let dst = destination(dst)?;
+                registers[dst] = value;
+            }
+            Instruction::GetLengthProperty {
+                dst,
+                value,
+                ic_index,
+            }
+            | Instruction::GetPropertyByName {
+                dst,
+                value,
+                ic_index,
+            } => {
+                if !matches!(read(value)?, PureReaderValue::Argument) {
+                    return None;
+                }
+                property_reads = property_reads.checked_add(1)?;
+                if property_reads > MAX_PURE_READER_PROPERTIES {
+                    return None;
+                }
+                let value = cached_named_data_property_value(code, object, u32::from(ic_index))?
+                    .as_i32()?;
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(value);
+            }
+            Instruction::Add { dst, lhs, rhs } => {
+                let (PureReaderValue::I32(lhs), PureReaderValue::I32(rhs)) =
+                    (read(lhs)?, read(rhs)?)
+                else {
+                    return None;
+                };
+                let value = lhs.checked_add(rhs)?;
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(value);
+            }
+            Instruction::Sub { dst, lhs, rhs } => {
+                let (PureReaderValue::I32(lhs), PureReaderValue::I32(rhs)) =
+                    (read(lhs)?, read(rhs)?)
+                else {
+                    return None;
+                };
+                let value = lhs.checked_sub(rhs)?;
+                let dst = destination(dst)?;
+                registers[dst] = PureReaderValue::I32(value);
+            }
+            Instruction::PushFromRegister { src } => {
+                let value = read(src)?;
+                if matches!(value, PureReaderValue::Unset) {
+                    return None;
+                }
+                stack.push(value);
+            }
+            Instruction::PopIntoRegister { dst } => {
+                let value = stack.pop()?;
+                let dst = destination(dst)?;
+                registers[dst] = value;
+            }
+            Instruction::SetAccumulator { src } => {
+                let PureReaderValue::I32(value) = read(src)? else {
+                    return None;
+                };
+                accumulator = Some(value);
+            }
+            Instruction::CheckReturn => {}
+            Instruction::Return => {
+                if property_reads == 0 || !stack.is_empty() {
+                    return None;
+                }
+                return accumulator;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn encode_pure_reader_range_result(sum: i32, iterations: u64, applied: bool) -> u64 {
+    u64::from(sum as u32)
+        | (iterations.min(JIT_SCAN_COUNT_MASK) << JIT_SCAN_COUNT_SHIFT)
+        | if applied { JIT_SUM_APPLIED_BIT } else { 0 }
+}
+
+extern "C" fn jit_pure_reader_range_i32_guarded(
+    context: *mut Context,
+    function_binding_index: u32,
+    function_ic_index: u32,
+    object_binding_index: u32,
+    object_ic_index: u32,
+    index: i32,
+    limit: i32,
+    sum: i32,
+) -> u64 {
+    // SAFETY: generated code receives an exclusively borrowed live context.
+    let context = unsafe { &mut *context };
+    if index >= limit {
+        return encode_pure_reader_range_result(sum, 0, false);
+    }
+
+    // Preserve the source lookup order: callable first, argument second.
+    let Some(function) =
+        global_binding_data_value(context, function_binding_index, function_ic_index)
+    else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let Some(argument) = global_binding_data_value(context, object_binding_index, object_ic_index)
+    else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let Some(function_object) = function.as_object() else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let Some(ordinary) = function_object.downcast_ref::<OrdinaryFunction>() else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    if !ordinary.codeblock().is_ordinary() || ordinary.codeblock().is_class_constructor() {
+        return JIT_GUARD_FAIL_BIT;
+    }
+
+    // `function_call` checks these limits after the caller has pushed `this`,
+    // the function, and one argument. A failed check must be replayed by the
+    // ordinary Call opcode so it creates the exact catchable RangeError.
+    if context.check_runtime_limits().is_err()
+        || context.runtime_limits().stack_size_limit() <= context.vm.stack.len().saturating_add(3)
+    {
+        return JIT_GUARD_FAIL_BIT;
+    }
+
+    let Some(object) = argument.as_object() else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+    let Some(reader_value) = pure_named_reader_i32(ordinary.codeblock(), &object) else {
+        return JIT_GUARD_FAIL_BIT;
+    };
+
+    let iterations = i64::from(limit) - i64::from(index);
+    let reduced = i128::from(sum) + i128::from(reader_value) * i128::from(iterations);
+    let Ok(reduced) = i32::try_from(reduced) else {
+        // Repeated addition would leave the i32 specialization. Resume before
+        // the first call and let the ordinary overflow deopt preserve Number
+        // promotion and every later iteration.
+        return JIT_GUARD_FAIL_BIT;
+    };
+    encode_pure_reader_range_result(reduced, iterations as u64, true)
+}
+
+extern "C" fn jit_diagnostic_pure_reader_range_i32_guarded(
+    context: *mut Context,
+    function_binding_index: u32,
+    function_ic_index: u32,
+    object_binding_index: u32,
+    object_ic_index: u32,
+    index: i32,
+    limit: i32,
+    sum: i32,
+) -> u64 {
+    let result = jit_pure_reader_range_i32_guarded(
+        context,
+        function_binding_index,
+        function_ic_index,
+        object_binding_index,
+        object_ic_index,
+        index,
+        limit,
+        sum,
+    );
+    // SAFETY: generated code receives an exclusively borrowed live context,
+    // and the delegated helper's borrows ended before this update.
+    let counters = unsafe { &mut (*context).vm.jit_native_storage };
+    if result & JIT_GUARD_FAIL_BIT != 0 {
+        counters.pure_reader_guard_misses = counters.pure_reader_guard_misses.saturating_add(1);
+        return result;
+    }
+    if result & JIT_SUM_APPLIED_BIT == 0 {
+        return result;
+    }
+    let calls = (result >> JIT_SCAN_COUNT_SHIFT) & JIT_SCAN_COUNT_MASK;
+    counters.pure_reader_range_hits = counters.pure_reader_range_hits.saturating_add(1);
+    counters.pure_reader_calls_elided = counters.pure_reader_calls_elided.saturating_add(calls);
+    result
+}
+
 fn dense_array_wrapping_sum_i32(
     context: &Context,
     value: &JsValue,
@@ -6705,10 +7383,31 @@ fn cached_named_property_value(
     object: &JsObject,
     ic_index: u32,
 ) -> Option<JsValue> {
+    cached_named_property_value_from_code(context.vm.frame().code_block(), object, ic_index, false)
+}
+
+fn cached_named_data_property_value(
+    code: &CodeBlock,
+    object: &JsObject,
+    ic_index: u32,
+) -> Option<JsValue> {
+    cached_named_property_value_from_code(code, object, ic_index, true)
+}
+
+fn cached_named_property_value_from_code(
+    code: &CodeBlock,
+    object: &JsObject,
+    ic_index: u32,
+    data_only: bool,
+) -> Option<JsValue> {
     let object = object.borrow();
-    let ic = context.vm.frame().code_block().ic.get(ic_index as usize)?;
+    let ic = code.ic.get(ic_index as usize)?;
     let slot = ic.get(object.shape())?;
-    if slot.attributes.has_get() {
+    if if data_only {
+        slot.attributes.is_accessor_descriptor()
+    } else {
+        slot.attributes.has_get()
+    } {
         return None;
     }
     if slot.attributes.contains(SlotAttributes::PROTOTYPE) {
