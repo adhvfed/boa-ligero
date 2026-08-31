@@ -23,6 +23,7 @@ const MAX_PURE_READER_CONTINUATION: usize = 16;
 const MAX_PURE_PROPERTY_WRITES: usize = 8;
 pub(crate) const PURE_PROPERTY_WRITE_GUARD_MISS: u8 = 1 << 0;
 pub(crate) const PURE_METHOD_GUARD_MISS: u8 = 1 << 1;
+pub(crate) const PURE_GLOBAL_AFFINE_GUARD_MISS: u8 = 1 << 2;
 
 #[derive(Clone, Copy, Debug)]
 enum PureReaderNode {
@@ -65,11 +66,21 @@ pub(crate) struct PureReceiverAffineStepPlan {
     argument_scale: i32,
 }
 
+/// A no-argument ordinary function that advances one own global-object data
+/// property by a constant i32 offset and returns no observable value.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureGlobalAffineStepPlan {
+    read_ic_index: u32,
+    write_ic_index: u32,
+    delta: i32,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PureFunctionKind {
     Reader,
     AffineStep,
     ReceiverAffineStep(PureReceiverAffineStepPlan),
+    GlobalAffineStep(PureGlobalAffineStepPlan),
 }
 
 /// One cached, source-free proof for the mutually exclusive pure-function
@@ -152,6 +163,19 @@ pub(crate) struct PureMethodLoopPlan {
     accumulator: usize,
 }
 
+/// A canonical loop whose no-argument callee advances one own global-object
+/// i32 data slot by a constant amount and whose return value is discarded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureGlobalAffineLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    exit_pc: u32,
+    function_binding_index: u32,
+    function_ic_index: Option<u32>,
+    index: usize,
+    limit: usize,
+}
+
 /// A statically proven loop shape. Reader and affine candidates use distinct
 /// specialized opcodes because their runtime guards and tiering policy differ.
 #[derive(Clone, Copy, Debug)]
@@ -160,6 +184,7 @@ pub(crate) enum PureLoopPlan {
     Affine(PureAffineLoopPlan),
     PropertyWrite(PurePropertyWriteLoopPlan),
     Method(PureMethodLoopPlan),
+    GlobalAffine(PureGlobalAffineLoopPlan),
 }
 
 impl PureFunctionPlan {
@@ -367,6 +392,7 @@ impl PureFunctionPlan {
         Self::parse_reader(code)
             .or_else(|| Self::parse_affine(code))
             .or_else(|| Self::parse_receiver_affine(code))
+            .or_else(|| Self::parse_global_affine(code))
     }
 
     pub(super) fn reader_i32(&self, code: &CodeBlock, object: &JsObject) -> Option<i32> {
@@ -385,6 +411,13 @@ impl PureFunctionPlan {
 
     pub(super) fn receiver_affine_step(&self) -> Option<PureReceiverAffineStepPlan> {
         let PureFunctionKind::ReceiverAffineStep(plan) = self.kind else {
+            return None;
+        };
+        Some(plan)
+    }
+
+    pub(super) fn global_affine_step(&self) -> Option<PureGlobalAffineStepPlan> {
+        let PureFunctionKind::GlobalAffineStep(plan) = self.kind else {
             return None;
         };
         Some(plan)
@@ -674,6 +707,105 @@ impl PureFunctionPlan {
 
         None
     }
+
+    fn parse_global_affine(code: &CodeBlock) -> Option<Self> {
+        if !code.is_ordinary()
+            || code.is_class_constructor()
+            || !code.handlers.is_empty()
+            || code.register_count > MAX_PURE_READER_REGISTERS
+        {
+            return None;
+        }
+
+        let mut instructions = InstructionIterator::new(&code.bytecode);
+        let (
+            _,
+            _,
+            Instruction::GetLocatorGlobal {
+                binding_index: write_binding_index,
+                ic_index: write_ic_index,
+            },
+        ) = instructions.next()?
+        else {
+            return None;
+        };
+        let (
+            _,
+            _,
+            Instruction::GetNameGlobal {
+                dst: state,
+                binding_index: read_binding_index,
+                ic_index: read_ic_index,
+            },
+        ) = instructions.next()?
+        else {
+            return None;
+        };
+        let write_binding_index = u32::from(write_binding_index);
+        let read_binding_index = u32::from(read_binding_index);
+        if write_binding_index != read_binding_index {
+            return None;
+        }
+        let binding_index = write_binding_index as usize;
+        code.bindings
+            .get(binding_index)
+            .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+
+        let (_, _, constant_instruction) = instructions.next()?;
+        let (constant, constant_register) = match constant_instruction {
+            Instruction::StoreZero { dst } => (0, usize::from(dst)),
+            Instruction::StoreOne { dst } => (1, usize::from(dst)),
+            Instruction::StoreInt8 { value, dst } => (i32::from(value), usize::from(dst)),
+            Instruction::StoreInt16 { value, dst } => (i32::from(value), usize::from(dst)),
+            Instruction::StoreInt32 { value, dst } => (value, usize::from(dst)),
+            _ => return None,
+        };
+        let state = usize::from(state);
+        if constant_register == state {
+            return None;
+        }
+
+        let (_, _, arithmetic) = instructions.next()?;
+        let (result, delta) = match arithmetic {
+            Instruction::Add { lhs, rhs, dst }
+                if (usize::from(lhs) == state && usize::from(rhs) == constant_register)
+                    || (usize::from(rhs) == state && usize::from(lhs) == constant_register) =>
+            {
+                (usize::from(dst), constant)
+            }
+            Instruction::Sub { lhs, rhs, dst }
+                if usize::from(lhs) == state && usize::from(rhs) == constant_register =>
+            {
+                (usize::from(dst), constant.checked_neg()?)
+            }
+            _ => return None,
+        };
+        if !matches!(
+            instructions.next()?.2,
+            Instruction::SetNameByLocator { src } if usize::from(src) == result
+        ) || !matches!(instructions.next()?.2, Instruction::CheckReturn)
+            || !matches!(instructions.next()?.2, Instruction::Return)
+            || instructions.next().is_some()
+        {
+            return None;
+        }
+
+        let read_ic_index = u32::from(read_ic_index);
+        let write_ic_index = u32::from(write_ic_index);
+        if code.ic.get(read_ic_index as usize)?.name != code.ic.get(write_ic_index as usize)?.name {
+            return None;
+        }
+
+        Some(Self {
+            nodes: Box::default(),
+            root: 0,
+            kind: PureFunctionKind::GlobalAffineStep(PureGlobalAffineStepPlan {
+                read_ic_index,
+                write_ic_index,
+                delta,
+            }),
+        })
+    }
 }
 
 impl PureLoopPlan {
@@ -721,6 +853,10 @@ impl PureLoopPlan {
                 PureMethodLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
                 plans.push(Self::Method(plan));
+            } else if let Some(plan) =
+                PureGlobalAffineLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::GlobalAffine(plan));
             } else if let Some(plan) =
                 PurePropertyWriteLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
@@ -1736,6 +1872,311 @@ impl PureMethodLoopPlan {
     }
 }
 
+impl PureGlobalAffineLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+        let this_push_index = loop_iteration_index.checked_add(3)?;
+        let function_load_index = loop_iteration_index.checked_add(4)?;
+        let function_push_index = loop_iteration_index.checked_add(5)?;
+        let call_index = loop_iteration_index.checked_add(6)?;
+        let pop_index = loop_iteration_index.checked_add(7)?;
+        let back_edge_index = loop_iteration_index.checked_add(8)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+
+        let increment = instructions.get(increment_index)?;
+        let Instruction::Inc { src, dst } = &increment.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+
+        if !matches!(
+            &instructions.get(this_push_index)?.instruction,
+            Instruction::PushFromRegister { .. }
+        ) {
+            return None;
+        }
+
+        let (function_register, function_binding_index, function_ic_index) = match &instructions
+            .get(function_load_index)?
+            .instruction
+        {
+            Instruction::GetName { dst, binding_index } => {
+                let binding_index = u32::from(*binding_index);
+                code.bindings
+                    .get(binding_index as usize)
+                    .filter(|binding| binding.scope() == BindingLocatorScope::GlobalDeclarative)?;
+                (usize::from(*dst), binding_index, None)
+            }
+            Instruction::GetNameGlobal {
+                dst,
+                binding_index,
+                ic_index,
+            } => {
+                let binding_index = u32::from(*binding_index);
+                code.bindings
+                    .get(binding_index as usize)
+                    .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                (usize::from(*dst), binding_index, Some(u32::from(*ic_index)))
+            }
+            _ => return None,
+        };
+        if !matches!(
+            &instructions.get(function_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == function_register
+        ) || !matches!(
+            &instructions.get(call_index)?.instruction,
+            Instruction::Call { argument_count } if u32::from(*argument_count) == 0
+        ) || !matches!(&instructions.get(pop_index)?.instruction, Instruction::Pop)
+        {
+            return None;
+        }
+
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = &instructions.get(back_edge_index)?.instruction
+        else {
+            return None;
+        };
+        if back_edge_address.as_u32() as usize != loop_iteration.pc {
+            return None;
+        }
+
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let body_start_pc = instructions.get(this_push_index)?.pc;
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start_pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        if index == limit || function_register == index || function_register == limit {
+            return None;
+        }
+        let live_at_exit = continuation_live_registers(code, exit_pc)?;
+        if live_at_exit.get(function_register).copied().unwrap_or(true) {
+            return None;
+        }
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            exit_pc: u32::try_from(exit_pc).ok()?,
+            function_binding_index,
+            function_ic_index,
+            index,
+            limit,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_GLOBAL_AFFINE_GUARD_MISS != 0 {
+            return None;
+        }
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let index = context.vm.get_register(self.index).as_i32()?;
+        let limit = context.vm.get_register(self.limit).as_i32()?;
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 0 {
+            return None;
+        }
+
+        let Some(function) = binding_data_value(
+            caller_code,
+            self.function_binding_index,
+            self.function_ic_index,
+            context,
+        ) else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(function) = function.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(ordinary) = function.downcast_ref::<crate::builtins::function::OrdinaryFunction>()
+        else {
+            return self.suppress_for_frame(context);
+        };
+        let step_code = ordinary.codeblock();
+        if !step_code.is_ordinary()
+            || step_code.is_class_constructor()
+            || step_code.has_binding_identifier()
+            || step_code.has_function_scope()
+        {
+            return self.suppress_for_frame(context);
+        }
+        #[cfg(feature = "trace")]
+        if step_code.traceable() {
+            return None;
+        }
+        let Some(environment) = ordinary
+            .environments
+            .current_declarative_ref(ordinary.realm().environment())
+        else {
+            return self.suppress_for_frame(context);
+        };
+        if environment.with() || environment.poisoned() {
+            return self.suppress_for_frame(context);
+        }
+        let Some(step) = step_code.pure_global_affine_step() else {
+            return self.suppress_for_frame(context);
+        };
+
+        let target = ordinary.realm().global_object().clone();
+        if !target.is_ordinary() {
+            return self.suppress_for_frame(context);
+        }
+        let (slot_index, state) = {
+            let target = target.borrow();
+            let shape = target.shape();
+            let Some(read_slot) = step_code
+                .ic
+                .get(step.read_ic_index as usize)
+                .and_then(|ic| ic.get(shape))
+            else {
+                return self.suppress_for_frame(context);
+            };
+            let Some(write_slot) = step_code
+                .ic
+                .get(step.write_ic_index as usize)
+                .and_then(|ic| ic.get(shape))
+            else {
+                return self.suppress_for_frame(context);
+            };
+            if read_slot.index != write_slot.index
+                || read_slot.attributes.is_accessor_descriptor()
+                || write_slot.attributes.is_accessor_descriptor()
+                || read_slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                || write_slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                || !write_slot.attributes.contains(SlotAttributes::WRITABLE)
+            {
+                return self.suppress_for_frame(context);
+            }
+            let slot_index = read_slot.index as usize;
+            let Some(state) = target
+                .properties()
+                .storage
+                .get(slot_index)
+                .and_then(JsValue::as_i32)
+            else {
+                return self.suppress_for_frame(context);
+            };
+            (slot_index, state)
+        };
+
+        let reduced = i128::from(state) + i128::from(step.delta) * i128::from(remaining);
+        let Ok(reduced) = i32::try_from(reduced) else {
+            return self.suppress_for_frame(context);
+        };
+        let total_iterations = u64::try_from(remaining).ok()?.checked_add(1)?;
+
+        context.consume_loop_iterations(total_iterations).ok()?;
+        target.borrow_mut().properties_mut().storage[slot_index] = reduced.into();
+        context.vm.set_register(self.index, limit.into());
+        context.vm.frame_mut().pc = self.exit_pc;
+        caller_code.mark_pure_range_loop_observed();
+        #[cfg(test)]
+        {
+            context.vm.pure_global_affine_loop_reductions = context
+                .vm
+                .pure_global_affine_loop_reductions
+                .saturating_add(1);
+            context.vm.pure_global_affine_loop_calls_elided = context
+                .vm
+                .pure_global_affine_loop_calls_elided
+                .saturating_add(u64::try_from(remaining).ok()?);
+        }
+        Some(())
+    }
+
+    fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
+        debug_assert!(self.loop_iteration_next_pc > self.loop_iteration_pc);
+        context.vm.frame_mut().pure_loop_guard_misses |= PURE_GLOBAL_AFFINE_GUARD_MISS;
+        None
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
+    }
+}
+
 impl PurePropertyWriteLoopPlan {
     fn parse_at(
         code: &CodeBlock,
@@ -2059,6 +2500,7 @@ impl PureLoopPlan {
             Self::Affine(plan) => plan.loop_iteration_pc(),
             Self::PropertyWrite(plan) => plan.loop_iteration_pc(),
             Self::Method(plan) => plan.loop_iteration_pc(),
+            Self::GlobalAffine(plan) => plan.loop_iteration_pc(),
         }
     }
 }
@@ -2109,6 +2551,9 @@ fn continuation_live_registers(code: &CodeBlock, resume_pc: usize) -> Option<Vec
         let (uses, definition, returns) = match instruction {
             Instruction::PushFromRegister { src } | Instruction::SetAccumulator { src } => {
                 (vec![usize::from(src)], None, false)
+            }
+            Instruction::GetName { dst, .. } | Instruction::GetNameGlobal { dst, .. } => {
+                (Vec::new(), Some(usize::from(dst)), false)
             }
             Instruction::PopIntoRegister { dst } => (Vec::new(), Some(usize::from(dst)), false),
             Instruction::CheckReturn => (Vec::new(), None, false),
@@ -2203,6 +2648,185 @@ mod tests {
         Context, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
     };
+
+    #[test]
+    fn canonical_global_affine_loop_advances_data_slot_as_a_range() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "var counter = 0; const N = 10;\n\
+                 function bump() { counter = counter + 1; }\n\
+                 function main() {\n\
+                     counter = 0;\n\
+                     for (let index = 0; index < N; index++) { bump(); }\n\
+                     return counter;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical global-affine loop must succeed");
+
+        assert_eq!(result, JsValue::new(10));
+        assert_eq!(context.vm.pure_global_affine_loop_reductions, 1);
+        assert_eq!(context.vm.pure_global_affine_loop_calls_elided, 9);
+    }
+
+    #[test]
+    fn global_affine_loop_supports_negative_constant_steps() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "var counter = 10; const N = 4;\n\
+                 function lower() { counter = counter - 2; }\n\
+                 function main() {\n\
+                     for (let index = 0; index < N; index++) { lower(); }\n\
+                     return counter;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("negative global-affine step must succeed");
+
+        assert_eq!(result, JsValue::new(2));
+        assert_eq!(context.vm.pure_global_affine_loop_reductions, 1);
+        assert_eq!(context.vm.pure_global_affine_loop_calls_elided, 3);
+    }
+
+    #[test]
+    fn global_affine_loop_revalidates_accessors_functions_and_captured_scopes() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "globalThis.counter = 0;\n\
+                 globalThis.step = function() { counter = counter + 1; };\n\
+                 const originalStep = step; const N = 10;\n\
+                 function run() {\n\
+                     counter = 0;\n\
+                     for (let index = 0; index < N; index++) { step(); }\n\
+                     return counter;\n\
+                 }\n\
+                 const observations = [String(run())];\n\
+                 let reboundCalls = 0;\n\
+                 step = function() { reboundCalls++; counter = counter + 1; };\n\
+                 const reboundResult = run();\n\
+                 observations.push([reboundResult, reboundCalls].join(','));\n\
+                 step = originalStep;\n\
+                 observations.push(String(run()));\n\
+                 let stateReads = 0; let stateWrites = 0; let stateValue = 0;\n\
+                 Object.defineProperty(globalThis, 'counter', {\n\
+                     configurable: true,\n\
+                     get() { stateReads++; return stateValue; },\n\
+                     set(value) { stateWrites++; stateValue = value; }\n\
+                 });\n\
+                 const accessorStateResult = run();\n\
+                 observations.push([accessorStateResult, stateReads, stateWrites].join(','));\n\
+                 Object.defineProperty(globalThis, 'counter', {\n\
+                     configurable: true, writable: true, value: 0\n\
+                 });\n\
+                 let stepReads = 0; let stepCalls = 0;\n\
+                 Object.defineProperty(globalThis, 'step', {\n\
+                     configurable: true,\n\
+                     get() {\n\
+                         stepReads++;\n\
+                         return function() { stepCalls++; counter = counter + 1; };\n\
+                     }\n\
+                 });\n\
+                 const accessorFunctionResult = run();\n\
+                 observations.push([accessorFunctionResult, stepReads, stepCalls].join(','));\n\
+                 Object.defineProperty(globalThis, 'step', {\n\
+                     configurable: true, writable: true, value: originalStep\n\
+                 });\n\
+                 const box = { counter: 0 };\n\
+                 with (box) {\n\
+                     step = function() { counter = counter + 1; };\n\
+                 }\n\
+                 const capturedResult = run();\n\
+                 observations.push([capturedResult, box.counter].join(','));\n\
+                 observations.join(';');",
+            ))
+            .expect("guarded global-affine cases must preserve source semantics");
+        assert_eq!(
+            result
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("10;10,10;10;10,11,11;10,10,10;0,10")
+        );
+        assert_eq!(context.vm.pure_global_affine_loop_reductions, 2);
+    }
+
+    #[test]
+    fn global_affine_shortcuts_preserve_effects_overflow_and_finite_accounting() {
+        let definition = "var counter = 0; const N = 10;\n\
+            function bump() { counter = counter + 1; }\n\
+            function main() {\n\
+                counter = 0;\n\
+                for (let index = 0; index < N; index++) { bump(); }\n\
+                return counter;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget case definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        assert_eq!(
+            budgeted.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(budgeted.vm.pure_global_affine_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit case definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(3);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must execute every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_global_affine_loop_reductions, 0);
+
+        let mut overflow = Context::default();
+        let result = overflow
+            .eval(Source::from_bytes(
+                "var counter = 2147483646; const N = 4;\n\
+                 function bump() { counter = counter + 1; }\n\
+                 function main() {\n\
+                     for (let index = 0; index < N; index++) { bump(); }\n\
+                     return counter;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("overflow case must preserve Number promotion");
+        assert_eq!(result, JsValue::new(2_147_483_650_f64));
+        assert_eq!(overflow.vm.pure_global_affine_loop_reductions, 0);
+
+        let mut effectful = Context::default();
+        effectful
+            .eval(Source::from_bytes(
+                "var counter = 0; var effects = 0; const N = 10;\n\
+                 function bump() { effects = effects + 1; counter = counter + 1; }\n\
+                 function main() {\n\
+                     counter = 0; effects = 0;\n\
+                     for (let index = 0; index < N; index++) { bump(); }\n\
+                     return counter;\n\
+                 }",
+            ))
+            .expect("effectful case definitions must succeed");
+        assert_eq!(
+            effectful.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(
+            effectful.eval(Source::from_bytes("effects")),
+            Ok(JsValue::new(10))
+        );
+        assert_eq!(effectful.vm.pure_global_affine_loop_reductions, 0);
+    }
 
     #[test]
     fn canonical_method_loop_advances_receiver_slot_as_a_range() {

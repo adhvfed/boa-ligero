@@ -4717,6 +4717,37 @@ mod tests {
     }
 
     #[test]
+    fn native_admission_preserves_observed_global_affine_summaries() {
+        let code = first_function_code(
+            "var counter = 0; const N = 100;\n\
+             function main() {\n\
+                 for (let index = 0; index < N; index++) { bump(); }\n\
+                 return counter;\n\
+             }\n\
+             function bump() { counter = counter + 1; }",
+        );
+        assert!(
+            InstructionIterator::new(&code.bytecode).any(|(_, _, instruction)| {
+                matches!(instruction, Instruction::PureGlobalAffineLoopIteration)
+            }),
+            "the bytecompiler must mark the global-affine candidate before JIT admission"
+        );
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("discarded call results are not part of native lowering");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(rejection.first_blocking_opcode, Some(Opcode::Pop));
+
+        code.mark_pure_range_loop_observed();
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("native lowering must not discard an observed global-affine summary");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(
+            rejection.first_blocking_opcode,
+            Some(Opcode::PureGlobalAffineLoopIteration)
+        );
+    }
+
+    #[test]
     fn jit_executes_script_matches_interpreter() {
         // End-to-end: run a real script through the JIT trampoline and confirm
         // the result matches the interpreter exactly. The JIT runs native code

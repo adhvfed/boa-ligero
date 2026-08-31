@@ -114,8 +114,9 @@ use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
     pure_reader::{
-        PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PureMethodLoopPlan,
-        PurePropertyWriteLoopPlan, PureReaderLoopPlan, PureReceiverAffineStepPlan,
+        PureAffineLoopPlan, PureFunctionPlan, PureGlobalAffineLoopPlan, PureGlobalAffineStepPlan,
+        PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan, PureReaderLoopPlan,
+        PureReceiverAffineStepPlan,
     },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
@@ -526,6 +527,12 @@ impl CodeBlock {
         self.pure_function_plan()?.receiver_affine_step()
     }
 
+    /// Return a cached proof that this no-argument function advances one own
+    /// global-object data slot by a constant i32 offset.
+    pub(crate) fn pure_global_affine_step(&self) -> Option<PureGlobalAffineStepPlan> {
+        self.pure_function_plan()?.global_affine_step()
+    }
+
     /// Return the statically cached pure-reader loop whose maintenance opcode
     /// just advanced to `next_pc`.
     #[inline]
@@ -541,7 +548,8 @@ impl CodeBlock {
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
-                | PureLoopPlan::Method(_) => None,
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
             })
     }
 
@@ -560,7 +568,8 @@ impl CodeBlock {
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
-                | PureLoopPlan::Method(_) => None,
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
             })
     }
 
@@ -582,7 +591,8 @@ impl CodeBlock {
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
-                | PureLoopPlan::Method(_) => None,
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
             })
     }
 
@@ -601,7 +611,31 @@ impl CodeBlock {
                 PureLoopPlan::Reader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
-                | PureLoopPlan::Method(_) => None,
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
+            })
+    }
+
+    /// Return the cached global-affine call loop whose maintenance opcode just
+    /// advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_global_affine_loop_plan(
+        &self,
+        next_pc: u32,
+    ) -> Option<PureGlobalAffineLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::GlobalAffine(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
             })
     }
 
@@ -636,6 +670,7 @@ impl CodeBlock {
                 PureLoopPlan::Affine(_) => Opcode::PureAffineLoopIteration,
                 PureLoopPlan::PropertyWrite(_) => Opcode::PurePropertyWriteLoopIteration,
                 PureLoopPlan::Method(_) => Opcode::PureMethodLoopIteration,
+                PureLoopPlan::GlobalAffine(_) => Opcode::PureGlobalAffineLoopIteration,
             }
             .encode();
         }
@@ -1254,6 +1289,7 @@ impl CodeBlock {
             | Instruction::PureAffineLoopIteration
             | Instruction::PurePropertyWriteLoopIteration
             | Instruction::PureMethodLoopIteration
+            | Instruction::PureGlobalAffineLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1263,8 +1299,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved10
-            | Instruction::Reserved11
+            Instruction::Reserved11
             | Instruction::Reserved12
             | Instruction::Reserved13
             | Instruction::Reserved14
