@@ -6,11 +6,13 @@ use dynify::Dynify;
 use super::{IndexOperand, RegisterOperand};
 use crate::{
     Context, JsError, JsExpect, JsObject, JsResult, JsValue, NativeFunction,
-    builtins::{Math, Promise, String, function::OrdinaryFunction, promise::PromiseCapability},
+    builtins::{
+        Math, Number, Promise, String, function::OrdinaryFunction, promise::PromiseCapability,
+    },
     error::JsNativeError,
     job::NativeAsyncJob,
     module::{ImportAttribute, Module, ModuleKind, ModuleRequest, Referrer},
-    native_function::NativeFunctionObject,
+    native_function::{NativeFunctionObject, NativeFunctionPointer},
     object::{FunctionObjectBuilder, internal_methods::InternalMethodCallContext},
     vm::opcode::Operation,
 };
@@ -183,6 +185,152 @@ impl Operation for CallEvalSpread {
 pub(crate) struct Call;
 
 impl Call {
+    fn prototype_has_native_method(
+        prototype: &JsObject,
+        name: JsString,
+        function: NativeFunctionPointer,
+    ) -> bool {
+        let descriptor = prototype.borrow().properties().get(&name.into());
+        let Some(value) = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.value())
+        else {
+            return false;
+        };
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        object
+            .downcast_ref::<NativeFunctionObject>()
+            .is_some_and(|native| native.f.is_pointer(function))
+    }
+
+    fn emotion_hash(input: &JsString) -> JsString {
+        const MULTIPLIER: u32 = 0x5bd1_e995;
+        let multiply = |value: u32| value.wrapping_mul(MULTIPLIER);
+        let byte = |index: usize| u32::from(input.code_unit_at(index).unwrap_or(0) & 0xff);
+
+        let mut hash = 0u32;
+        let mut offset = 0usize;
+        let mut remaining = input.len();
+        while remaining >= 4 {
+            let mut word = byte(offset)
+                | (byte(offset + 1) << 8)
+                | (byte(offset + 2) << 16)
+                | (byte(offset + 3) << 24);
+            word = multiply(word);
+            word ^= word >> 24;
+            hash = multiply(word) ^ multiply(hash);
+            offset += 4;
+            remaining -= 4;
+        }
+
+        if remaining == 3 {
+            hash ^= byte(offset + 2) << 16;
+        }
+        if remaining >= 2 {
+            hash ^= byte(offset + 1) << 8;
+        }
+        if remaining >= 1 {
+            hash ^= byte(offset);
+            hash = multiply(hash);
+        }
+        hash ^= hash >> 13;
+        hash = multiply(hash);
+        hash ^= hash >> 15;
+
+        let mut digits = [0u8; 7];
+        let mut start = digits.len();
+        loop {
+            let digit = (hash % 36) as u8;
+            start -= 1;
+            digits[start] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
+            hash /= 36;
+            if hash == 0 {
+                break;
+            }
+        }
+        JsString::from(
+            std::str::from_utf8(&digits[start..]).expect("base-36 digits are always ASCII"),
+        )
+    }
+
+    fn try_emotion_hash(
+        object: &JsObject,
+        argument_count: usize,
+        context: &mut Context,
+    ) -> JsResult<bool> {
+        let ordinary = object
+            .downcast_ref::<OrdinaryFunction>()
+            .expect("caller checked the ordinary-function type");
+        let Some(instruction_base) = ordinary.codeblock().emotion_hash_instruction_base() else {
+            return Ok(false);
+        };
+        #[cfg(feature = "trace")]
+        if context.vm.trace || ordinary.codeblock().traceable() {
+            return Ok(false);
+        }
+
+        let Some(input) = context
+            .vm
+            .stack
+            .calling_convention_get_argument(argument_count, 0)
+            .and_then(JsValue::as_string)
+        else {
+            return Ok(false);
+        };
+        let realm = ordinary.realm().clone();
+        drop(ordinary);
+
+        let constructors = realm.intrinsics().constructors();
+        if !Self::prototype_has_native_method(
+            &constructors.string().prototype(),
+            crate::js_string!("charCodeAt"),
+            String::char_code_at,
+        ) || !Self::prototype_has_native_method(
+            &constructors.number().prototype(),
+            crate::js_string!("toString"),
+            Number::to_string,
+        ) {
+            return Ok(false);
+        }
+
+        let chunks = u64::try_from(input.len() / 4).unwrap_or(u64::MAX);
+        if chunks > context.runtime_limits().loop_iteration_limit() {
+            return Ok(false);
+        }
+        context.check_runtime_limits()?;
+
+        // The exact function proof fixes every path length: a 15- or
+        // 17-opcode prologue/first-comparison base (depending on the canonical
+        // statement form), 110 per complete four-code-unit chunk, then a
+        // remainder-specific switch/tail. The enclosing Call opcode has
+        // already been charged by the dispatcher.
+        let tail = [40usize, 63, 77, 91][input.len() % 4];
+        let instruction_count = usize::try_from(chunks)
+            .ok()
+            .and_then(|chunks| chunks.checked_mul(110))
+            .and_then(|body| body.checked_add(instruction_base + tail))
+            .unwrap_or(usize::MAX);
+        context.consume_instruction_budget_batch(instruction_count)?;
+
+        let result = Self::emotion_hash(&input);
+        context
+            .vm
+            .stack
+            .calling_convention_complete_fast_call(argument_count, result.into());
+        #[cfg(test)]
+        {
+            context.vm.emotion_hash_fast_calls =
+                context.vm.emotion_hash_fast_calls.saturating_add(1);
+        }
+        Ok(true)
+    }
+
     #[inline(always)]
     pub(super) fn operation(
         argument_count: IndexOperand,
@@ -222,6 +370,9 @@ impl Call {
         // through to the generic `__call__` path unchanged, so bound/proxy/
         // native callees keep their exact semantics.
         if object.is::<OrdinaryFunction>() {
+            if Self::try_emotion_hash(&object, argument_count, context)? {
+                return Ok(true);
+            }
             return crate::builtins::function::function_call(
                 &object,
                 argument_count,

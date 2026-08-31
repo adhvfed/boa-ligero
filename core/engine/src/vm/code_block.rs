@@ -557,6 +557,12 @@ impl CodeBlock {
         self.pure_function_plan()?.closure_affine_step()
     }
 
+    /// Return the fixed instruction charge for an exact canonical Emotion hash.
+    pub(crate) fn emotion_hash_instruction_base(&self) -> Option<usize> {
+        self.pure_function_plan()
+            .and_then(PureFunctionPlan::emotion_hash_instruction_base)
+    }
+
     /// Return the statically cached pure-reader loop whose maintenance opcode
     /// just advanced to `next_pc`.
     #[inline]

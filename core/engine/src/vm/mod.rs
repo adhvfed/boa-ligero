@@ -209,6 +209,9 @@ pub struct Vm {
 
     #[cfg(test)]
     pub(crate) native_builtin_fast_calls: u64,
+
+    #[cfg(test)]
+    pub(crate) emotion_hash_fast_calls: u64,
 }
 
 /// The stack holds the [`JsValue`]s for the calling convention and registers.
@@ -655,6 +658,8 @@ impl Vm {
             pure_numeric_loop_cache_hits: 0,
             #[cfg(test)]
             native_builtin_fast_calls: 0,
+            #[cfg(test)]
+            emotion_hash_fast_calls: 0,
         }
     }
 
@@ -1087,6 +1092,22 @@ impl Context {
                 return Err(crate::error::EngineError::NoInstructionsRemain);
             }
             *remaining -= 1;
+        }
+        Ok(())
+    }
+
+    /// Charge a statically proven bytecode range in one operation.
+    #[inline]
+    pub(crate) fn consume_instruction_budget_batch(
+        &mut self,
+        count: usize,
+    ) -> Result<(), crate::error::EngineError> {
+        if let Some(remaining) = &mut self.instruction_budget_remaining {
+            if *remaining < count {
+                *remaining = 0;
+                return Err(crate::error::EngineError::NoInstructionsRemain);
+            }
+            *remaining -= count;
         }
         Ok(())
     }

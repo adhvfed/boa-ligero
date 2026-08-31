@@ -3,13 +3,38 @@ use crate::vm::CallFrame;
 use crate::vm::call_frame::CallFrameLocation;
 use crate::vm::source_info::SourcePath;
 use crate::{
-    Context, JsNativeErrorKind, JsValue, NativeFunction, TestAction, js_string,
-    property::Attribute, run_test_actions, run_test_actions_with,
+    Context, JsNativeErrorKind, JsValue, NativeFunction, TestAction,
+    builtins::function::OrdinaryFunction, js_string, property::Attribute, run_test_actions,
+    run_test_actions_with,
 };
 use boa_ast::Position;
 use boa_macros::js_str;
 use boa_parser::Source;
 use indoc::indoc;
+
+const EMOTION_HASH_SOURCE: &str = r#"function emotionHash(e){for(var t,r=0,n=0,i=e.length;i>=4;++n,i-=4)t=(65535&(t=255&e.charCodeAt(n)|(255&e.charCodeAt(++n))<<8|(255&e.charCodeAt(++n))<<16|(255&e.charCodeAt(++n))<<24))*1540483477+((t>>>16)*59797<<16),t^=t>>>24,r=(65535&t)*1540483477+((t>>>16)*59797<<16)^(65535&r)*1540483477+((r>>>16)*59797<<16);switch(i){case 3:r^=(255&e.charCodeAt(n+2))<<16;case 2:r^=(255&e.charCodeAt(n+1))<<8;case 1:r^=255&e.charCodeAt(n),r=(65535&r)*1540483477+((r>>>16)*59797<<16)}return r^=r>>>13,r=(65535&r)*1540483477+((r>>>16)*59797<<16),((r^r>>>15)>>>0).toString(36)}"#;
+
+const EMOTION_HASH_BLOCK_SOURCE: &str = r#"function emotionHash(e) {
+  for (var t, r = 0, n = 0, i = e.length; i >= 4; ++n, i -= 4) {
+    t = (65535 & (t = 255 & e.charCodeAt(n) |
+      (255 & e.charCodeAt(++n)) << 8 |
+      (255 & e.charCodeAt(++n)) << 16 |
+      (255 & e.charCodeAt(++n)) << 24)) * 0x5bd1e995 + ((t >>> 16) * 59797 << 16);
+    t ^= t >>> 24;
+    r = (65535 & t) * 0x5bd1e995 + ((t >>> 16) * 59797 << 16) ^
+      (65535 & r) * 0x5bd1e995 + ((r >>> 16) * 59797 << 16);
+  }
+  switch (i) {
+    case 3: r ^= (255 & e.charCodeAt(n + 2)) << 16;
+    case 2: r ^= (255 & e.charCodeAt(n + 1)) << 8;
+    case 1:
+      r ^= 255 & e.charCodeAt(n);
+      r = (65535 & r) * 0x5bd1e995 + ((r >>> 16) * 59797 << 16);
+  }
+  r ^= r >>> 13;
+  r = (65535 & r) * 0x5bd1e995 + ((r >>> 16) * 59797 << 16);
+  return ((r ^ r >>> 15) >>> 0).toString(36);
+}"#;
 
 #[test]
 fn typeof_string() {
@@ -82,6 +107,114 @@ fn native_builtin_fast_paths_fall_back_for_javascript_coercions() {
         .expect("coercing built-in calls must evaluate through the generic path");
     assert_eq!(result, js_string!("[90,null,-42]").into());
     assert_eq!(context.vm.native_builtin_fast_calls, 0);
+}
+
+#[test]
+fn canonical_emotion_hash_uses_exact_guarded_call_summary() {
+    let call = r#"JSON.stringify([emotionHash(""),emotionHash("a"),emotionHash("abcd"),emotionHash("abcdefg"),emotionHash("😀 style")])"#;
+
+    let mut summarized = Context::default();
+    summarized
+        .eval(Source::from_bytes(EMOTION_HASH_SOURCE))
+        .expect("define canonical hash");
+    let summarized_result = summarized
+        .eval(Source::from_bytes(call))
+        .expect("summarize canonical hashes");
+    assert_eq!(summarized.vm.emotion_hash_fast_calls, 5);
+
+    let mut interpreted = Context::default();
+    interpreted
+        .eval(Source::from_bytes(EMOTION_HASH_SOURCE))
+        .expect("define interpreted hash");
+    interpreted
+        .eval(Source::from_bytes(
+            "const originalCharCodeAt = String.prototype.charCodeAt; \
+             String.prototype.charCodeAt = function (index) { \
+                 return originalCharCodeAt.call(this, index); \
+             };",
+        ))
+        .expect("install equivalent wrapper");
+    let interpreted_result = interpreted
+        .eval(Source::from_bytes(call))
+        .expect("interpret wrapped hashes");
+    assert_eq!(interpreted.vm.emotion_hash_fast_calls, 0);
+    assert_eq!(summarized_result, interpreted_result);
+}
+
+#[test]
+fn emotion_hash_summary_honors_builtin_replacements_and_runtime_limits() {
+    let mut patched = Context::default();
+    patched
+        .eval(Source::from_bytes(EMOTION_HASH_SOURCE))
+        .expect("define canonical hash");
+    let result = patched
+        .eval(Source::from_bytes(
+            "Number.prototype.toString = function () { return 'patched'; }; \
+             emotionHash('abcd')",
+        ))
+        .expect("patched toString must execute");
+    assert_eq!(result, js_string!("patched").into());
+    assert_eq!(patched.vm.emotion_hash_fast_calls, 0);
+
+    let mut limited = Context::default();
+    limited
+        .eval(Source::from_bytes(EMOTION_HASH_SOURCE))
+        .expect("define canonical hash");
+    limited.runtime_limits_mut().set_loop_iteration_limit(1);
+    let error = limited
+        .eval(Source::from_bytes("emotionHash('abcdefgh')"))
+        .expect_err("the ordinary loop path must enforce its per-frame limit");
+    assert_eq!(
+        error.as_engine(),
+        Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+    );
+    assert_eq!(limited.vm.emotion_hash_fast_calls, 0);
+}
+
+#[test]
+fn emotion_hash_summary_preserves_exact_instruction_accounting() {
+    for source in [EMOTION_HASH_SOURCE, EMOTION_HASH_BLOCK_SOURCE] {
+        let mut summarized = Context::default();
+        summarized
+            .eval(Source::from_bytes(source))
+            .expect("define summarized hash");
+        summarized.set_instruction_budget(100_000);
+        let summarized_result = summarized
+            .eval(Source::from_bytes("emotionHash('abcdefghijk')"))
+            .expect("summarized hash must fit");
+        let summarized_remaining = summarized.instruction_budget_remaining();
+        assert_eq!(summarized.vm.emotion_hash_fast_calls, 1);
+
+        let mut interpreted = Context::default();
+        interpreted
+            .eval(Source::from_bytes(source))
+            .expect("define interpreted hash");
+        let global = interpreted.global_object();
+        let function = global
+            .get(js_string!("emotionHash"), &mut interpreted)
+            .expect("read interpreted hash");
+        let object = function
+            .as_object()
+            .expect("hash must be a function object");
+        let ordinary = object
+            .downcast_ref::<OrdinaryFunction>()
+            .expect("hash must be ordinary");
+        ordinary
+            .codeblock()
+            .pure_function_plan
+            .set(None)
+            .expect("proof cache must be cold before the first call");
+        interpreted.set_instruction_budget(100_000);
+        let interpreted_result = interpreted
+            .eval(Source::from_bytes("emotionHash('abcdefghijk')"))
+            .expect("interpreted hash must fit");
+
+        assert_eq!(summarized_result, interpreted_result);
+        assert_eq!(
+            summarized_remaining,
+            interpreted.instruction_budget_remaining()
+        );
+    }
 }
 
 #[test]
