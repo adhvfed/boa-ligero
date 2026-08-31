@@ -14,6 +14,8 @@ use indoc::indoc;
 
 const EMOTION_HASH_SOURCE: &str = r#"function emotionHash(e){for(var t,r=0,n=0,i=e.length;i>=4;++n,i-=4)t=(65535&(t=255&e.charCodeAt(n)|(255&e.charCodeAt(++n))<<8|(255&e.charCodeAt(++n))<<16|(255&e.charCodeAt(++n))<<24))*1540483477+((t>>>16)*59797<<16),t^=t>>>24,r=(65535&t)*1540483477+((t>>>16)*59797<<16)^(65535&r)*1540483477+((r>>>16)*59797<<16);switch(i){case 3:r^=(255&e.charCodeAt(n+2))<<16;case 2:r^=(255&e.charCodeAt(n+1))<<8;case 1:r^=255&e.charCodeAt(n),r=(65535&r)*1540483477+((r>>>16)*59797<<16)}return r^=r>>>13,r=(65535&r)*1540483477+((r>>>16)*59797<<16),((r^r>>>15)>>>0).toString(36)}"#;
 
+const EMOTION_HASH_PRODUCTION_SOURCE: &str = r#"function n(e){for(var t,r=0,n=0,i=e.length;i>=4;++n,i-=4)t=(65535&(t=255&e.charCodeAt(n)|(255&e.charCodeAt(++n))<<8|(255&e.charCodeAt(++n))<<16|(255&e.charCodeAt(++n))<<24))*0x5bd1e995+((t>>>16)*59797<<16),t^=t>>>24,r=(65535&t)*0x5bd1e995+((t>>>16)*59797<<16)^(65535&r)*0x5bd1e995+((r>>>16)*59797<<16);switch(i){case 3:r^=(255&e.charCodeAt(n+2))<<16;case 2:r^=(255&e.charCodeAt(n+1))<<8;case 1:r^=255&e.charCodeAt(n),r=(65535&r)*0x5bd1e995+((r>>>16)*59797<<16)}return r^=r>>>13,(((r=(65535&r)*0x5bd1e995+((r>>>16)*59797<<16))^r>>>15)>>>0).toString(36)};var emotionHash=n"#;
+
 const EMOTION_HASH_BLOCK_SOURCE: &str = r#"function emotionHash(e) {
   for (var t, r = 0, n = 0, i = e.length; i >= 4; ++n, i -= 4) {
     t = (65535 & (t = 255 & e.charCodeAt(n) |
@@ -173,7 +175,11 @@ fn emotion_hash_summary_honors_builtin_replacements_and_runtime_limits() {
 
 #[test]
 fn emotion_hash_summary_preserves_exact_instruction_accounting() {
-    for source in [EMOTION_HASH_SOURCE, EMOTION_HASH_BLOCK_SOURCE] {
+    for source in [
+        EMOTION_HASH_SOURCE,
+        EMOTION_HASH_BLOCK_SOURCE,
+        EMOTION_HASH_PRODUCTION_SOURCE,
+    ] {
         let mut summarized = Context::default();
         summarized
             .eval(Source::from_bytes(source))
