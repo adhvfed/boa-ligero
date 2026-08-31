@@ -80,3 +80,33 @@ impl Operation for PureAffineLoopIteration {
     const INSTRUCTION: &'static str = "INST - PureAffineLoopIteration";
     const COST: u8 = 3;
 }
+
+/// Loop-maintenance opcode installed on a canonical fixed-property write loop.
+/// A successful guard skips overwritten middle iterations but executes the
+/// final source body normally.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PurePropertyWriteLoopIteration;
+
+impl PurePropertyWriteLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_property_write_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PurePropertyWriteLoopIteration {
+    const NAME: &'static str = "PurePropertyWriteLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PurePropertyWriteLoopIteration";
+    const COST: u8 = 3;
+}

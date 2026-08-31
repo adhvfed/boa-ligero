@@ -113,7 +113,10 @@ impl JitTieringCache {
 use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
-    pure_reader::{PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PureReaderLoopPlan},
+    pure_reader::{
+        PureAffineLoopPlan, PureFunctionPlan, PureLoopPlan, PurePropertyWriteLoopPlan,
+        PureReaderLoopPlan,
+    },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
 
@@ -263,12 +266,12 @@ pub struct CodeBlock {
     #[unsafe_ignore_trace]
     pub(crate) pure_loop_plans: OnceCell<Box<[PureLoopPlan]>>,
 
-    /// Whether this code block has completed an affine range summary. Until a
-    /// candidate succeeds, the native tier may lower its maintenance opcode as
-    /// an ordinary loop iteration; after success, keeping the caller in the
-    /// interpreter preserves the cheaper range summary.
+    /// Whether this code block has completed an interpreter-only range summary.
+    /// Until a candidate succeeds, the native tier may lower its maintenance
+    /// opcode as an ordinary loop iteration; after success, keeping the caller
+    /// in the interpreter preserves the cheaper summary.
     #[unsafe_ignore_trace]
-    pub(crate) pure_affine_loop_observed: Cell<bool>,
+    pub(crate) pure_range_loop_observed: Cell<bool>,
 
     /// Element-access inline caches — one entry per `GetPropertyByValue` /
     /// `GetPropertyByValuePush` / `SetPropertyByValue` site. Monomorphic;
@@ -327,7 +330,7 @@ impl CodeBlock {
             ic: Box::default(),
             pure_function_plan: OnceCell::new(),
             pure_loop_plans: OnceCell::new(),
-            pure_affine_loop_observed: Cell::new(false),
+            pure_range_loop_observed: Cell::new(false),
             element_ic: Box::default(),
             source_info: SourceInfo::new(
                 SourceMap::new(Box::default(), SourcePath::None),
@@ -529,7 +532,9 @@ impl CodeBlock {
                 PureLoopPlan::Reader(plan) if plan.loop_iteration_next_pc() == next_pc => {
                     Some(plan)
                 }
-                PureLoopPlan::Reader(_) | PureLoopPlan::Affine(_) => None,
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_) => None,
             })
     }
 
@@ -545,25 +550,48 @@ impl CodeBlock {
                 PureLoopPlan::Affine(plan) if plan.loop_iteration_next_pc() == next_pc => {
                     Some(plan)
                 }
-                PureLoopPlan::Reader(_) | PureLoopPlan::Affine(_) => None,
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_) => None,
             })
     }
 
-    /// Record that at least one affine loop in this code block passed every
-    /// runtime guard and was reduced as a range.
+    /// Return the cached property-write loop whose maintenance opcode just
+    /// advanced to `next_pc`.
     #[inline]
-    pub(crate) fn mark_pure_affine_loop_observed(&self) {
-        self.pure_affine_loop_observed.set(true);
+    pub(crate) fn pure_property_write_loop_plan(
+        &self,
+        next_pc: u32,
+    ) -> Option<PurePropertyWriteLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::PropertyWrite(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_) => None,
+            })
     }
 
-    /// Whether native admission must retain the interpreter's affine summary.
+    /// Record that at least one interpreter-only loop in this code block passed
+    /// every runtime guard and was reduced as a range.
+    #[inline]
+    pub(crate) fn mark_pure_range_loop_observed(&self) {
+        self.pure_range_loop_observed.set(true);
+    }
+
+    /// Whether native admission must retain an interpreter range summary.
     #[cfg(feature = "jit")]
     #[inline]
-    pub(crate) fn pure_affine_loop_observed(&self) -> bool {
-        self.pure_affine_loop_observed.get()
+    pub(crate) fn pure_range_loop_observed(&self) -> bool {
+        self.pure_range_loop_observed.get()
     }
 
-    /// Parse canonical pure-call loops once and specialize only their zero-width
+    /// Parse canonical pure loops once and specialize only their zero-width
     /// maintenance opcode. All ordinary loops keep the original handler and
     /// therefore incur no runtime probe for this optimization.
     pub(crate) fn initialize_pure_loop_plans(&mut self) {
@@ -578,12 +606,13 @@ impl CodeBlock {
             *opcode = match plan {
                 PureLoopPlan::Reader(_) => Opcode::PureReaderLoopIteration,
                 PureLoopPlan::Affine(_) => Opcode::PureAffineLoopIteration,
+                PureLoopPlan::PropertyWrite(_) => Opcode::PurePropertyWriteLoopIteration,
             }
             .encode();
         }
         self.pure_loop_plans
             .set(plans)
-            .expect("pure-call loop plans must initialize exactly once");
+            .expect("pure loop plans must initialize exactly once");
     }
 
     /// Find exception [`Handler`] in the code block given the current program counter (`pc`).
@@ -1194,6 +1223,7 @@ impl CodeBlock {
             | Instruction::IncrementLoopIteration
             | Instruction::PureReaderLoopIteration
             | Instruction::PureAffineLoopIteration
+            | Instruction::PurePropertyWriteLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1203,8 +1233,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved8
-            | Instruction::Reserved9
+            Instruction::Reserved9
             | Instruction::Reserved10
             | Instruction::Reserved11
             | Instruction::Reserved12

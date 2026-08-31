@@ -3106,7 +3106,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             ic: self.ic.into_boxed_slice(),
             pure_function_plan: std::cell::OnceCell::new(),
             pure_loop_plans: std::cell::OnceCell::new(),
-            pure_affine_loop_observed: Cell::new(false),
+            pure_range_loop_observed: Cell::new(false),
             element_ic: self.element_ic.into_boxed_slice(),
             source_info: SourceInfo::new(
                 SourceMap::new(source_map_entries, self.source_path),

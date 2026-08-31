@@ -631,6 +631,7 @@ fn loop_use_def(
         Instruction::IncrementLoopIteration
         | Instruction::PureReaderLoopIteration
         | Instruction::PureAffineLoopIteration
+        | Instruction::PurePropertyWriteLoopIteration
         | Instruction::Jump { .. } => Ok((Vec::new(), None)),
         _ => Err(LoopPlanRejection::UnsupportedRegionOpcode),
     }
@@ -1523,8 +1524,9 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::SetAccumulator, Instruction::SetAccumulator { .. })
         | (Opcode::CheckReturn, Instruction::CheckReturn)
         | (Opcode::Return, Instruction::Return) => true,
-        (Opcode::PureAffineLoopIteration, Instruction::PureAffineLoopIteration) => {
-            !code.pure_affine_loop_observed()
+        (Opcode::PureAffineLoopIteration, Instruction::PureAffineLoopIteration)
+        | (Opcode::PurePropertyWriteLoopIteration, Instruction::PurePropertyWriteLoopIteration) => {
+            !code.pure_range_loop_observed()
         }
         _ => false,
     }
@@ -3562,7 +3564,8 @@ impl<'a> NativeCompiler<'a> {
             }
             Instruction::IncrementLoopIteration
             | Instruction::PureReaderLoopIteration
-            | Instruction::PureAffineLoopIteration => {
+            | Instruction::PureAffineLoopIteration
+            | Instruction::PurePropertyWriteLoopIteration => {
                 if !self.options.accounting.loop_iterations {
                     return true;
                 }
@@ -3892,6 +3895,7 @@ impl<'a> NativeCompiler<'a> {
             Instruction::IncrementLoopIteration
                 | Instruction::PureReaderLoopIteration
                 | Instruction::PureAffineLoopIteration
+                | Instruction::PurePropertyWriteLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4220,6 +4224,7 @@ impl<'a> NativeCompiler<'a> {
             Instruction::IncrementLoopIteration
                 | Instruction::PureReaderLoopIteration
                 | Instruction::PureAffineLoopIteration
+                | Instruction::PurePropertyWriteLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4506,6 +4511,7 @@ impl<'a> NativeCompiler<'a> {
             Instruction::IncrementLoopIteration
                 | Instruction::PureReaderLoopIteration
                 | Instruction::PureAffineLoopIteration
+                | Instruction::PurePropertyWriteLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4848,6 +4854,7 @@ impl<'a> NativeCompiler<'a> {
             Instruction::IncrementLoopIteration
                 | Instruction::PureReaderLoopIteration
                 | Instruction::PureAffineLoopIteration
+                | Instruction::PurePropertyWriteLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -5910,7 +5917,8 @@ impl<'a> LoopRegionCompiler<'a> {
             )?,
             Instruction::IncrementLoopIteration
             | Instruction::PureReaderLoopIteration
-            | Instruction::PureAffineLoopIteration => {
+            | Instruction::PureAffineLoopIteration
+            | Instruction::PurePropertyWriteLoopIteration => {
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);

@@ -20,6 +20,7 @@ const MAX_PURE_READER_REGISTERS: u32 = 128;
 const MAX_PURE_READER_LOOP_CODE: usize = 512;
 const MAX_PURE_READER_LOOPS: usize = 8;
 const MAX_PURE_READER_CONTINUATION: usize = 16;
+const MAX_PURE_PROPERTY_WRITES: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum PureReaderNode {
@@ -98,12 +99,30 @@ pub(crate) struct PureAffineLoopPlan {
     accumulator: usize,
 }
 
+/// A canonical loop that writes affine index values to a fixed set of own
+/// data properties. The final source iteration is retained, so the plan only
+/// skips writes whose values are guaranteed to be overwritten before exit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PurePropertyWriteLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    body_start_pc: u32,
+    object_binding_index: u32,
+    object_ic_index: Option<u32>,
+    property_ic_indices: [u32; MAX_PURE_PROPERTY_WRITES],
+    property_count: u8,
+    guard_bit: u8,
+    index: usize,
+    limit: usize,
+}
+
 /// A statically proven loop shape. Reader and affine candidates use distinct
 /// specialized opcodes because their runtime guards and tiering policy differ.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PureLoopPlan {
     Reader(PureReaderLoopPlan),
     Affine(PureAffineLoopPlan),
+    PropertyWrite(PurePropertyWriteLoopPlan),
 }
 
 impl PureFunctionPlan {
@@ -488,6 +507,12 @@ impl PureLoopPlan {
                 PureAffineLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
                 plans.push(Self::Affine(plan));
+            } else if let Some(plan) =
+                PurePropertyWriteLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::PropertyWrite(
+                    plan.with_guard_bit(1_u8 << plans.len()),
+                ));
             }
         }
         plans.into_boxed_slice()
@@ -1082,7 +1107,7 @@ impl PureAffineLoopPlan {
         context.vm.set_register(self.accumulator, reduced.into());
         context.vm.set_register(self.index, limit.into());
         context.vm.frame_mut().pc = self.exit_pc;
-        caller_code.mark_pure_affine_loop_observed();
+        caller_code.mark_pure_range_loop_observed();
         #[cfg(test)]
         {
             context.vm.pure_affine_loop_reductions =
@@ -1104,11 +1129,333 @@ impl PureAffineLoopPlan {
     }
 }
 
+impl PurePropertyWriteLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+        let body_start_index = loop_iteration_index.checked_add(3)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+
+        let increment = instructions.get(increment_index)?;
+        let Instruction::Inc { src, dst } = &increment.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+        let body_start_pc = instructions.get(body_start_index)?.pc;
+
+        let binding_read = |instruction_index: usize| {
+            let instruction = &instructions.get(instruction_index)?.instruction;
+            match instruction {
+                Instruction::GetName { dst, binding_index } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })?;
+                    Some((usize::from(*dst), binding_index, None))
+                }
+                Instruction::GetNameGlobal {
+                    dst,
+                    binding_index,
+                    ic_index,
+                } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                    Some((usize::from(*dst), binding_index, Some(u32::from(*ic_index))))
+                }
+                _ => None,
+            }
+        };
+
+        let mut cursor = body_start_index;
+        let mut object_binding = None;
+        let mut object_register = None;
+        let mut property_ic_indices = [u32::MAX; MAX_PURE_PROPERTY_WRITES];
+        let mut property_count = 0usize;
+        let mut temporary_registers = Vec::new();
+
+        let back_edge_index = loop {
+            if let Instruction::Jump { address } = &instructions.get(cursor)?.instruction {
+                if address.as_u32() as usize != loop_iteration.pc || property_count == 0 {
+                    return None;
+                }
+                break cursor;
+            }
+            if property_count == MAX_PURE_PROPERTY_WRITES {
+                return None;
+            }
+
+            let (current_object, binding_index, binding_ic_index) = binding_read(cursor)?;
+            let binding = (binding_index, binding_ic_index);
+            if object_binding.is_some_and(|expected| expected != binding)
+                || object_register.is_some_and(|expected| expected != current_object)
+            {
+                return None;
+            }
+            object_binding = Some(binding);
+            object_register = Some(current_object);
+            temporary_registers.push(current_object);
+            cursor = cursor.checked_add(1)?;
+
+            let (value_register, constant_register) = match &instructions.get(cursor)?.instruction {
+                Instruction::Move { src, dst } if usize::from(*src) == index => {
+                    cursor = cursor.checked_add(1)?;
+                    (usize::from(*dst), None)
+                }
+                Instruction::StoreOne { dst }
+                | Instruction::StoreInt8 { dst, .. }
+                | Instruction::StoreInt16 { dst, .. }
+                | Instruction::StoreInt32 { dst, .. } => {
+                    let constant_register = usize::from(*dst);
+                    let Instruction::Add { dst, lhs, rhs } =
+                        &instructions.get(cursor.checked_add(1)?)?.instruction
+                    else {
+                        return None;
+                    };
+                    let lhs = usize::from(*lhs);
+                    let rhs = usize::from(*rhs);
+                    if !((lhs == index && rhs == constant_register)
+                        || (rhs == index && lhs == constant_register))
+                    {
+                        return None;
+                    }
+                    cursor = cursor.checked_add(2)?;
+                    (usize::from(*dst), Some(constant_register))
+                }
+                _ => return None,
+            };
+
+            let Instruction::SetPropertyByName {
+                value,
+                object,
+                ic_index,
+            } = &instructions.get(cursor)?.instruction
+            else {
+                return None;
+            };
+            if usize::from(*value) != value_register || usize::from(*object) != current_object {
+                return None;
+            }
+            property_ic_indices[property_count] = u32::from(*ic_index);
+            property_count = property_count.checked_add(1)?;
+            temporary_registers.push(value_register);
+            if let Some(constant_register) = constant_register {
+                temporary_registers.push(constant_register);
+            }
+            cursor = cursor.checked_add(1)?;
+        };
+
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start_pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        if index == limit
+            || temporary_registers
+                .iter()
+                .any(|register| *register == index || *register == limit)
+            || temporary_registers
+                .iter()
+                .any(|register| *register >= code.register_count as usize)
+        {
+            return None;
+        }
+        let (object_binding_index, object_ic_index) = object_binding?;
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            body_start_pc: u32::try_from(body_start_pc).ok()?,
+            object_binding_index,
+            object_ic_index,
+            property_ic_indices,
+            property_count: u8::try_from(property_count).ok()?,
+            guard_bit: 0,
+            index,
+            limit,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.vm.frame().pure_loop_guard_misses & self.guard_bit != 0 {
+            return None;
+        }
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let index = context.vm.get_register(self.index).as_i32()?;
+        let limit = context.vm.get_register(self.limit).as_i32()?;
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 1 {
+            return None;
+        }
+
+        let object = binding_data_value(
+            caller_code,
+            self.object_binding_index,
+            self.object_ic_index,
+            context,
+        )?;
+        let Some(object) = object.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        if !object.is_ordinary() {
+            return self.suppress_for_frame(context);
+        }
+        let mut stable_guard_miss = false;
+        {
+            let object = object.borrow();
+            let shape = object.shape();
+            for ic_index in &self.property_ic_indices[..usize::from(self.property_count)] {
+                let ic = caller_code.ic.get(*ic_index as usize)?;
+                let slot = ic.get(shape)?;
+                if slot.attributes.is_accessor_descriptor()
+                    || slot.attributes.contains(SlotAttributes::PROTOTYPE)
+                    || !slot.attributes.contains(SlotAttributes::WRITABLE)
+                    || object
+                        .properties()
+                        .storage
+                        .get(slot.index as usize)
+                        .is_none()
+                {
+                    stable_guard_miss = true;
+                    break;
+                }
+            }
+        }
+        if stable_guard_miss {
+            return self.suppress_for_frame(context);
+        }
+
+        context
+            .consume_loop_iterations(u64::try_from(remaining).ok()?)
+            .ok()?;
+        context
+            .vm
+            .set_register(self.index, limit.checked_sub(1)?.into());
+        context.vm.frame_mut().pc = self.body_start_pc;
+        caller_code.mark_pure_range_loop_observed();
+        #[cfg(test)]
+        {
+            let skipped_iterations = u64::try_from(remaining.checked_sub(1)?).ok()?;
+            context.vm.pure_property_write_loop_reductions = context
+                .vm
+                .pure_property_write_loop_reductions
+                .saturating_add(1);
+            context.vm.pure_property_write_loop_iterations_elided = context
+                .vm
+                .pure_property_write_loop_iterations_elided
+                .saturating_add(skipped_iterations);
+            context.vm.pure_property_write_loop_writes_elided = context
+                .vm
+                .pure_property_write_loop_writes_elided
+                .saturating_add(skipped_iterations.saturating_mul(u64::from(self.property_count)));
+        }
+        Some(())
+    }
+
+    fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
+        context.vm.frame_mut().pure_loop_guard_misses |= self.guard_bit;
+        None
+    }
+
+    const fn with_guard_bit(mut self, guard_bit: u8) -> Self {
+        self.guard_bit = guard_bit;
+        self
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
+    }
+}
+
 impl PureLoopPlan {
     pub(crate) const fn loop_iteration_pc(self) -> u32 {
         match self {
             Self::Reader(plan) => plan.loop_iteration_pc(),
             Self::Affine(plan) => plan.loop_iteration_pc(),
+            Self::PropertyWrite(plan) => plan.loop_iteration_pc(),
         }
     }
 }
@@ -1253,6 +1600,142 @@ mod tests {
         Context, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
     };
+
+    #[test]
+    fn canonical_property_write_loop_keeps_only_the_final_overwrite() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 10;\n\
+                 const target = { x: 0, y: 0, z: 0 };\n\
+                 function main() {\n\
+                     for (let i = 0; i < N; i++) {\n\
+                         target.x = i;\n\
+                         target.y = i + 1;\n\
+                         target.z = i + 2;\n\
+                     }\n\
+                     return target.x + target.y + target.z;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical property-write loop must succeed");
+
+        assert_eq!(result, JsValue::new(30));
+        assert_eq!(context.vm.pure_property_write_loop_reductions, 1);
+        assert_eq!(context.vm.pure_property_write_loop_iterations_elided, 8);
+        assert_eq!(context.vm.pure_property_write_loop_writes_elided, 24);
+    }
+
+    #[test]
+    fn property_write_loop_revalidates_rebound_targets_and_accessors() {
+        let mut context = Context::default();
+        context
+            .eval(Source::from_bytes(
+                "const N = 10;\n\
+                 let target = { x: 0, y: 0, z: 0 };\n\
+                 const plain = target;\n\
+                 function run() {\n\
+                     for (let i = 0; i < N; i++) {\n\
+                         target.x = i;\n\
+                         target.y = i + 1;\n\
+                         target.z = i + 2;\n\
+                     }\n\
+                     return 1;\n\
+                 }",
+            ))
+            .expect("definitions must succeed");
+
+        assert_eq!(
+            context.eval(Source::from_bytes("run()")),
+            Ok(JsValue::new(1))
+        );
+        assert_eq!(context.vm.pure_property_write_loop_reductions, 1);
+
+        assert_eq!(
+            context
+                .eval(Source::from_bytes(
+                    "let writes = 0;\n\
+                     target = {\n\
+                         set x(value) { writes++; },\n\
+                         set y(value) { writes++; },\n\
+                         set z(value) { writes++; }\n\
+                     };\n\
+                     run();\n\
+                     writes;",
+                ))
+                .expect("accessor target must execute every write"),
+            JsValue::new(30)
+        );
+        assert_eq!(context.vm.pure_property_write_loop_reductions, 1);
+
+        assert_eq!(
+            context.eval(Source::from_bytes("target = plain; run()")),
+            Ok(JsValue::new(1))
+        );
+        assert_eq!(context.vm.pure_property_write_loop_reductions, 2);
+    }
+
+    #[test]
+    fn property_write_shortcuts_preserve_effects_and_finite_accounting() {
+        let definition = "const N = 10;\n\
+            const target = { x: 0, y: 0, z: 0 };\n\
+            function main() {\n\
+                for (let i = 0; i < N; i++) {\n\
+                    target.x = i;\n\
+                    target.y = i + 1;\n\
+                    target.z = i + 2;\n\
+                }\n\
+                return target.x + target.y + target.z;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget case definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        assert_eq!(
+            budgeted.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(30))
+        );
+        assert_eq!(budgeted.vm.pure_property_write_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit case definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(3);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must execute every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_property_write_loop_reductions, 0);
+
+        let mut effectful = Context::default();
+        let result = effectful
+            .eval(Source::from_bytes(
+                "const N = 10;\n\
+                 const target = { x: 0, y: 0, z: 0 };\n\
+                 let effects = 0;\n\
+                 function main() {\n\
+                     for (let i = 0; i < N; i++) {\n\
+                         target.x = i;\n\
+                         target.y = i + 1;\n\
+                         target.z = i + 2;\n\
+                         effects++;\n\
+                     }\n\
+                     return effects;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("near-match loop must execute its effect");
+        assert_eq!(result, JsValue::new(10));
+        assert_eq!(effectful.vm.pure_property_write_loop_reductions, 0);
+    }
 
     #[test]
     fn canonical_affine_call_loop_reduces_after_one_feedback_iteration() {

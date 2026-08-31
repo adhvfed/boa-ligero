@@ -2292,8 +2292,8 @@ generate_opcodes! {
     PureReaderLoopIteration,
     /// Execute loop maintenance with a cached pure-affine range proof.
     PureAffineLoopIteration,
-    /// Reserved [`Opcode`].
-    Reserved8 => Reserved,
+    /// Execute loop maintenance with a cached property-write range proof.
+    PurePropertyWriteLoopIteration,
     /// Reserved [`Opcode`].
     Reserved9 => Reserved,
     /// Reserved [`Opcode`].

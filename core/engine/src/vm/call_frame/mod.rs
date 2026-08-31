@@ -102,6 +102,10 @@ pub struct CallFrame {
     /// How many iterations a loop has done.
     pub(crate) loop_iteration_count: u64,
 
+    /// Interpreter range-summary guards suppressed for this invocation after
+    /// a stable miss such as an accessor or exotic target.
+    pub(crate) pure_loop_guard_misses: u8,
+
     /// `[[ScriptOrModule]]`
     pub(crate) active_runnable: Option<ActiveRunnable>,
 
@@ -186,6 +190,7 @@ impl CallFrame {
             disposable_resources: DisposableResourceStack::default(),
             code_block,
             loop_iteration_count: 0,
+            pure_loop_guard_misses: 0,
             active_runnable,
             environments,
             realm,

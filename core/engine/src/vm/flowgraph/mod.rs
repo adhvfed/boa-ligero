@@ -328,6 +328,7 @@ impl CodeBlock {
                 | Instruction::IncrementLoopIteration
                 | Instruction::PureReaderLoopIteration
                 | Instruction::PureAffineLoopIteration
+                | Instruction::PurePropertyWriteLoopIteration
                 | Instruction::CreateForInIterator { .. }
                 | Instruction::GetIterator { .. }
                 | Instruction::GetAsyncIterator { .. }
@@ -385,8 +386,7 @@ impl CodeBlock {
                 Instruction::Return => {
                     graph.add_node(previous_pc, NodeShape::Diamond, label.into(), Color::Red);
                 }
-                Instruction::Reserved8
-                | Instruction::Reserved9
+                Instruction::Reserved9
                 | Instruction::Reserved10
                 | Instruction::Reserved11
                 | Instruction::Reserved12

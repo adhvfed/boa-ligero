@@ -4633,13 +4633,46 @@ mod tests {
             "an unproven affine candidate must retain ordinary native lowering"
         );
 
-        code.mark_pure_affine_loop_observed();
+        code.mark_pure_range_loop_observed();
         let rejection = native::admission_profile(&code, false)
             .expect_err("native lowering must not discard an observed affine range summary");
         assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
         assert_eq!(
             rejection.first_blocking_opcode,
             Some(Opcode::PureAffineLoopIteration)
+        );
+    }
+
+    #[test]
+    fn native_admission_preserves_observed_property_write_summaries_without_penalizing_misses() {
+        let code = first_function_code(
+            "function main() {\n\
+                 for (let index = 0; index < 100; index++) {\n\
+                     target.x = index;\n\
+                     target.y = index + 1;\n\
+                 }\n\
+                 return target.x + target.y;\n\
+             }\n\
+             const target = { x: 0, y: 0 };",
+        );
+        assert!(
+            InstructionIterator::new(&code.bytecode).any(|(_, _, instruction)| {
+                matches!(instruction, Instruction::PurePropertyWriteLoopIteration)
+            }),
+            "the bytecompiler must mark the property-write candidate before JIT admission"
+        );
+        assert!(
+            native::admission_profile(&code, false).is_ok(),
+            "an unproven property-write candidate must retain ordinary native lowering"
+        );
+
+        code.mark_pure_range_loop_observed();
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("native lowering must not discard an observed property-write summary");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(
+            rejection.first_blocking_opcode,
+            Some(Opcode::PurePropertyWriteLoopIteration)
         );
     }
 
