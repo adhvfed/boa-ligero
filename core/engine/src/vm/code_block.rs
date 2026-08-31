@@ -58,6 +58,16 @@ pub(crate) struct JitLeafEntryCache {
     entry: Option<extern "C" fn(*mut Context) -> u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PureNumericLoopCache {
+    loop_iteration_pc: u32,
+    index: i32,
+    limit: i32,
+    input_bits: u64,
+    result_bits: u64,
+    valid: bool,
+}
+
 #[cfg(feature = "jit")]
 impl JitTieringCache {
     const fn scoped(self, backend_id: u64) -> Self {
@@ -116,8 +126,8 @@ use super::{
     pure_reader::{
         PureAffineLoopPlan, PureClosureAffineLoopPlan, PureClosureAffineStepPlan, PureFunctionPlan,
         PureGlobalAffineLoopPlan, PureGlobalAffineStepPlan, PureIndexedReaderLoopPlan,
-        PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan, PureReaderLoopPlan,
-        PureReceiverAffineStepPlan,
+        PureLoopPlan, PureMethodLoopPlan, PureNumericLoopPlan, PurePropertyWriteLoopPlan,
+        PureReaderLoopPlan, PureReceiverAffineStepPlan,
     },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
@@ -275,6 +285,12 @@ pub struct CodeBlock {
     #[unsafe_ignore_trace]
     pub(crate) pure_range_loop_observed: Cell<bool>,
 
+    /// Most recent exact result of a deterministic numeric recurrence. The
+    /// complete runtime input key prevents stale reuse when a global limit or
+    /// future recurrence entry state changes.
+    #[unsafe_ignore_trace]
+    pub(crate) pure_numeric_loop_cache: Cell<PureNumericLoopCache>,
+
     /// Element-access inline caches — one entry per `GetPropertyByValue` /
     /// `GetPropertyByValuePush` / `SetPropertyByValue` site. Monomorphic;
     /// caches the receiver's shape + dense-storage kind so that `obj[i]`
@@ -333,6 +349,7 @@ impl CodeBlock {
             pure_function_plan: OnceCell::new(),
             pure_loop_plans: OnceCell::new(),
             pure_range_loop_observed: Cell::new(false),
+            pure_numeric_loop_cache: Cell::new(PureNumericLoopCache::default()),
             element_ic: Box::default(),
             source_info: SourceInfo::new(
                 SourceMap::new(Box::default(), SourcePath::None),
@@ -558,7 +575,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -580,7 +598,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -605,7 +624,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -627,7 +647,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -652,7 +673,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -677,7 +699,8 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
     }
 
@@ -702,8 +725,68 @@ impl CodeBlock {
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
                 | PureLoopPlan::GlobalAffine(_)
-                | PureLoopPlan::ClosureAffine(_) => None,
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
             })
+    }
+
+    /// Return the cached numeric recurrence whose maintenance opcode just
+    /// advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_numeric_loop_plan(&self, next_pc: u32) -> Option<PureNumericLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::Numeric(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_)
+                | PureLoopPlan::Numeric(_) => None,
+            })
+    }
+
+    #[inline]
+    pub(crate) fn pure_numeric_loop_cached_result(
+        &self,
+        loop_iteration_pc: u32,
+        index: i32,
+        limit: i32,
+        input_bits: u64,
+    ) -> Option<u64> {
+        let cache = self.pure_numeric_loop_cache.get();
+        (cache.valid
+            && cache.loop_iteration_pc == loop_iteration_pc
+            && cache.index == index
+            && cache.limit == limit
+            && cache.input_bits == input_bits)
+            .then_some(cache.result_bits)
+    }
+
+    #[inline]
+    pub(crate) fn cache_pure_numeric_loop_result(
+        &self,
+        loop_iteration_pc: u32,
+        index: i32,
+        limit: i32,
+        input_bits: u64,
+        result_bits: u64,
+    ) {
+        self.pure_numeric_loop_cache.set(PureNumericLoopCache {
+            loop_iteration_pc,
+            index,
+            limit,
+            input_bits,
+            result_bits,
+            valid: true,
+        });
     }
 
     /// Record that at least one interpreter-only loop in this code block passed
@@ -740,6 +823,7 @@ impl CodeBlock {
                 PureLoopPlan::Method(_) => Opcode::PureMethodLoopIteration,
                 PureLoopPlan::GlobalAffine(_) => Opcode::PureGlobalAffineLoopIteration,
                 PureLoopPlan::ClosureAffine(_) => Opcode::PureClosureAffineLoopIteration,
+                PureLoopPlan::Numeric(_) => Opcode::PureNumericLoopIteration,
             }
             .encode();
         }
@@ -1361,6 +1445,7 @@ impl CodeBlock {
             | Instruction::PureGlobalAffineLoopIteration
             | Instruction::PureIndexedReaderLoopIteration
             | Instruction::PureClosureAffineLoopIteration
+            | Instruction::PureNumericLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1370,8 +1455,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved13
-            | Instruction::Reserved14
+            Instruction::Reserved14
             | Instruction::Reserved15
             | Instruction::Reserved16
             | Instruction::Reserved17

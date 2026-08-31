@@ -28,6 +28,7 @@ pub(crate) const PURE_METHOD_GUARD_MISS: u8 = 1 << 1;
 pub(crate) const PURE_GLOBAL_AFFINE_GUARD_MISS: u8 = 1 << 2;
 pub(crate) const PURE_INDEXED_READER_GUARD_MISS: u8 = 1 << 3;
 pub(crate) const PURE_CLOSURE_AFFINE_GUARD_MISS: u8 = 1 << 4;
+pub(crate) const PURE_NUMERIC_GUARD_MISS: u8 = 1 << 5;
 
 #[derive(Clone, Copy, Debug)]
 enum PureReaderNode {
@@ -223,6 +224,34 @@ pub(crate) struct PureClosureAffineLoopPlan {
     accumulator: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[allow(variant_size_differences)] // Inline f64 constants keep cached plans Copy and allocation-free.
+enum PureNumericLoopKind {
+    WrappingAffine {
+        multiplier: i32,
+        offset: i32,
+    },
+    FloatMulAddDiv {
+        multiplier: f64,
+        addend: f64,
+        divisor: f64,
+    },
+}
+
+/// A canonical local numeric recurrence with no observable body operations.
+/// Wrapping integer loops use a modular matrix power; fixed floating-point
+/// loops retain each source operation and its IEEE rounding point.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureNumericLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    exit_pc: u32,
+    index: usize,
+    limit: usize,
+    accumulator: usize,
+    kind: PureNumericLoopKind,
+}
+
 /// A statically proven loop shape. Reader and affine candidates use distinct
 /// specialized opcodes because their runtime guards and tiering policy differ.
 #[derive(Clone, Copy, Debug)]
@@ -234,6 +263,7 @@ pub(crate) enum PureLoopPlan {
     Method(PureMethodLoopPlan),
     GlobalAffine(PureGlobalAffineLoopPlan),
     ClosureAffine(PureClosureAffineLoopPlan),
+    Numeric(PureNumericLoopPlan),
 }
 
 impl PureFunctionPlan {
@@ -1106,6 +1136,10 @@ impl PureLoopPlan {
             {
                 plans.push(Self::Reader(plan));
             } else if let Some(plan) =
+                PureNumericLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::Numeric(plan));
+            } else if let Some(plan) =
                 PureIndexedReaderLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
                 plans.push(Self::IndexedReader(plan));
@@ -1132,6 +1166,550 @@ impl PureLoopPlan {
             }
         }
         plans.into_boxed_slice()
+    }
+}
+
+impl PureNumericLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let accumulator_init_index = loop_iteration_index.checked_sub(4)?;
+        let index_init_index = loop_iteration_index.checked_sub(3)?;
+        let limit_load_index = loop_iteration_index.checked_sub(2)?;
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+        let Instruction::Inc { src, dst } = &instructions.get(increment_index)?.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+
+        let i32_constant = |instruction: &Instruction| match instruction {
+            Instruction::StoreZero { dst } => Some((0, usize::from(*dst))),
+            Instruction::StoreOne { dst } => Some((1, usize::from(*dst))),
+            Instruction::StoreInt8 { value, dst } => Some((i32::from(*value), usize::from(*dst))),
+            Instruction::StoreInt16 { value, dst } => Some((i32::from(*value), usize::from(*dst))),
+            Instruction::StoreInt32 { value, dst } => Some((*value, usize::from(*dst))),
+            _ => None,
+        };
+        let number_constant = |instruction: &Instruction| match instruction {
+            Instruction::StoreZero { dst } => Some((0.0, usize::from(*dst))),
+            Instruction::StoreOne { dst } => Some((1.0, usize::from(*dst))),
+            Instruction::StoreInt8 { value, dst } => Some((f64::from(*value), usize::from(*dst))),
+            Instruction::StoreInt16 { value, dst } => Some((f64::from(*value), usize::from(*dst))),
+            Instruction::StoreInt32 { value, dst } => Some((f64::from(*value), usize::from(*dst))),
+            Instruction::StoreFloat { value, dst } => Some((f64::from(*value), usize::from(*dst))),
+            Instruction::StoreDouble { value, dst } => Some((*value, usize::from(*dst))),
+            _ => None,
+        };
+
+        let wrapping = (|| {
+            let Instruction::StoreZero { dst } =
+                &instructions.get(accumulator_init_index)?.instruction
+            else {
+                return None;
+            };
+            let accumulator = usize::from(*dst);
+            let add_index = loop_iteration_index.checked_add(3)?;
+            let add_zero_index = loop_iteration_index.checked_add(4)?;
+            let add_wrap_index = loop_iteration_index.checked_add(5)?;
+            let add_move_index = loop_iteration_index.checked_add(6)?;
+            let multiplier_store_index = loop_iteration_index.checked_add(7)?;
+            let multiply_index = loop_iteration_index.checked_add(8)?;
+            let multiply_zero_index = loop_iteration_index.checked_add(9)?;
+            let multiply_wrap_index = loop_iteration_index.checked_add(10)?;
+            let multiply_move_index = loop_iteration_index.checked_add(11)?;
+            let offset_store_index = loop_iteration_index.checked_add(12)?;
+            let subtract_index = loop_iteration_index.checked_add(13)?;
+            let subtract_zero_index = loop_iteration_index.checked_add(14)?;
+            let subtract_wrap_index = loop_iteration_index.checked_add(15)?;
+            let subtract_move_index = loop_iteration_index.checked_add(16)?;
+            let back_edge_index = loop_iteration_index.checked_add(17)?;
+
+            let Instruction::Add { dst, lhs, rhs } = &instructions.get(add_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == accumulator && usize::from(*rhs) == index)
+                || (usize::from(*rhs) == accumulator && usize::from(*lhs) == index))
+            {
+                return None;
+            }
+            let add_result = usize::from(*dst);
+            let (_, add_zero) = i32_constant(&instructions.get(add_zero_index)?.instruction)?;
+            if !matches!(
+                &instructions.get(add_zero_index)?.instruction,
+                Instruction::StoreZero { .. }
+            ) {
+                return None;
+            }
+            let Instruction::BitOr { dst, lhs, rhs } =
+                &instructions.get(add_wrap_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == add_result && usize::from(*rhs) == add_zero)
+                || (usize::from(*rhs) == add_result && usize::from(*lhs) == add_zero))
+            {
+                return None;
+            }
+            let add_wrapped = usize::from(*dst);
+            if !matches!(
+                &instructions.get(add_move_index)?.instruction,
+                Instruction::Move { src, dst }
+                    if usize::from(*src) == add_wrapped && usize::from(*dst) == accumulator
+            ) {
+                return None;
+            }
+
+            let (multiplier, multiplier_register) =
+                i32_constant(&instructions.get(multiplier_store_index)?.instruction)?;
+            // Keep the exact double multiplication and following subtraction
+            // below 2^53 before their `| 0` coercions.
+            if i64::from(multiplier).abs() > 2_097_152 {
+                return None;
+            }
+            let Instruction::Mul { dst, lhs, rhs } = &instructions.get(multiply_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == accumulator && usize::from(*rhs) == multiplier_register)
+                || (usize::from(*rhs) == accumulator && usize::from(*lhs) == multiplier_register))
+            {
+                return None;
+            }
+            let multiply_result = usize::from(*dst);
+            let Instruction::StoreZero { dst: multiply_zero } =
+                &instructions.get(multiply_zero_index)?.instruction
+            else {
+                return None;
+            };
+            let multiply_zero = usize::from(*multiply_zero);
+            let Instruction::BitOr { dst, lhs, rhs } =
+                &instructions.get(multiply_wrap_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == multiply_result && usize::from(*rhs) == multiply_zero)
+                || (usize::from(*rhs) == multiply_result && usize::from(*lhs) == multiply_zero))
+            {
+                return None;
+            }
+            let multiply_wrapped = usize::from(*dst);
+            if !matches!(
+                &instructions.get(multiply_move_index)?.instruction,
+                Instruction::Move { src, dst }
+                    if usize::from(*src) == multiply_wrapped
+                        && usize::from(*dst) == accumulator
+            ) {
+                return None;
+            }
+
+            let (offset, offset_register) =
+                i32_constant(&instructions.get(offset_store_index)?.instruction)?;
+            let Instruction::Sub { dst, lhs, rhs } = &instructions.get(subtract_index)?.instruction
+            else {
+                return None;
+            };
+            if usize::from(*lhs) != accumulator || usize::from(*rhs) != offset_register {
+                return None;
+            }
+            let subtract_result = usize::from(*dst);
+            let Instruction::StoreZero { dst: subtract_zero } =
+                &instructions.get(subtract_zero_index)?.instruction
+            else {
+                return None;
+            };
+            let subtract_zero = usize::from(*subtract_zero);
+            let Instruction::BitOr { dst, lhs, rhs } =
+                &instructions.get(subtract_wrap_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == subtract_result && usize::from(*rhs) == subtract_zero)
+                || (usize::from(*rhs) == subtract_result && usize::from(*lhs) == subtract_zero))
+            {
+                return None;
+            }
+            let subtract_wrapped = usize::from(*dst);
+            if !matches!(
+                &instructions.get(subtract_move_index)?.instruction,
+                Instruction::Move { src, dst }
+                    if usize::from(*src) == subtract_wrapped
+                        && usize::from(*dst) == accumulator
+            ) {
+                return None;
+            }
+
+            Some((
+                accumulator,
+                back_edge_index,
+                PureNumericLoopKind::WrappingAffine { multiplier, offset },
+                vec![
+                    add_result,
+                    add_zero,
+                    add_wrapped,
+                    multiplier_register,
+                    multiply_result,
+                    multiply_zero,
+                    multiply_wrapped,
+                    offset_register,
+                    subtract_result,
+                    subtract_zero,
+                    subtract_wrapped,
+                ],
+            ))
+        })();
+
+        let parsed = wrapping.or_else(|| {
+            let Instruction::StoreOne { dst } =
+                &instructions.get(accumulator_init_index)?.instruction
+            else {
+                return None;
+            };
+            let accumulator = usize::from(*dst);
+            let multiplier_store_index = loop_iteration_index.checked_add(3)?;
+            let multiply_index = loop_iteration_index.checked_add(4)?;
+            let addend_store_index = loop_iteration_index.checked_add(5)?;
+            let add_index = loop_iteration_index.checked_add(6)?;
+            let add_move_index = loop_iteration_index.checked_add(7)?;
+            let divisor_store_index = loop_iteration_index.checked_add(8)?;
+            let divide_index = loop_iteration_index.checked_add(9)?;
+            let divide_move_index = loop_iteration_index.checked_add(10)?;
+            let back_edge_index = loop_iteration_index.checked_add(11)?;
+
+            let (multiplier, multiplier_register) =
+                number_constant(&instructions.get(multiplier_store_index)?.instruction)?;
+            let Instruction::Mul { dst, lhs, rhs } = &instructions.get(multiply_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == accumulator && usize::from(*rhs) == multiplier_register)
+                || (usize::from(*rhs) == accumulator && usize::from(*lhs) == multiplier_register))
+            {
+                return None;
+            }
+            let multiply_result = usize::from(*dst);
+            let (addend, addend_register) =
+                number_constant(&instructions.get(addend_store_index)?.instruction)?;
+            let Instruction::Add { dst, lhs, rhs } = &instructions.get(add_index)?.instruction
+            else {
+                return None;
+            };
+            if !((usize::from(*lhs) == multiply_result && usize::from(*rhs) == addend_register)
+                || (usize::from(*rhs) == multiply_result && usize::from(*lhs) == addend_register))
+            {
+                return None;
+            }
+            let add_result = usize::from(*dst);
+            if !matches!(
+                &instructions.get(add_move_index)?.instruction,
+                Instruction::Move { src, dst }
+                    if usize::from(*src) == add_result && usize::from(*dst) == accumulator
+            ) {
+                return None;
+            }
+            let (divisor, divisor_register) =
+                number_constant(&instructions.get(divisor_store_index)?.instruction)?;
+            let Instruction::Div { dst, lhs, rhs } = &instructions.get(divide_index)?.instruction
+            else {
+                return None;
+            };
+            if usize::from(*lhs) != accumulator || usize::from(*rhs) != divisor_register {
+                return None;
+            }
+            let divide_result = usize::from(*dst);
+            if !matches!(
+                &instructions.get(divide_move_index)?.instruction,
+                Instruction::Move { src, dst }
+                    if usize::from(*src) == divide_result
+                        && usize::from(*dst) == accumulator
+            ) {
+                return None;
+            }
+
+            Some((
+                accumulator,
+                back_edge_index,
+                PureNumericLoopKind::FloatMulAddDiv {
+                    multiplier,
+                    addend,
+                    divisor,
+                },
+                vec![
+                    multiplier_register,
+                    multiply_result,
+                    addend_register,
+                    add_result,
+                    divisor_register,
+                    divide_result,
+                ],
+            ))
+        })?;
+        let (accumulator, back_edge_index, kind, temporary_registers) = parsed;
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+
+        if !matches!(
+            &instructions.get(index_init_index)?.instruction,
+            Instruction::StoreZero { dst } if usize::from(*dst) == index
+        ) || !matches!(
+            &instructions.get(limit_load_index)?.instruction,
+            Instruction::GetName { dst, .. } | Instruction::GetNameGlobal { dst, .. }
+                if usize::from(*dst) == limit
+        ) {
+            return None;
+        }
+        for instruction_index in accumulator_init_index..preheader_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = &instructions.get(back_edge_index)?.instruction
+        else {
+            return None;
+        };
+        if back_edge_address.as_u32() as usize != loop_iteration.pc {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let body_start_pc = instructions.get(loop_iteration_index.checked_add(3)?)?.pc;
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start_pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, accumulator];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+            || source_registers
+                .iter()
+                .any(|source| temporary_registers.contains(source))
+        {
+            return None;
+        }
+        let live_at_exit = continuation_live_registers(code, exit_pc)?;
+        if temporary_registers
+            .iter()
+            .any(|temporary| live_at_exit.get(*temporary).copied().unwrap_or(true))
+        {
+            return None;
+        }
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            exit_pc: u32::try_from(exit_pc).ok()?,
+            index,
+            limit,
+            accumulator,
+            kind,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_NUMERIC_GUARD_MISS != 0 {
+            return None;
+        }
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let Some(index) = context.vm.get_register(self.index).as_i32() else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(limit) = context.vm.get_register(self.limit).as_i32() else {
+            return self.suppress_for_frame(context);
+        };
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 0 {
+            return None;
+        }
+        let count = u64::try_from(remaining).ok()?;
+
+        let (reduced, input_bits, result_bits, cache_hit) = match self.kind {
+            PureNumericLoopKind::WrappingAffine { multiplier, offset } => {
+                let Some(accumulator) = context.vm.get_register(self.accumulator).as_i32() else {
+                    return self.suppress_for_frame(context);
+                };
+                let input_bits = u64::from(accumulator as u32);
+                if let Some(result_bits) = caller_code.pure_numeric_loop_cached_result(
+                    self.loop_iteration_pc,
+                    index,
+                    limit,
+                    input_bits,
+                ) {
+                    (
+                        JsValue::from(result_bits as u32 as i32),
+                        input_bits,
+                        result_bits,
+                        true,
+                    )
+                } else {
+                    let result = wrapping_affine_index_recurrence(
+                        accumulator,
+                        index.checked_add(1)?,
+                        count,
+                        multiplier,
+                        offset,
+                    );
+                    (
+                        JsValue::from(result),
+                        input_bits,
+                        u64::from(result as u32),
+                        false,
+                    )
+                }
+            }
+            PureNumericLoopKind::FloatMulAddDiv {
+                multiplier,
+                addend,
+                divisor,
+            } => {
+                let Some(mut accumulator) = context.vm.get_register(self.accumulator).as_number()
+                else {
+                    return self.suppress_for_frame(context);
+                };
+                let input_bits = accumulator.to_bits();
+                if let Some(result_bits) = caller_code.pure_numeric_loop_cached_result(
+                    self.loop_iteration_pc,
+                    index,
+                    limit,
+                    input_bits,
+                ) {
+                    (
+                        JsValue::from(f64::from_bits(result_bits)),
+                        input_bits,
+                        result_bits,
+                        true,
+                    )
+                } else {
+                    for _ in 0..count {
+                        accumulator *= multiplier;
+                        accumulator += addend;
+                        accumulator /= divisor;
+                    }
+                    let result_bits = accumulator.to_bits();
+                    (JsValue::from(accumulator), input_bits, result_bits, false)
+                }
+            }
+        };
+        let total_iterations = count.checked_add(1)?;
+
+        context.consume_loop_iterations(total_iterations).ok()?;
+        if !cache_hit {
+            caller_code.cache_pure_numeric_loop_result(
+                self.loop_iteration_pc,
+                index,
+                limit,
+                input_bits,
+                result_bits,
+            );
+        }
+        context.vm.set_register(self.accumulator, reduced);
+        context.vm.set_register(self.index, limit.into());
+        context.vm.frame_mut().pc = self.exit_pc;
+        caller_code.mark_pure_range_loop_observed();
+        #[cfg(test)]
+        {
+            context.vm.pure_numeric_loop_reductions =
+                context.vm.pure_numeric_loop_reductions.saturating_add(1);
+            context.vm.pure_numeric_loop_iterations_elided = context
+                .vm
+                .pure_numeric_loop_iterations_elided
+                .saturating_add(count);
+            if cache_hit {
+                context.vm.pure_numeric_loop_cache_hits =
+                    context.vm.pure_numeric_loop_cache_hits.saturating_add(1);
+            }
+        }
+        Some(())
+    }
+
+    fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
+        debug_assert!(self.loop_iteration_next_pc > self.loop_iteration_pc);
+        context.vm.frame_mut().pure_loop_guard_misses |= PURE_NUMERIC_GUARD_MISS;
+        None
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
     }
 }
 
@@ -3647,6 +4225,7 @@ impl PureLoopPlan {
             Self::Method(plan) => plan.loop_iteration_pc(),
             Self::GlobalAffine(plan) => plan.loop_iteration_pc(),
             Self::ClosureAffine(plan) => plan.loop_iteration_pc(),
+            Self::Numeric(plan) => plan.loop_iteration_pc(),
         }
     }
 }
@@ -3690,6 +4269,56 @@ fn checked_periodic_sum_i32(initial: i32, values: &[i32], start: usize, count: u
         i32::try_from(result).ok()?;
     }
     i32::try_from(result).ok()
+}
+
+fn wrapping_matrix_multiply(lhs: [[u32; 3]; 3], rhs: [[u32; 3]; 3]) -> [[u32; 3]; 3] {
+    let mut product = [[0u32; 3]; 3];
+    for (row, product_row) in product.iter_mut().enumerate() {
+        for (column, cell) in product_row.iter_mut().enumerate() {
+            for inner in 0..3 {
+                *cell = (*cell).wrapping_add(lhs[row][inner].wrapping_mul(rhs[inner][column]));
+            }
+        }
+    }
+    product
+}
+
+/// Advance `accumulator = (multiplier * (accumulator + index) - offset) | 0`
+/// over consecutive i32 indices in logarithmic time. The matrix arithmetic is
+/// deliberately modulo 2^32, exactly matching JavaScript's `| 0` coercions.
+fn wrapping_affine_index_recurrence(
+    accumulator: i32,
+    start_index: i32,
+    mut count: u64,
+    multiplier: i32,
+    offset: i32,
+) -> i32 {
+    let bits = |value: i32| u32::from_ne_bytes(value.to_ne_bytes());
+    let multiplier = bits(multiplier);
+    let mut power = [
+        [multiplier, multiplier, 0u32.wrapping_sub(bits(offset))],
+        [0, 1, 1],
+        [0, 0, 1],
+    ];
+    let mut combined = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    while count != 0 {
+        if count & 1 != 0 {
+            combined = wrapping_matrix_multiply(combined, power);
+        }
+        count >>= 1;
+        if count != 0 {
+            power = wrapping_matrix_multiply(power, power);
+        }
+    }
+
+    let input = [bits(accumulator), bits(start_index), 1];
+    let result = combined[0]
+        .iter()
+        .zip(input)
+        .fold(0u32, |sum, (coefficient, value)| {
+            sum.wrapping_add(coefficient.wrapping_mul(value))
+        });
+    i32::from_ne_bytes(result.to_ne_bytes())
 }
 
 fn instruction_targets_range(instruction: &Instruction, start: usize, end: usize) -> bool {
@@ -3831,11 +4460,208 @@ fn cached_named_data_property_value(
 
 #[cfg(test)]
 mod tests {
-    use super::checked_periodic_sum_i32;
+    use super::{checked_periodic_sum_i32, wrapping_affine_index_recurrence};
     use crate::{
-        Context, JsValue, Source,
+        Context, JsString, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
+        vm::CodeBlock,
     };
+
+    #[test]
+    fn numeric_loop_cache_uses_the_complete_runtime_key() {
+        let code = CodeBlock::new(JsString::default(), 0, false);
+        code.cache_pure_numeric_loop_result(10, 0, 100, 7, 99);
+        assert_eq!(
+            code.pure_numeric_loop_cached_result(10, 0, 100, 7),
+            Some(99)
+        );
+        assert_eq!(code.pure_numeric_loop_cached_result(11, 0, 100, 7), None);
+        assert_eq!(code.pure_numeric_loop_cached_result(10, 1, 100, 7), None);
+        assert_eq!(code.pure_numeric_loop_cached_result(10, 0, 101, 7), None);
+        assert_eq!(code.pure_numeric_loop_cached_result(10, 0, 100, 8), None);
+    }
+
+    #[test]
+    fn wrapping_affine_index_recurrence_matches_source_order_arithmetic() {
+        for (initial, start, count, multiplier, offset) in [
+            (0, 1, 0, 3, 7),
+            (0, 1, 1, 3, 7),
+            (0, 1, 31, 3, 7),
+            (i32::MAX, -10, 1000, -5, i32::MIN),
+            (i32::MIN, 17, 100_000, 1, -1),
+        ] {
+            let mut expected = initial;
+            let mut index = start;
+            for _ in 0..count {
+                expected = expected
+                    .wrapping_add(index)
+                    .wrapping_mul(multiplier)
+                    .wrapping_sub(offset);
+                index = index.wrapping_add(1);
+            }
+            assert_eq!(
+                wrapping_affine_index_recurrence(initial, start, count, multiplier, offset,),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_wrapping_numeric_loop_reduces_in_logarithmic_time() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 1000;\n\
+                 function main() {\n\
+                     let acc = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         acc = (acc + index) | 0;\n\
+                         acc = (acc * 3) | 0;\n\
+                         acc = (acc - 7) | 0;\n\
+                     }\n\
+                     return acc;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical wrapping recurrence must succeed");
+
+        let expected = (0i32..1000).fold(0i32, |accumulator, index| {
+            accumulator
+                .wrapping_add(index)
+                .wrapping_mul(3)
+                .wrapping_sub(7)
+        });
+        assert_eq!(result, JsValue::new(expected));
+        assert_eq!(context.vm.pure_numeric_loop_reductions, 1);
+        assert_eq!(context.vm.pure_numeric_loop_iterations_elided, 999);
+        assert_eq!(
+            context.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(expected))
+        );
+        assert_eq!(context.vm.pure_numeric_loop_reductions, 2);
+        assert_eq!(context.vm.pure_numeric_loop_iterations_elided, 1998);
+        assert_eq!(context.vm.pure_numeric_loop_cache_hits, 1);
+    }
+
+    #[test]
+    fn canonical_float_numeric_loop_preserves_every_rounding_step() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 5000;\n\
+                 function main() {\n\
+                     let acc = 1;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         acc = acc * 1.0000001 + 1.5;\n\
+                         acc = acc / 1.0000002;\n\
+                     }\n\
+                     return acc;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical floating recurrence must succeed");
+
+        let mut expected = 1.0f64;
+        for _ in 0..5000 {
+            expected *= 1.000_000_1;
+            expected += 1.5;
+            expected /= 1.000_000_2;
+        }
+        assert_eq!(
+            result.as_number().map(f64::to_bits),
+            Some(expected.to_bits())
+        );
+        assert_eq!(context.vm.pure_numeric_loop_reductions, 1);
+        assert_eq!(context.vm.pure_numeric_loop_iterations_elided, 4999);
+        assert_eq!(
+            context
+                .eval(Source::from_bytes("main()"))
+                .expect("the cached floating recurrence must succeed")
+                .as_number()
+                .map(f64::to_bits),
+            Some(expected.to_bits())
+        );
+        assert_eq!(context.vm.pure_numeric_loop_reductions, 2);
+        assert_eq!(context.vm.pure_numeric_loop_iterations_elided, 9998);
+        assert_eq!(context.vm.pure_numeric_loop_cache_hits, 1);
+    }
+
+    #[test]
+    fn numeric_shortcuts_preserve_guards_and_finite_accounting() {
+        let definition = "let N = 20;\n\
+            function main() {\n\
+                let acc = 0;\n\
+                for (let index = 0; index < N; index++) {\n\
+                    acc = (acc + index) | 0;\n\
+                    acc = (acc * 3) | 0;\n\
+                    acc = (acc - 7) | 0;\n\
+                }\n\
+                return acc;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        budgeted
+            .eval(Source::from_bytes("main()"))
+            .expect("budgeted recurrence must execute normally");
+        assert_eq!(budgeted.vm.pure_numeric_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(5);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must retain every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_numeric_loop_reductions, 0);
+
+        let mut fractional_limit = Context::default();
+        #[cfg(feature = "jit")]
+        fractional_limit.disable_jit();
+        fractional_limit
+            .eval(Source::from_bytes(definition))
+            .expect("fractional-limit definitions must succeed");
+        let result = fractional_limit
+            .eval(Source::from_bytes("N = 10.5; main()"))
+            .expect("a non-i32 loop limit must execute normally");
+        let expected = (0i32..11).fold(0i32, |accumulator, index| {
+            accumulator
+                .wrapping_add(index)
+                .wrapping_mul(3)
+                .wrapping_sub(7)
+        });
+        assert_eq!(result, JsValue::new(expected));
+        assert_eq!(fractional_limit.vm.pure_numeric_loop_reductions, 0);
+
+        let mut unsafe_multiplier = Context::default();
+        let result = unsafe_multiplier
+            .eval(Source::from_bytes(
+                "const N = 8;\n\
+                 function main() {\n\
+                     let acc = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         acc = (acc + index) | 0;\n\
+                         acc = (acc * 4194304) | 0;\n\
+                         acc = (acc - 2147483647) | 0;\n\
+                     }\n\
+                     return acc;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("an unsafe closed-form multiplier must execute normally");
+        assert!(result.is_number());
+        assert_eq!(unsafe_multiplier.vm.pure_numeric_loop_reductions, 0);
+    }
 
     #[test]
     fn canonical_closure_affine_loop_updates_captured_state_and_wrapping_sum() {

@@ -636,6 +636,7 @@ fn loop_use_def(
         | Instruction::PureGlobalAffineLoopIteration
         | Instruction::PureIndexedReaderLoopIteration
         | Instruction::PureClosureAffineLoopIteration
+        | Instruction::PureNumericLoopIteration
         | Instruction::Jump { .. } => Ok((Vec::new(), None)),
         _ => Err(LoopPlanRejection::UnsupportedRegionOpcode),
     }
@@ -1533,7 +1534,8 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::PureMethodLoopIteration, Instruction::PureMethodLoopIteration)
         | (Opcode::PureGlobalAffineLoopIteration, Instruction::PureGlobalAffineLoopIteration)
         | (Opcode::PureIndexedReaderLoopIteration, Instruction::PureIndexedReaderLoopIteration)
-        | (Opcode::PureClosureAffineLoopIteration, Instruction::PureClosureAffineLoopIteration) => {
+        | (Opcode::PureClosureAffineLoopIteration, Instruction::PureClosureAffineLoopIteration)
+        | (Opcode::PureNumericLoopIteration, Instruction::PureNumericLoopIteration) => {
             !code.pure_range_loop_observed()
         }
         _ => false,
@@ -3577,7 +3579,8 @@ impl<'a> NativeCompiler<'a> {
             | Instruction::PureMethodLoopIteration
             | Instruction::PureGlobalAffineLoopIteration
             | Instruction::PureIndexedReaderLoopIteration
-            | Instruction::PureClosureAffineLoopIteration => {
+            | Instruction::PureClosureAffineLoopIteration
+            | Instruction::PureNumericLoopIteration => {
                 if !self.options.accounting.loop_iterations {
                     return true;
                 }
@@ -3912,6 +3915,7 @@ impl<'a> NativeCompiler<'a> {
                 | Instruction::PureGlobalAffineLoopIteration
                 | Instruction::PureIndexedReaderLoopIteration
                 | Instruction::PureClosureAffineLoopIteration
+                | Instruction::PureNumericLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4245,6 +4249,7 @@ impl<'a> NativeCompiler<'a> {
                 | Instruction::PureGlobalAffineLoopIteration
                 | Instruction::PureIndexedReaderLoopIteration
                 | Instruction::PureClosureAffineLoopIteration
+                | Instruction::PureNumericLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4536,6 +4541,7 @@ impl<'a> NativeCompiler<'a> {
                 | Instruction::PureGlobalAffineLoopIteration
                 | Instruction::PureIndexedReaderLoopIteration
                 | Instruction::PureClosureAffineLoopIteration
+                | Instruction::PureNumericLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -4883,6 +4889,7 @@ impl<'a> NativeCompiler<'a> {
                 | Instruction::PureGlobalAffineLoopIteration
                 | Instruction::PureIndexedReaderLoopIteration
                 | Instruction::PureClosureAffineLoopIteration
+                | Instruction::PureNumericLoopIteration
         ) || self
             .instructions
             .pc_to_index
@@ -5950,7 +5957,8 @@ impl<'a> LoopRegionCompiler<'a> {
             | Instruction::PureMethodLoopIteration
             | Instruction::PureGlobalAffineLoopIteration
             | Instruction::PureIndexedReaderLoopIteration
-            | Instruction::PureClosureAffineLoopIteration => {
+            | Instruction::PureClosureAffineLoopIteration
+            | Instruction::PureNumericLoopIteration => {
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);

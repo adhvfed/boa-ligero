@@ -43,7 +43,7 @@ pub use {
 
 pub(crate) use call_frame::BindingReference;
 
-pub(crate) use code_block::GlobalFunctionBinding;
+pub(crate) use code_block::{GlobalFunctionBinding, PureNumericLoopCache};
 #[cfg(feature = "jit")]
 pub(crate) use code_block::{JitAdmissionState, JitLeafEntryCache, JitTieringCache};
 
@@ -197,6 +197,15 @@ pub struct Vm {
 
     #[cfg(test)]
     pub(crate) pure_closure_affine_loop_calls_elided: u64,
+
+    #[cfg(test)]
+    pub(crate) pure_numeric_loop_reductions: u64,
+
+    #[cfg(test)]
+    pub(crate) pure_numeric_loop_iterations_elided: u64,
+
+    #[cfg(test)]
+    pub(crate) pure_numeric_loop_cache_hits: u64,
 }
 
 /// The stack holds the [`JsValue`]s for the calling convention and registers.
@@ -598,6 +607,12 @@ impl Vm {
             pure_closure_affine_loop_reductions: 0,
             #[cfg(test)]
             pure_closure_affine_loop_calls_elided: 0,
+            #[cfg(test)]
+            pure_numeric_loop_reductions: 0,
+            #[cfg(test)]
+            pure_numeric_loop_iterations_elided: 0,
+            #[cfg(test)]
+            pure_numeric_loop_cache_hits: 0,
         }
     }
 

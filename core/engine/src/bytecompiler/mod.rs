@@ -3107,6 +3107,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             pure_function_plan: std::cell::OnceCell::new(),
             pure_loop_plans: std::cell::OnceCell::new(),
             pure_range_loop_observed: Cell::new(false),
+            pure_numeric_loop_cache: Cell::new(crate::vm::PureNumericLoopCache::default()),
             element_ic: self.element_ic.into_boxed_slice(),
             source_info: SourceInfo::new(
                 SourceMap::new(source_map_entries, self.source_path),

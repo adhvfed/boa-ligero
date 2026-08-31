@@ -4,7 +4,8 @@ use crate::{
         opcode::Operation,
         pure_reader::{
             PURE_CLOSURE_AFFINE_GUARD_MISS, PURE_GLOBAL_AFFINE_GUARD_MISS,
-            PURE_INDEXED_READER_GUARD_MISS, PURE_METHOD_GUARD_MISS, PURE_PROPERTY_WRITE_GUARD_MISS,
+            PURE_INDEXED_READER_GUARD_MISS, PURE_METHOD_GUARD_MISS, PURE_NUMERIC_GUARD_MISS,
+            PURE_PROPERTY_WRITE_GUARD_MISS,
         },
     },
 };
@@ -249,5 +250,38 @@ impl PureClosureAffineLoopIteration {
 impl Operation for PureClosureAffineLoopIteration {
     const NAME: &'static str = "PureClosureAffineLoopIteration";
     const INSTRUCTION: &'static str = "INST - PureClosureAffineLoopIteration";
+    const COST: u8 = 3;
+}
+
+/// Loop-maintenance opcode installed on a canonical numeric recurrence. The
+/// interpreter may summarize it while the native tier lowers it as ordinary
+/// loop maintenance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureNumericLoopIteration;
+
+impl PureNumericLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_NUMERIC_GUARD_MISS != 0 {
+            return context.consume_loop_iterations(1);
+        }
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_numeric_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PureNumericLoopIteration {
+    const NAME: &'static str = "PureNumericLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PureNumericLoopIteration";
     const COST: u8 = 3;
 }
