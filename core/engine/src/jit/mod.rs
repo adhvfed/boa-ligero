@@ -4748,6 +4748,43 @@ mod tests {
     }
 
     #[test]
+    fn native_admission_preserves_observed_indexed_reader_summaries() {
+        let code = first_function_code(
+            "const N = 100;\n\
+             const o1 = { x: 1 }; const o2 = { a: 0, x: 2 };\n\
+             const o3 = { x: 3, b: 0 }; const o4 = { c: 0, x: 4 };\n\
+             const values = [o1, o2, o3, o4];\n\
+             function main() {\n\
+                 let sum = 0;\n\
+                 for (let index = 0; index < N; index++) {\n\
+                     sum += read(values[index & 3]);\n\
+                 }\n\
+                 return sum;\n\
+             }\n\
+             function read(value) { return value.x; }",
+        );
+        assert!(
+            InstructionIterator::new(&code.bytecode).any(|(_, _, instruction)| {
+                matches!(instruction, Instruction::PureIndexedReaderLoopIteration)
+            }),
+            "the bytecompiler must mark the indexed-reader candidate before JIT admission"
+        );
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("bitwise index selection is not part of native lowering");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(rejection.first_blocking_opcode, Some(Opcode::BitAnd));
+
+        code.mark_pure_range_loop_observed();
+        let rejection = native::admission_profile(&code, false)
+            .expect_err("native lowering must not discard an observed indexed-reader summary");
+        assert_eq!(rejection.kind, JitCompileBlockerKind::UnsupportedOpcode);
+        assert_eq!(
+            rejection.first_blocking_opcode,
+            Some(Opcode::PureIndexedReaderLoopIteration)
+        );
+    }
+
+    #[test]
     fn jit_executes_script_matches_interpreter() {
         // End-to-end: run a real script through the JIT trampoline and confirm
         // the result matches the interpreter exactly. The JIT runs native code

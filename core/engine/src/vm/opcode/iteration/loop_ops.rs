@@ -3,7 +3,8 @@ use crate::{
     vm::{
         opcode::Operation,
         pure_reader::{
-            PURE_GLOBAL_AFFINE_GUARD_MISS, PURE_METHOD_GUARD_MISS, PURE_PROPERTY_WRITE_GUARD_MISS,
+            PURE_GLOBAL_AFFINE_GUARD_MISS, PURE_INDEXED_READER_GUARD_MISS, PURE_METHOD_GUARD_MISS,
+            PURE_PROPERTY_WRITE_GUARD_MISS,
         },
     },
 };
@@ -184,5 +185,37 @@ impl PureGlobalAffineLoopIteration {
 impl Operation for PureGlobalAffineLoopIteration {
     const NAME: &'static str = "PureGlobalAffineLoopIteration";
     const INSTRUCTION: &'static str = "INST - PureGlobalAffineLoopIteration";
+    const COST: u8 = 3;
+}
+
+/// Loop-maintenance opcode installed on a canonical periodic array selection
+/// followed by a proven pure property-reader call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureIndexedReaderLoopIteration;
+
+impl PureIndexedReaderLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_INDEXED_READER_GUARD_MISS != 0 {
+            return context.consume_loop_iterations(1);
+        }
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_indexed_reader_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PureIndexedReaderLoopIteration {
+    const NAME: &'static str = "PureIndexedReaderLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PureIndexedReaderLoopIteration";
     const COST: u8 = 3;
 }

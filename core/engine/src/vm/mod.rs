@@ -185,6 +185,12 @@ pub struct Vm {
 
     #[cfg(test)]
     pub(crate) pure_global_affine_loop_calls_elided: u64,
+
+    #[cfg(test)]
+    pub(crate) pure_indexed_reader_loop_reductions: u64,
+
+    #[cfg(test)]
+    pub(crate) pure_indexed_reader_loop_calls_elided: u64,
 }
 
 /// The stack holds the [`JsValue`]s for the calling convention and registers.
@@ -578,6 +584,10 @@ impl Vm {
             pure_global_affine_loop_reductions: 0,
             #[cfg(test)]
             pure_global_affine_loop_calls_elided: 0,
+            #[cfg(test)]
+            pure_indexed_reader_loop_reductions: 0,
+            #[cfg(test)]
+            pure_indexed_reader_loop_calls_elided: 0,
         }
     }
 

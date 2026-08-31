@@ -3,14 +3,15 @@
 //! The accepted bytecode subset is deliberately narrow: a linear ordinary
 //! function may read cached data properties from argument zero, combine i32
 //! values with checked addition/subtraction, or apply one constant i32 offset
-//! to its argument. The plans contain no source text or GC-managed pointers,
-//! so they are safe to retain on the immutable [`CodeBlock`] and reuse from
-//! both interpreter and JIT paths.
+//! to its argument. Canonical loops can reuse those proofs over fixed or
+//! periodic indexed inputs. The plans contain no source text or GC-managed
+//! pointers, so they are safe to retain on the immutable [`CodeBlock`] and
+//! reuse from both interpreter and JIT paths.
 
 use crate::{
     Context, JsObject, JsValue,
     object::shape::slot::SlotAttributes,
-    vm::{CodeBlock, Instruction, InstructionIterator, Opcode},
+    vm::{CodeBlock, IndexedKind, Instruction, InstructionIterator, Opcode},
 };
 use boa_ast::scope::BindingLocatorScope;
 
@@ -21,9 +22,11 @@ const MAX_PURE_READER_LOOP_CODE: usize = 512;
 const MAX_PURE_READER_LOOPS: usize = 8;
 const MAX_PURE_READER_CONTINUATION: usize = 16;
 const MAX_PURE_PROPERTY_WRITES: usize = 8;
+const MAX_PURE_INDEXED_READER_PERIOD: usize = 8;
 pub(crate) const PURE_PROPERTY_WRITE_GUARD_MISS: u8 = 1 << 0;
 pub(crate) const PURE_METHOD_GUARD_MISS: u8 = 1 << 1;
 pub(crate) const PURE_GLOBAL_AFFINE_GUARD_MISS: u8 = 1 << 2;
+pub(crate) const PURE_INDEXED_READER_GUARD_MISS: u8 = 1 << 3;
 
 #[derive(Clone, Copy, Debug)]
 enum PureReaderNode {
@@ -176,11 +179,31 @@ pub(crate) struct PureGlobalAffineLoopPlan {
     limit: usize,
 }
 
+/// A canonical `sum += reader(array[index & mask])` loop. One complete source
+/// cycle warms every named-property shape before the remaining periodic range
+/// is reduced.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PureIndexedReaderLoopPlan {
+    loop_iteration_pc: u32,
+    loop_iteration_next_pc: u32,
+    exit_pc: u32,
+    function_binding_index: u32,
+    function_ic_index: Option<u32>,
+    array_binding_index: u32,
+    array_ic_index: Option<u32>,
+    element_ic_index: u32,
+    index: usize,
+    limit: usize,
+    sum: usize,
+    mask: u8,
+}
+
 /// A statically proven loop shape. Reader and affine candidates use distinct
 /// specialized opcodes because their runtime guards and tiering policy differ.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PureLoopPlan {
     Reader(PureReaderLoopPlan),
+    IndexedReader(PureIndexedReaderLoopPlan),
     Affine(PureAffineLoopPlan),
     PropertyWrite(PurePropertyWriteLoopPlan),
     Method(PureMethodLoopPlan),
@@ -846,6 +869,10 @@ impl PureLoopPlan {
             {
                 plans.push(Self::Reader(plan));
             } else if let Some(plan) =
+                PureIndexedReaderLoopPlan::parse_at(code, &instructions, loop_iteration_index)
+            {
+                plans.push(Self::IndexedReader(plan));
+            } else if let Some(plan) =
                 PureAffineLoopPlan::parse_at(code, &instructions, loop_iteration_index)
             {
                 plans.push(Self::Affine(plan));
@@ -1187,6 +1214,460 @@ impl PureReaderLoopPlan {
                 .saturating_add(u64::try_from(remaining).ok()?);
         }
         Some(())
+    }
+
+    pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
+        self.loop_iteration_next_pc
+    }
+
+    pub(crate) const fn loop_iteration_pc(self) -> u32 {
+        self.loop_iteration_pc
+    }
+}
+
+impl PureIndexedReaderLoopPlan {
+    fn parse_at(
+        code: &CodeBlock,
+        instructions: &[DecodedInstruction],
+        loop_iteration_index: usize,
+    ) -> Option<Self> {
+        let sum_init_index = loop_iteration_index.checked_sub(4)?;
+        let index_init_index = loop_iteration_index.checked_sub(3)?;
+        let limit_load_index = loop_iteration_index.checked_sub(2)?;
+        let preheader_index = loop_iteration_index.checked_sub(1)?;
+        let increment_index = loop_iteration_index.checked_add(1)?;
+        let comparison_index = loop_iteration_index.checked_add(2)?;
+        let body_start_index = loop_iteration_index.checked_add(3)?;
+        let this_push_index = loop_iteration_index.checked_add(4)?;
+        let function_load_index = loop_iteration_index.checked_add(5)?;
+        let function_push_index = loop_iteration_index.checked_add(6)?;
+        let array_load_index = loop_iteration_index.checked_add(7)?;
+        let mask_store_index = loop_iteration_index.checked_add(8)?;
+        let bit_and_index = loop_iteration_index.checked_add(9)?;
+        let element_load_index = loop_iteration_index.checked_add(10)?;
+        let argument_push_index = loop_iteration_index.checked_add(11)?;
+        let call_index = loop_iteration_index.checked_add(12)?;
+        let pop_index = loop_iteration_index.checked_add(13)?;
+        let add_index = loop_iteration_index.checked_add(14)?;
+        let result_move_index = loop_iteration_index.checked_add(15)?;
+        let back_edge_index = loop_iteration_index.checked_add(16)?;
+
+        let loop_iteration = instructions.get(loop_iteration_index)?;
+        if !matches!(
+            &loop_iteration.instruction,
+            Instruction::IncrementLoopIteration
+        ) {
+            return None;
+        }
+
+        let preheader = instructions.get(preheader_index)?;
+        let Instruction::Jump {
+            address: preheader_target,
+        } = &preheader.instruction
+        else {
+            return None;
+        };
+        if preheader.next_pc != loop_iteration.pc {
+            return None;
+        }
+
+        let increment = instructions.get(increment_index)?;
+        let Instruction::Inc { src, dst } = &increment.instruction else {
+            return None;
+        };
+        let index = usize::from(*src);
+        if usize::from(*dst) != index {
+            return None;
+        }
+
+        let comparison = instructions.get(comparison_index)?;
+        let Instruction::JumpIfNotLessThan { address, lhs, rhs } = &comparison.instruction else {
+            return None;
+        };
+        if usize::from(*lhs) != index || preheader_target.as_u32() as usize != comparison.pc {
+            return None;
+        }
+        let limit = usize::from(*rhs);
+        let exit_pc = address.as_u32() as usize;
+        let exit_index = instructions
+            .iter()
+            .position(|instruction| instruction.pc == exit_pc)?;
+        if exit_index <= back_edge_index {
+            return None;
+        }
+
+        let body_start = instructions.get(body_start_index)?;
+        let Instruction::Move { src, dst } = &body_start.instruction else {
+            return None;
+        };
+        let sum = usize::from(*src);
+        let saved_sum = usize::from(*dst);
+
+        if !matches!(
+            &instructions.get(sum_init_index)?.instruction,
+            Instruction::StoreZero { dst } if usize::from(*dst) == sum
+        ) || !matches!(
+            &instructions.get(index_init_index)?.instruction,
+            Instruction::StoreZero { dst } if usize::from(*dst) == index
+        ) || !matches!(
+            &instructions.get(limit_load_index)?.instruction,
+            Instruction::GetName { dst, .. } | Instruction::GetNameGlobal { dst, .. }
+                if usize::from(*dst) == limit
+        ) {
+            return None;
+        }
+        for instruction_index in sum_init_index..preheader_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        if !matches!(
+            &instructions.get(this_push_index)?.instruction,
+            Instruction::PushFromRegister { .. }
+        ) {
+            return None;
+        }
+
+        let binding_read = |instruction_index: usize| {
+            let instruction = &instructions.get(instruction_index)?.instruction;
+            match instruction {
+                Instruction::GetName { dst, binding_index } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| {
+                            binding.scope() == BindingLocatorScope::GlobalDeclarative
+                        })?;
+                    Some((usize::from(*dst), binding_index, None))
+                }
+                Instruction::GetNameGlobal {
+                    dst,
+                    binding_index,
+                    ic_index,
+                } => {
+                    let binding_index = u32::from(*binding_index);
+                    code.bindings
+                        .get(binding_index as usize)
+                        .filter(|binding| binding.scope() == BindingLocatorScope::GlobalObject)?;
+                    Some((usize::from(*dst), binding_index, Some(u32::from(*ic_index))))
+                }
+                _ => None,
+            }
+        };
+        let (function_register, function_binding_index, function_ic_index) =
+            binding_read(function_load_index)?;
+        let (array_register, array_binding_index, array_ic_index) = binding_read(array_load_index)?;
+
+        if !matches!(
+            &instructions.get(function_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == function_register
+        ) {
+            return None;
+        }
+
+        let (mask, mask_register) = match &instructions.get(mask_store_index)?.instruction {
+            Instruction::StoreOne { dst } => (1, usize::from(*dst)),
+            Instruction::StoreInt8 { value, dst } => (i32::from(*value), usize::from(*dst)),
+            Instruction::StoreInt16 { value, dst } => (i32::from(*value), usize::from(*dst)),
+            Instruction::StoreInt32 { value, dst } => (*value, usize::from(*dst)),
+            _ => return None,
+        };
+        let period = usize::try_from(mask).ok()?.checked_add(1)?;
+        if !period.is_power_of_two() || period > MAX_PURE_INDEXED_READER_PERIOD {
+            return None;
+        }
+
+        let Instruction::BitAnd { dst, lhs, rhs } = &instructions.get(bit_and_index)?.instruction
+        else {
+            return None;
+        };
+        let key_register = usize::from(*dst);
+        let lhs = usize::from(*lhs);
+        let rhs = usize::from(*rhs);
+        if !((lhs == index && rhs == mask_register) || (rhs == index && lhs == mask_register)) {
+            return None;
+        }
+
+        let Instruction::GetPropertyByValue {
+            dst,
+            key,
+            receiver,
+            object,
+            ic_index,
+        } = &instructions.get(element_load_index)?.instruction
+        else {
+            return None;
+        };
+        let argument_register = usize::from(*dst);
+        if usize::from(*key) != key_register
+            || usize::from(*receiver) != array_register
+            || usize::from(*object) != array_register
+        {
+            return None;
+        }
+        let element_ic_index = u32::from(*ic_index);
+        code.element_ic.get(element_ic_index as usize)?;
+
+        if !matches!(
+            &instructions.get(argument_push_index)?.instruction,
+            Instruction::PushFromRegister { src } if usize::from(*src) == argument_register
+        ) || !matches!(
+            &instructions.get(call_index)?.instruction,
+            Instruction::Call { argument_count } if u32::from(*argument_count) == 1
+        ) {
+            return None;
+        }
+
+        let Instruction::PopIntoRegister { dst } = &instructions.get(pop_index)?.instruction else {
+            return None;
+        };
+        let reader_result = usize::from(*dst);
+        let Instruction::Add { dst, lhs, rhs } = &instructions.get(add_index)?.instruction else {
+            return None;
+        };
+        let add_result = usize::from(*dst);
+        let lhs = usize::from(*lhs);
+        let rhs = usize::from(*rhs);
+        if !((lhs == saved_sum && rhs == reader_result)
+            || (rhs == saved_sum && lhs == reader_result))
+        {
+            return None;
+        }
+        let Instruction::Move { src, dst } = &instructions.get(result_move_index)?.instruction
+        else {
+            return None;
+        };
+        if usize::from(*src) != add_result || usize::from(*dst) != sum {
+            return None;
+        }
+
+        let Instruction::Jump {
+            address: back_edge_address,
+        } = &instructions.get(back_edge_index)?.instruction
+        else {
+            return None;
+        };
+        if back_edge_address.as_u32() as usize != loop_iteration.pc {
+            return None;
+        }
+        for instruction_index in loop_iteration_index..back_edge_index {
+            if instructions.get(instruction_index)?.next_pc
+                != instructions.get(instruction_index + 1)?.pc
+            {
+                return None;
+            }
+        }
+
+        let body_start_pc = body_start.pc;
+        let back_edge_pc = instructions.get(back_edge_index)?.pc;
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if instruction_targets_range(&instruction.instruction, body_start_pc, back_edge_pc) {
+                return None;
+            }
+            if instruction_index != back_edge_index
+                && instruction_targets_range(
+                    &instruction.instruction,
+                    loop_iteration.pc,
+                    loop_iteration.pc,
+                )
+            {
+                return None;
+            }
+        }
+
+        let source_registers = [index, limit, sum];
+        if source_registers
+            .iter()
+            .enumerate()
+            .any(|(position, register)| source_registers[..position].contains(register))
+        {
+            return None;
+        }
+        let temporary_registers = [
+            saved_sum,
+            function_register,
+            array_register,
+            mask_register,
+            key_register,
+            argument_register,
+            reader_result,
+            add_result,
+        ];
+        if source_registers
+            .iter()
+            .any(|source| temporary_registers.contains(source))
+        {
+            return None;
+        }
+        let live_at_exit = continuation_live_registers(code, exit_pc)?;
+        if temporary_registers
+            .iter()
+            .any(|temporary| live_at_exit.get(*temporary).copied().unwrap_or(true))
+        {
+            return None;
+        }
+
+        Some(Self {
+            loop_iteration_pc: u32::try_from(loop_iteration.pc).ok()?,
+            loop_iteration_next_pc: u32::try_from(loop_iteration.next_pc).ok()?,
+            exit_pc: u32::try_from(exit_pc).ok()?,
+            function_binding_index,
+            function_ic_index,
+            array_binding_index,
+            array_ic_index,
+            element_ic_index,
+            index,
+            limit,
+            sum,
+            mask: u8::try_from(mask).ok()?,
+        })
+    }
+
+    pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_INDEXED_READER_GUARD_MISS != 0 {
+            return None;
+        }
+        if context.instruction_budget_remaining().is_some()
+            || context.runtime_limits().loop_iteration_limit() != u64::MAX
+        {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if context.active_jit_observes_interpreted_sites {
+            return None;
+        }
+        #[cfg(feature = "trace")]
+        if context.vm.trace || caller_code.traceable() {
+            return None;
+        }
+
+        let Some(index) = context.vm.get_register(self.index).as_i32() else {
+            return self.suppress_for_frame(context);
+        };
+        if index < i32::from(self.mask) {
+            return None;
+        }
+        let Some(limit) = context.vm.get_register(self.limit).as_i32() else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(sum) = context.vm.get_register(self.sum).as_i32() else {
+            return self.suppress_for_frame(context);
+        };
+        let remaining = i64::from(limit)
+            .checked_sub(i64::from(index))?
+            .checked_sub(1)?;
+        if remaining <= 0 {
+            return None;
+        }
+
+        // Preserve the source lookup order: callable first, indexed receiver
+        // second. Both probes accept data bindings only and are pre-effect.
+        let Some(function) = binding_data_value(
+            caller_code,
+            self.function_binding_index,
+            self.function_ic_index,
+            context,
+        ) else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(array) = binding_data_value(
+            caller_code,
+            self.array_binding_index,
+            self.array_ic_index,
+            context,
+        ) else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(function) = function.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        let Some(ordinary) = function.downcast_ref::<crate::builtins::function::OrdinaryFunction>()
+        else {
+            return self.suppress_for_frame(context);
+        };
+        let reader_code = ordinary.codeblock();
+        if !reader_code.is_ordinary()
+            || reader_code.is_class_constructor()
+            || reader_code.has_binding_identifier()
+            || reader_code.has_function_scope()
+        {
+            return self.suppress_for_frame(context);
+        }
+        #[cfg(feature = "trace")]
+        if reader_code.traceable() {
+            return None;
+        }
+
+        let Some(array) = array.as_object() else {
+            return self.suppress_for_frame(context);
+        };
+        if !array.is_array() || !array.uses_ordinary_property_reads() {
+            return self.suppress_for_frame(context);
+        }
+        {
+            let array = array.borrow();
+            let kind = caller_code
+                .element_ic
+                .get(self.element_ic_index as usize)?
+                .matches(array.shape());
+            if kind != Some(IndexedKind::DenseElement) {
+                return self.suppress_for_frame(context);
+            }
+        }
+
+        let period = usize::from(self.mask) + 1;
+        let mut values = [0i32; MAX_PURE_INDEXED_READER_PERIOD];
+        for (key, value) in values.iter_mut().enumerate().take(period) {
+            let Some(argument) = array
+                .borrow()
+                .properties()
+                .get_indexed_data_property(u32::try_from(key).ok()?)
+            else {
+                return self.suppress_for_frame(context);
+            };
+            let Some(argument) = argument.as_object() else {
+                return self.suppress_for_frame(context);
+            };
+            let Some(reader_value) = reader_code.pure_reader_i32(&argument) else {
+                return self.suppress_for_frame(context);
+            };
+            *value = reader_value;
+        }
+
+        let count = u64::try_from(remaining).ok()?;
+        let next_index = i64::from(index).checked_add(1)?;
+        let start = usize::try_from(next_index & i64::from(self.mask)).ok()?;
+        let Some(reduced) = checked_periodic_sum_i32(sum, &values[..period], start, count) else {
+            return self.suppress_for_frame(context);
+        };
+        let total_iterations = count.checked_add(1)?;
+
+        context.consume_loop_iterations(total_iterations).ok()?;
+        context.vm.set_register(self.sum, reduced.into());
+        context.vm.set_register(self.index, limit.into());
+        context.vm.frame_mut().pc = self.exit_pc;
+        caller_code.mark_pure_range_loop_observed();
+        #[cfg(test)]
+        {
+            context.vm.pure_indexed_reader_loop_reductions = context
+                .vm
+                .pure_indexed_reader_loop_reductions
+                .saturating_add(1);
+            context.vm.pure_indexed_reader_loop_calls_elided = context
+                .vm
+                .pure_indexed_reader_loop_calls_elided
+                .saturating_add(count);
+        }
+        Some(())
+    }
+
+    fn suppress_for_frame(self, context: &mut Context) -> Option<()> {
+        debug_assert!(self.loop_iteration_next_pc > self.loop_iteration_pc);
+        context.vm.frame_mut().pure_loop_guard_misses |= PURE_INDEXED_READER_GUARD_MISS;
+        None
     }
 
     pub(crate) const fn loop_iteration_next_pc(self) -> u32 {
@@ -2497,12 +2978,54 @@ impl PureLoopPlan {
     pub(crate) const fn loop_iteration_pc(self) -> u32 {
         match self {
             Self::Reader(plan) => plan.loop_iteration_pc(),
+            Self::IndexedReader(plan) => plan.loop_iteration_pc(),
             Self::Affine(plan) => plan.loop_iteration_pc(),
             Self::PropertyWrite(plan) => plan.loop_iteration_pc(),
             Self::Method(plan) => plan.loop_iteration_pc(),
             Self::GlobalAffine(plan) => plan.loop_iteration_pc(),
         }
     }
+}
+
+/// Add a periodic i32 sequence while proving that every source-order partial
+/// sum remains in Boa's exact i32 representation. Crossing that boundary must
+/// execute ordinary bytecode so JavaScript Number promotion is preserved.
+fn checked_periodic_sum_i32(initial: i32, values: &[i32], start: usize, count: u64) -> Option<i32> {
+    if values.is_empty() || start >= values.len() {
+        return None;
+    }
+
+    let period = u64::try_from(values.len()).ok()?;
+    let full_cycles = count / period;
+    let tail = usize::try_from(count % period).ok()?;
+    let mut cycle_prefix = 0i128;
+    let mut min_prefix = 0i128;
+    let mut max_prefix = 0i128;
+    for offset in 0..values.len() {
+        cycle_prefix =
+            cycle_prefix.checked_add(i128::from(values[(start + offset) % values.len()]))?;
+        min_prefix = min_prefix.min(cycle_prefix);
+        max_prefix = max_prefix.max(cycle_prefix);
+    }
+
+    let initial = i128::from(initial);
+    if full_cycles != 0 {
+        let last_cycle_base = i128::from(full_cycles.checked_sub(1)?).checked_mul(cycle_prefix)?;
+        let min_base = 0.min(last_cycle_base);
+        let max_base = 0.max(last_cycle_base);
+        let minimum = initial.checked_add(min_base)?.checked_add(min_prefix)?;
+        let maximum = initial.checked_add(max_base)?.checked_add(max_prefix)?;
+        if minimum < i128::from(i32::MIN) || maximum > i128::from(i32::MAX) {
+            return None;
+        }
+    }
+
+    let mut result = initial.checked_add(i128::from(full_cycles).checked_mul(cycle_prefix)?)?;
+    for offset in 0..tail {
+        result = result.checked_add(i128::from(values[(start + offset) % values.len()]))?;
+        i32::try_from(result).ok()?;
+    }
+    i32::try_from(result).ok()
 }
 
 fn instruction_targets_range(instruction: &Instruction, start: usize, end: usize) -> bool {
@@ -2644,10 +3167,247 @@ fn cached_named_data_property_value(
 
 #[cfg(test)]
 mod tests {
+    use super::checked_periodic_sum_i32;
     use crate::{
         Context, JsValue, Source,
         error::{EngineError, RuntimeLimitError},
     };
+
+    #[test]
+    fn canonical_indexed_reader_loop_reduces_a_warmed_shape_cycle() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 20;\n\
+                 const o1 = { x: 1, y: 2, z: 3 };\n\
+                 const o2 = { a: 0, x: 4, y: 5, z: 6 };\n\
+                 const o3 = { x: 7, b: 0, y: 8, z: 9 };\n\
+                 const o4 = { x: 10, y: 11, c: 0, z: 12 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 function read(value) { return value.x + value.y + value.z; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("canonical indexed-reader loop must succeed");
+
+        assert_eq!(result, JsValue::new(390));
+        assert_eq!(context.vm.pure_indexed_reader_loop_reductions, 1);
+        assert_eq!(context.vm.pure_indexed_reader_loop_calls_elided, 16);
+    }
+
+    #[test]
+    fn indexed_reader_loop_handles_negative_values_and_partial_cycles() {
+        let mut context = Context::default();
+        let result = context
+            .eval(Source::from_bytes(
+                "const N = 11;\n\
+                 const o1 = { x: 5 };\n\
+                 const o2 = { a: 0, x: -2 };\n\
+                 const o3 = { x: 7, b: 0 };\n\
+                 const o4 = { c: 0, x: -1 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 function read(value) { return value.x; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("partial periodic indexed-reader loop must succeed");
+
+        assert_eq!(result, JsValue::new(28));
+        assert_eq!(context.vm.pure_indexed_reader_loop_reductions, 1);
+        assert_eq!(context.vm.pure_indexed_reader_loop_calls_elided, 7);
+    }
+
+    #[test]
+    fn indexed_reader_loop_revalidates_reader_and_indexed_accessors() {
+        let mut reader_accessor = Context::default();
+        let result = reader_accessor
+            .eval(Source::from_bytes(
+                "const N = 12; let reads = 0;\n\
+                 const o1 = { get x() { reads++; return 1; }, y: 2, z: 3 };\n\
+                 const o2 = { a: 0, x: 4, y: 5, z: 6 };\n\
+                 const o3 = { x: 7, b: 0, y: 8, z: 9 };\n\
+                 const o4 = { x: 10, y: 11, c: 0, z: 12 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 function read(value) { return value.x + value.y + value.z; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 [main(), reads].join(',');",
+            ))
+            .expect("reader accessor case must preserve every getter call");
+        assert_eq!(
+            result
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("234,3")
+        );
+        assert_eq!(reader_accessor.vm.pure_indexed_reader_loop_reductions, 0);
+
+        let mut indexed_accessor = Context::default();
+        let result = indexed_accessor
+            .eval(Source::from_bytes(
+                "const N = 12; let reads = 0;\n\
+                 const o1 = { x: 1 }; const o2 = { x: 2 };\n\
+                 const o3 = { x: 3 }; const o4 = { x: 4 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 Object.defineProperty(values, '2', {\n\
+                     configurable: true, get() { reads++; return o3; }\n\
+                 });\n\
+                 function read(value) { return value.x; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 [main(), reads].join(',');",
+            ))
+            .expect("indexed accessor case must preserve every getter call");
+        assert_eq!(
+            result
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("30,3")
+        );
+        assert_eq!(indexed_accessor.vm.pure_indexed_reader_loop_reductions, 0);
+
+        let mut rebound_reader = Context::default();
+        let result = rebound_reader
+            .eval(Source::from_bytes(
+                "const N = 12; let calls = 0;\n\
+                 const o1 = { x: 1 }; const o2 = { x: 2 };\n\
+                 const o3 = { x: 3 }; const o4 = { x: 4 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 function read(value) { return value.x; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 read = function(value) { calls++; return value.x; };\n\
+                 [main(), calls].join(',');",
+            ))
+            .expect("rebound reader must preserve every function call");
+        assert_eq!(
+            result
+                .as_string()
+                .map(|value| value.to_std_string_escaped())
+                .as_deref(),
+            Some("30,12")
+        );
+        assert_eq!(rebound_reader.vm.pure_indexed_reader_loop_reductions, 0);
+    }
+
+    #[test]
+    fn indexed_reader_shortcuts_preserve_overflow_masks_and_finite_accounting() {
+        let definition = "const N = 12;\n\
+            const o1 = { x: 1 }; const o2 = { x: 2 };\n\
+            const o3 = { x: 3 }; const o4 = { x: 4 };\n\
+            const values = [o1, o2, o3, o4];\n\
+            function read(value) { return value.x; }\n\
+            function main() {\n\
+                let sum = 0;\n\
+                for (let index = 0; index < N; index++) {\n\
+                    sum += read(values[index & 3]);\n\
+                }\n\
+                return sum;\n\
+            }";
+
+        let mut budgeted = Context::default();
+        budgeted
+            .eval(Source::from_bytes(definition))
+            .expect("budget case definitions must succeed");
+        budgeted.set_instruction_budget(1_000_000);
+        assert_eq!(
+            budgeted.eval(Source::from_bytes("main()")),
+            Ok(JsValue::new(30))
+        );
+        assert_eq!(budgeted.vm.pure_indexed_reader_loop_reductions, 0);
+
+        let mut loop_limited = Context::default();
+        loop_limited
+            .eval(Source::from_bytes(definition))
+            .expect("loop-limit case definitions must succeed");
+        loop_limited
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(5);
+        let error = loop_limited
+            .eval(Source::from_bytes("main()"))
+            .expect_err("finite loop limits must execute every source charge");
+        assert_eq!(
+            error.as_engine(),
+            Some(&EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration))
+        );
+        assert_eq!(loop_limited.vm.pure_indexed_reader_loop_reductions, 0);
+
+        let mut overflow = Context::default();
+        let result = overflow
+            .eval(Source::from_bytes(
+                "const N = 8;\n\
+                 const o1 = { x: 1000000000 }; const o2 = { x: 1000000000 };\n\
+                 const o3 = { x: 1000000000 }; const o4 = { x: 1000000000 };\n\
+                 const values = [o1, o2, o3, o4];\n\
+                 function read(value) { return value.x; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 3]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("overflow case must preserve Number promotion");
+        assert_eq!(result, JsValue::new(8_000_000_000_f64));
+        assert_eq!(overflow.vm.pure_indexed_reader_loop_reductions, 0);
+
+        let mut unsupported_mask = Context::default();
+        let result = unsupported_mask
+            .eval(Source::from_bytes(
+                "const N = 12;\n\
+                 const o1 = { x: 1 }; const o2 = { x: 2 };\n\
+                 const o3 = { x: 3 }; const values = [o1, o2, o3];\n\
+                 function read(value) { return value.x; }\n\
+                 function main() {\n\
+                     let sum = 0;\n\
+                     for (let index = 0; index < N; index++) {\n\
+                         sum += read(values[index & 2]);\n\
+                     }\n\
+                     return sum;\n\
+                 }\n\
+                 main();",
+            ))
+            .expect("non-period-mask control must execute normally");
+        assert_eq!(result, JsValue::new(24));
+        assert_eq!(unsupported_mask.vm.pure_indexed_reader_loop_reductions, 0);
+
+        assert_eq!(checked_periodic_sum_i32(i32::MAX - 1, &[2, -2], 0, 4), None);
+        assert_eq!(
+            checked_periodic_sum_i32(0, &[5, -2, 7, -1], 0, 11),
+            Some(28)
+        );
+    }
 
     #[test]
     fn canonical_global_affine_loop_advances_data_slot_as_a_range() {

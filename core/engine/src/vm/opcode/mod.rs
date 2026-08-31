@@ -2298,8 +2298,8 @@ generate_opcodes! {
     PureMethodLoopIteration,
     /// Execute loop maintenance with a cached global-affine range proof.
     PureGlobalAffineLoopIteration,
-    /// Reserved [`Opcode`].
-    Reserved11 => Reserved,
+    /// Execute loop maintenance with a cached periodic indexed-reader proof.
+    PureIndexedReaderLoopIteration,
     /// Reserved [`Opcode`].
     Reserved12 => Reserved,
     /// Reserved [`Opcode`].

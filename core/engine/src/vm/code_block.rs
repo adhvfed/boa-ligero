@@ -115,8 +115,8 @@ use super::{
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
     pure_reader::{
         PureAffineLoopPlan, PureFunctionPlan, PureGlobalAffineLoopPlan, PureGlobalAffineStepPlan,
-        PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan, PureReaderLoopPlan,
-        PureReceiverAffineStepPlan,
+        PureIndexedReaderLoopPlan, PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan,
+        PureReaderLoopPlan, PureReceiverAffineStepPlan,
     },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
@@ -546,6 +546,7 @@ impl CodeBlock {
                     Some(plan)
                 }
                 PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
@@ -566,6 +567,7 @@ impl CodeBlock {
                     Some(plan)
                 }
                 PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
@@ -589,6 +591,7 @@ impl CodeBlock {
                     Some(plan)
                 }
                 PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
@@ -609,6 +612,7 @@ impl CodeBlock {
                     Some(plan)
                 }
                 PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
@@ -632,6 +636,31 @@ impl CodeBlock {
                     Some(plan)
                 }
                 PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_) => None,
+            })
+    }
+
+    /// Return the cached periodic indexed-reader loop whose maintenance
+    /// opcode just advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_indexed_reader_loop_plan(
+        &self,
+        next_pc: u32,
+    ) -> Option<PureIndexedReaderLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::IndexedReader(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
@@ -667,6 +696,7 @@ impl CodeBlock {
             debug_assert_eq!(Opcode::decode(*opcode), Opcode::IncrementLoopIteration);
             *opcode = match plan {
                 PureLoopPlan::Reader(_) => Opcode::PureReaderLoopIteration,
+                PureLoopPlan::IndexedReader(_) => Opcode::PureIndexedReaderLoopIteration,
                 PureLoopPlan::Affine(_) => Opcode::PureAffineLoopIteration,
                 PureLoopPlan::PropertyWrite(_) => Opcode::PurePropertyWriteLoopIteration,
                 PureLoopPlan::Method(_) => Opcode::PureMethodLoopIteration,
@@ -1290,6 +1320,7 @@ impl CodeBlock {
             | Instruction::PurePropertyWriteLoopIteration
             | Instruction::PureMethodLoopIteration
             | Instruction::PureGlobalAffineLoopIteration
+            | Instruction::PureIndexedReaderLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1299,8 +1330,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved11
-            | Instruction::Reserved12
+            Instruction::Reserved12
             | Instruction::Reserved13
             | Instruction::Reserved14
             | Instruction::Reserved15
