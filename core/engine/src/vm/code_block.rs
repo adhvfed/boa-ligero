@@ -114,9 +114,10 @@ use super::{
     ElementIC, InlineCache,
     opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
     pure_reader::{
-        PureAffineLoopPlan, PureFunctionPlan, PureGlobalAffineLoopPlan, PureGlobalAffineStepPlan,
-        PureIndexedReaderLoopPlan, PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan,
-        PureReaderLoopPlan, PureReceiverAffineStepPlan,
+        PureAffineLoopPlan, PureClosureAffineLoopPlan, PureClosureAffineStepPlan, PureFunctionPlan,
+        PureGlobalAffineLoopPlan, PureGlobalAffineStepPlan, PureIndexedReaderLoopPlan,
+        PureLoopPlan, PureMethodLoopPlan, PurePropertyWriteLoopPlan, PureReaderLoopPlan,
+        PureReceiverAffineStepPlan,
     },
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
@@ -533,6 +534,12 @@ impl CodeBlock {
         self.pure_function_plan()?.global_affine_step()
     }
 
+    /// Return a cached proof for an affine closure over captured state/base
+    /// bindings.
+    pub(crate) fn pure_closure_affine_step(&self) -> Option<PureClosureAffineStepPlan> {
+        self.pure_function_plan()?.closure_affine_step()
+    }
+
     /// Return the statically cached pure-reader loop whose maintenance opcode
     /// just advanced to `next_pc`.
     #[inline]
@@ -550,7 +557,8 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -571,7 +579,8 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -595,7 +604,8 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -616,7 +626,8 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -640,7 +651,8 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -664,7 +676,33 @@ impl CodeBlock {
                 | PureLoopPlan::Affine(_)
                 | PureLoopPlan::PropertyWrite(_)
                 | PureLoopPlan::Method(_)
-                | PureLoopPlan::GlobalAffine(_) => None,
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
+            })
+    }
+
+    /// Return the cached captured-affine closure loop whose maintenance
+    /// opcode just advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_closure_affine_loop_plan(
+        &self,
+        next_pc: u32,
+    ) -> Option<PureClosureAffineLoopPlan> {
+        self.pure_loop_plans
+            .get_or_init(|| PureLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find_map(|plan| match plan {
+                PureLoopPlan::ClosureAffine(plan) if plan.loop_iteration_next_pc() == next_pc => {
+                    Some(plan)
+                }
+                PureLoopPlan::Reader(_)
+                | PureLoopPlan::IndexedReader(_)
+                | PureLoopPlan::Affine(_)
+                | PureLoopPlan::PropertyWrite(_)
+                | PureLoopPlan::Method(_)
+                | PureLoopPlan::GlobalAffine(_)
+                | PureLoopPlan::ClosureAffine(_) => None,
             })
     }
 
@@ -701,6 +739,7 @@ impl CodeBlock {
                 PureLoopPlan::PropertyWrite(_) => Opcode::PurePropertyWriteLoopIteration,
                 PureLoopPlan::Method(_) => Opcode::PureMethodLoopIteration,
                 PureLoopPlan::GlobalAffine(_) => Opcode::PureGlobalAffineLoopIteration,
+                PureLoopPlan::ClosureAffine(_) => Opcode::PureClosureAffineLoopIteration,
             }
             .encode();
         }
@@ -1321,6 +1360,7 @@ impl CodeBlock {
             | Instruction::PureMethodLoopIteration
             | Instruction::PureGlobalAffineLoopIteration
             | Instruction::PureIndexedReaderLoopIteration
+            | Instruction::PureClosureAffineLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1330,8 +1370,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved12
-            | Instruction::Reserved13
+            Instruction::Reserved13
             | Instruction::Reserved14
             | Instruction::Reserved15
             | Instruction::Reserved16

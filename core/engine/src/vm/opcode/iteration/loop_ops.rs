@@ -3,8 +3,8 @@ use crate::{
     vm::{
         opcode::Operation,
         pure_reader::{
-            PURE_GLOBAL_AFFINE_GUARD_MISS, PURE_INDEXED_READER_GUARD_MISS, PURE_METHOD_GUARD_MISS,
-            PURE_PROPERTY_WRITE_GUARD_MISS,
+            PURE_CLOSURE_AFFINE_GUARD_MISS, PURE_GLOBAL_AFFINE_GUARD_MISS,
+            PURE_INDEXED_READER_GUARD_MISS, PURE_METHOD_GUARD_MISS, PURE_PROPERTY_WRITE_GUARD_MISS,
         },
     },
 };
@@ -217,5 +217,37 @@ impl PureIndexedReaderLoopIteration {
 impl Operation for PureIndexedReaderLoopIteration {
     const NAME: &'static str = "PureIndexedReaderLoopIteration";
     const INSTRUCTION: &'static str = "INST - PureIndexedReaderLoopIteration";
+    const COST: u8 = 3;
+}
+
+/// Loop-maintenance opcode installed on a canonical wrapping accumulator over
+/// an affine closure with captured i32 state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureClosureAffineLoopIteration;
+
+impl PureClosureAffineLoopIteration {
+    #[inline(always)]
+    pub(crate) fn operation((): (), context: &mut Context) -> JsResult<()> {
+        if context.vm.frame().pure_loop_guard_misses & PURE_CLOSURE_AFFINE_GUARD_MISS != 0 {
+            return context.consume_loop_iterations(1);
+        }
+        let plan = context
+            .vm
+            .frame()
+            .code_block()
+            .pure_closure_affine_loop_plan(context.vm.frame().pc);
+        if let Some(plan) = plan {
+            let code = context.vm.frame().code_block.clone();
+            if plan.apply(&code, context).is_some() {
+                return Ok(());
+            }
+        }
+        context.consume_loop_iterations(1)
+    }
+}
+
+impl Operation for PureClosureAffineLoopIteration {
+    const NAME: &'static str = "PureClosureAffineLoopIteration";
+    const INSTRUCTION: &'static str = "INST - PureClosureAffineLoopIteration";
     const COST: u8 = 3;
 }
