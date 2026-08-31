@@ -14,7 +14,11 @@ use bitflags::bitflags;
 use boa_ast::scope::{BindingLocator, Scope};
 use boa_gc::{Finalize, Gc, Trace, empty_trace};
 use itertools::Itertools;
-use std::{cell::Cell, fmt::Display, fmt::Write as _};
+use std::{
+    cell::{Cell, OnceCell},
+    fmt::Display,
+    fmt::Write as _,
+};
 use thin_vec::ThinVec;
 
 #[cfg(feature = "jit")]
@@ -108,7 +112,8 @@ impl JitTieringCache {
 
 use super::{
     ElementIC, InlineCache,
-    opcode::{Address, Bytecode, Instruction, InstructionIterator},
+    opcode::{Address, Bytecode, Instruction, InstructionIterator, Opcode},
+    pure_reader::{PureReaderLoopPlan, PureReaderPlan},
     source_info::{SourceInfo, SourceMap, SourcePath},
 };
 
@@ -248,6 +253,16 @@ pub struct CodeBlock {
     /// Named-property inline caches (by-name PIC, 4-way polymorphic).
     pub(crate) ic: Box<[InlineCache]>,
 
+    /// Source-free proof for a small pure numeric reader, including cached
+    /// rejection. The code block is immutable once published, so this plan
+    /// remains valid for its lifetime; runtime object/IC guards are separate.
+    #[unsafe_ignore_trace]
+    pub(crate) pure_reader_plan: OnceCell<Option<PureReaderPlan>>,
+
+    /// Canonical pure-reader loops indexed by their maintenance opcode.
+    #[unsafe_ignore_trace]
+    pub(crate) pure_reader_loop_plans: OnceCell<Box<[PureReaderLoopPlan]>>,
+
     /// Element-access inline caches — one entry per `GetPropertyByValue` /
     /// `GetPropertyByValuePush` / `SetPropertyByValue` site. Monomorphic;
     /// caches the receiver's shape + dense-storage kind so that `obj[i]`
@@ -303,6 +318,8 @@ impl CodeBlock {
             parameter_length: 0,
             handlers: ThinVec::default(),
             ic: Box::default(),
+            pure_reader_plan: OnceCell::new(),
+            pure_reader_loop_plans: OnceCell::new(),
             element_ic: Box::default(),
             source_info: SourceInfo::new(
                 SourceMap::new(Box::default(), SourcePath::None),
@@ -472,6 +489,49 @@ impl CodeBlock {
     /// Returns true if this function requires a function scope.
     pub(crate) fn has_function_scope(&self) -> bool {
         self.flags.get().has_function_scope()
+    }
+
+    /// Return the cached proof that this code is a pure i32 property reader.
+    #[inline]
+    pub(crate) fn pure_reader_plan(&self) -> Option<&PureReaderPlan> {
+        self.pure_reader_plan
+            .get_or_init(|| PureReaderPlan::parse(self))
+            .as_ref()
+    }
+
+    /// Evaluate a cached proof that this code is a pure i32 property reader.
+    pub(crate) fn pure_reader_i32(&self, object: &JsObject) -> Option<i32> {
+        self.pure_reader_plan()?.evaluate(self, object)
+    }
+
+    /// Return the statically cached pure-reader loop whose maintenance opcode
+    /// just advanced to `next_pc`.
+    #[inline]
+    pub(crate) fn pure_reader_loop_plan(&self, next_pc: u32) -> Option<PureReaderLoopPlan> {
+        self.pure_reader_loop_plans
+            .get_or_init(|| PureReaderLoopPlan::parse_all(self))
+            .iter()
+            .copied()
+            .find(|plan| plan.loop_iteration_next_pc() == next_pc)
+    }
+
+    /// Parse canonical reader loops once and specialize only their zero-width
+    /// maintenance opcode. All ordinary loops keep the original handler and
+    /// therefore incur no runtime probe for this optimization.
+    pub(crate) fn initialize_pure_reader_loop_plans(&mut self) {
+        let plans = PureReaderLoopPlan::parse_all(self);
+        for plan in &plans {
+            let opcode = self
+                .bytecode
+                .bytes
+                .get_mut(plan.loop_iteration_pc() as usize)
+                .expect("proven loop-maintenance pc must be in bytecode");
+            debug_assert_eq!(Opcode::decode(*opcode), Opcode::IncrementLoopIteration);
+            *opcode = Opcode::PureReaderLoopIteration.encode();
+        }
+        self.pure_reader_loop_plans
+            .set(plans)
+            .expect("pure-reader loop plans must initialize exactly once");
     }
 
     /// Find exception [`Handler`] in the code block given the current program counter (`pc`).
@@ -1080,6 +1140,7 @@ impl CodeBlock {
             | Instruction::CreatePromiseCapability
             | Instruction::PopEnvironment
             | Instruction::IncrementLoopIteration
+            | Instruction::PureReaderLoopIteration
             | Instruction::IteratorNext
             | Instruction::SuperCallDerived
             | Instruction::CallSpread
@@ -1089,8 +1150,7 @@ impl CodeBlock {
             | Instruction::Generator
             | Instruction::AsyncGenerator
             | Instruction::CreateDisposableResourceScope => String::new(),
-            Instruction::Reserved6
-            | Instruction::Reserved7
+            Instruction::Reserved7
             | Instruction::Reserved8
             | Instruction::Reserved9
             | Instruction::Reserved10

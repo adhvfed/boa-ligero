@@ -336,7 +336,7 @@ impl std::fmt::Display for IndexOperand {
 }
 
 impl Opcode {
-    fn encode(self) -> u8 {
+    pub(crate) fn encode(self) -> u8 {
         self as u8
     }
 
@@ -2288,8 +2288,8 @@ generate_opcodes! {
         result: RegisterOperand,
         needs_await: RegisterOperand,
     },
-    /// Reserved [`Opcode`].
-    Reserved6 => Reserved,
+    /// Execute loop maintenance with a cached pure-reader range proof.
+    PureReaderLoopIteration,
     /// Reserved [`Opcode`].
     Reserved7 => Reserved,
     /// Reserved [`Opcode`].

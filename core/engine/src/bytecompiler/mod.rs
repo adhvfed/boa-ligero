@@ -3092,7 +3092,7 @@ impl<'ctx> ByteCompiler<'ctx> {
 
         let source_map_entries = self.source_map_builder.build(final_bytecode_len.as_u32());
 
-        CodeBlock {
+        let mut code = CodeBlock {
             length: self.length,
             register_count,
             this_mode: self.this_mode,
@@ -3104,6 +3104,8 @@ impl<'ctx> ByteCompiler<'ctx> {
             handlers: self.handlers,
             flags: Cell::new(self.code_block_flags),
             ic: self.ic.into_boxed_slice(),
+            pure_reader_plan: std::cell::OnceCell::new(),
+            pure_reader_loop_plans: std::cell::OnceCell::new(),
             element_ic: self.element_ic.into_boxed_slice(),
             source_info: SourceInfo::new(
                 SourceMap::new(source_map_entries, self.source_path),
@@ -3120,7 +3122,9 @@ impl<'ctx> ByteCompiler<'ctx> {
             jit_leaf_entry: Cell::new(crate::vm::JitLeafEntryCache::default()),
             #[cfg(feature = "trace")]
             traced: Cell::new(false),
-        }
+        };
+        code.initialize_pure_reader_loop_plans();
+        code
     }
 
     fn compile_declaration_pattern(

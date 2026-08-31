@@ -32,8 +32,6 @@ const JIT_SUM_APPLIED_BIT: u64 = 1 << 59;
 const JIT_SCAN_COUNT_SHIFT: u32 = 32;
 const JIT_SCAN_COUNT_MASK: u64 = (1 << 27) - 1;
 const JIT_GLOBAL_DECLARATIVE_IC: u32 = u32::MAX;
-const MAX_PURE_READER_INSTRUCTIONS: usize = 64;
-const MAX_PURE_READER_PROPERTIES: usize = 8;
 
 /// Compile an ordinary numeric code block to native code.
 ///
@@ -630,7 +628,9 @@ fn loop_use_def(
         | Instruction::JumpIfNotEqual { lhs, rhs, .. } => {
             comparison(usize::from(*lhs), usize::from(*rhs))
         }
-        Instruction::IncrementLoopIteration | Instruction::Jump { .. } => Ok((Vec::new(), None)),
+        Instruction::IncrementLoopIteration
+        | Instruction::PureReaderLoopIteration
+        | Instruction::Jump { .. } => Ok((Vec::new(), None)),
         _ => Err(LoopPlanRejection::UnsupportedRegionOpcode),
     }
 }
@@ -1516,6 +1516,7 @@ fn is_supported(code: &CodeBlock, opcode: crate::vm::Opcode, instruction: &Instr
         | (Opcode::JumpIfNotEqual, Instruction::JumpIfNotEqual { .. })
         | (Opcode::JumpIfFalse, Instruction::JumpIfFalse { .. })
         | (Opcode::IncrementLoopIteration, Instruction::IncrementLoopIteration)
+        | (Opcode::PureReaderLoopIteration, Instruction::PureReaderLoopIteration)
         | (Opcode::PushFromRegister, Instruction::PushFromRegister { .. })
         | (Opcode::PopIntoRegister, Instruction::PopIntoRegister { .. })
         | (Opcode::SetAccumulator, Instruction::SetAccumulator { .. })
@@ -3555,7 +3556,7 @@ impl<'a> NativeCompiler<'a> {
                     return false;
                 }
             }
-            Instruction::IncrementLoopIteration => {
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration => {
                 if !self.options.accounting.loop_iterations {
                     return true;
                 }
@@ -3880,13 +3881,15 @@ impl<'a> NativeCompiler<'a> {
         let index_increment_index = self.current_instruction.checked_sub(1)?;
         let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
             self.instructions.instructions.get(loop_iteration_index)?;
-        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
-            || self
-                .instructions
-                .pc_to_index
-                .get(loop_iteration_next_pc)
-                .copied()
-                != Some(index_increment_index)
+        if !matches!(
+            loop_iteration,
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+        ) || self
+            .instructions
+            .pc_to_index
+            .get(loop_iteration_next_pc)
+            .copied()
+            != Some(index_increment_index)
             || back_edge_address.as_u32() as usize != *loop_iteration_pc
         {
             return None;
@@ -4204,13 +4207,15 @@ impl<'a> NativeCompiler<'a> {
         let index_increment_index = comparison_entry_index.checked_sub(1)?;
         let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
             self.instructions.instructions.get(loop_iteration_index)?;
-        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
-            || self
-                .instructions
-                .pc_to_index
-                .get(loop_iteration_next_pc)
-                .copied()
-                != Some(index_increment_index)
+        if !matches!(
+            loop_iteration,
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+        ) || self
+            .instructions
+            .pc_to_index
+            .get(loop_iteration_next_pc)
+            .copied()
+            != Some(index_increment_index)
             || address.as_u32() as usize != *loop_iteration_pc
         {
             return None;
@@ -4486,13 +4491,15 @@ impl<'a> NativeCompiler<'a> {
         let index_increment_index = self.current_instruction.checked_sub(1)?;
         let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
             self.instructions.instructions.get(loop_iteration_index)?;
-        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
-            || self
-                .instructions
-                .pc_to_index
-                .get(loop_iteration_next_pc)
-                .copied()
-                != Some(index_increment_index)
+        if !matches!(
+            loop_iteration,
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+        ) || self
+            .instructions
+            .pc_to_index
+            .get(loop_iteration_next_pc)
+            .copied()
+            != Some(index_increment_index)
             || back_edge_address.as_u32() as usize != *loop_iteration_pc
         {
             return None;
@@ -4824,13 +4831,15 @@ impl<'a> NativeCompiler<'a> {
         let index_increment_index = loop_iteration_index.checked_add(1)?;
         let (loop_iteration_pc, loop_iteration_next_pc, loop_iteration) =
             self.instructions.instructions.get(loop_iteration_index)?;
-        if !matches!(loop_iteration, Instruction::IncrementLoopIteration)
-            || self
-                .instructions
-                .pc_to_index
-                .get(loop_iteration_next_pc)
-                .copied()
-                != Some(index_increment_index)
+        if !matches!(
+            loop_iteration,
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+        ) || self
+            .instructions
+            .pc_to_index
+            .get(loop_iteration_next_pc)
+            .copied()
+            != Some(index_increment_index)
         {
             return None;
         }
@@ -5885,7 +5894,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 blocks,
                 loop_exit,
             )?,
-            Instruction::IncrementLoopIteration => {
+            Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration => {
                 let helper = bcx
                     .ins()
                     .iconst(helpers.ptr, helpers.increment_loop.address as i64);
@@ -6610,151 +6619,6 @@ fn global_binding_data_value(
     cached_named_data_property_value(&code, &global, ic_index)
 }
 
-#[derive(Clone, Copy)]
-enum PureReaderValue {
-    Unset,
-    Argument,
-    I32(i32),
-}
-
-/// Evaluate the reachable prefix of a small, linear ordinary function while
-/// proving that it can only read cached data properties from argument zero.
-/// Every unsupported opcode rejects the plan before the caller loop advances.
-fn pure_named_reader_i32(code: &CodeBlock, object: &JsObject) -> Option<i32> {
-    if !code.is_ordinary()
-        || code.is_class_constructor()
-        || !code.handlers.is_empty()
-        || code.register_count > 128
-    {
-        return None;
-    }
-
-    let mut registers = vec![PureReaderValue::Unset; code.register_count as usize];
-    let mut stack = Vec::new();
-    let mut accumulator = None;
-    let mut property_reads = 0usize;
-    let mut instruction_count = 0usize;
-
-    for (_, _, instruction) in InstructionIterator::new(&code.bytecode) {
-        instruction_count = instruction_count.checked_add(1)?;
-        if instruction_count > MAX_PURE_READER_INSTRUCTIONS {
-            return None;
-        }
-        let read = |register: crate::vm::opcode::RegisterOperand| {
-            registers.get(usize::from(register)).copied()
-        };
-        let destination = |register: crate::vm::opcode::RegisterOperand| {
-            usize::from(register)
-                .lt(&registers.len())
-                .then_some(usize::from(register))
-        };
-
-        match instruction {
-            Instruction::GetArgument { index, dst } if u32::from(index) == 0 => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::Argument;
-            }
-            Instruction::StoreZero { dst } => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(0);
-            }
-            Instruction::StoreOne { dst } => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(1);
-            }
-            Instruction::StoreInt8 { value, dst } => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(i32::from(value));
-            }
-            Instruction::StoreInt16 { value, dst } => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(i32::from(value));
-            }
-            Instruction::StoreInt32 { value, dst } => {
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(value);
-            }
-            Instruction::Move { src, dst } => {
-                let value = read(src)?;
-                if matches!(value, PureReaderValue::Unset) {
-                    return None;
-                }
-                let dst = destination(dst)?;
-                registers[dst] = value;
-            }
-            Instruction::GetLengthProperty {
-                dst,
-                value,
-                ic_index,
-            }
-            | Instruction::GetPropertyByName {
-                dst,
-                value,
-                ic_index,
-            } => {
-                if !matches!(read(value)?, PureReaderValue::Argument) {
-                    return None;
-                }
-                property_reads = property_reads.checked_add(1)?;
-                if property_reads > MAX_PURE_READER_PROPERTIES {
-                    return None;
-                }
-                let value = cached_named_data_property_value(code, object, u32::from(ic_index))?
-                    .as_i32()?;
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(value);
-            }
-            Instruction::Add { dst, lhs, rhs } => {
-                let (PureReaderValue::I32(lhs), PureReaderValue::I32(rhs)) =
-                    (read(lhs)?, read(rhs)?)
-                else {
-                    return None;
-                };
-                let value = lhs.checked_add(rhs)?;
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(value);
-            }
-            Instruction::Sub { dst, lhs, rhs } => {
-                let (PureReaderValue::I32(lhs), PureReaderValue::I32(rhs)) =
-                    (read(lhs)?, read(rhs)?)
-                else {
-                    return None;
-                };
-                let value = lhs.checked_sub(rhs)?;
-                let dst = destination(dst)?;
-                registers[dst] = PureReaderValue::I32(value);
-            }
-            Instruction::PushFromRegister { src } => {
-                let value = read(src)?;
-                if matches!(value, PureReaderValue::Unset) {
-                    return None;
-                }
-                stack.push(value);
-            }
-            Instruction::PopIntoRegister { dst } => {
-                let value = stack.pop()?;
-                let dst = destination(dst)?;
-                registers[dst] = value;
-            }
-            Instruction::SetAccumulator { src } => {
-                let PureReaderValue::I32(value) = read(src)? else {
-                    return None;
-                };
-                accumulator = Some(value);
-            }
-            Instruction::CheckReturn => {}
-            Instruction::Return => {
-                if property_reads == 0 || !stack.is_empty() {
-                    return None;
-                }
-                return accumulator;
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
 fn encode_pure_reader_range_result(sum: i32, iterations: u64, applied: bool) -> u64 {
     u64::from(sum as u32)
         | (iterations.min(JIT_SCAN_COUNT_MASK) << JIT_SCAN_COUNT_SHIFT)
@@ -6809,7 +6673,7 @@ extern "C" fn jit_pure_reader_range_i32_guarded(
     let Some(object) = argument.as_object() else {
         return JIT_GUARD_FAIL_BIT;
     };
-    let Some(reader_value) = pure_named_reader_i32(ordinary.codeblock(), &object) else {
+    let Some(reader_value) = ordinary.codeblock().pure_reader_i32(&object) else {
         return JIT_GUARD_FAIL_BIT;
     };
 

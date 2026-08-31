@@ -4776,7 +4776,11 @@ mod tests {
         context.enable_jit();
         let script = crate::Script::parse(
             crate::Source::from_bytes(
-                "function read(object) { return object.x + object.y + object.z; } let object = { x: 1, y: 2, z: 3 }; function main() { let total = 0; for (let index = 0; index < 100; index++) { total += read(object); } return total; } main()",
+                // Keep this loop deliberately outside the pure range reducer:
+                // the test owns the prepared leaf-call path, while the
+                // canonical `total += read(object)` shape now completes
+                // without needing native compilation at all.
+                "function read(object) { return (object.x + object.y + object.z) | 0; } let object = { x: 1, y: 2, z: 3 }; function main() { let total = 0; for (let index = 0; index < 100; index++) { total = (total + read(object)) | 0; } return total; } main()",
             ),
             None,
             &mut context,
@@ -5802,7 +5806,10 @@ mod tests {
             .find_map(|(pc, _, instruction)| (pc as u32 == header_pc).then_some(instruction))
             .expect("loop header instruction");
         assert!(
-            matches!(header_instruction, Instruction::IncrementLoopIteration),
+            matches!(
+                header_instruction,
+                Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+            ),
             "the first-shape header and loop-iteration poll are one boundary"
         );
         let replay_pcs = replay_opcode.map_or_else(Vec::new, |opcode| {
@@ -6050,7 +6057,10 @@ mod tests {
         let loop_limit_pc = InstructionIterator::new(&code.bytecode)
             .find_map(|(pc, _, instruction)| {
                 (pc as u32 == header_pc
-                    && matches!(instruction, Instruction::IncrementLoopIteration))
+                    && matches!(
+                        instruction,
+                        Instruction::IncrementLoopIteration | Instruction::PureReaderLoopIteration
+                    ))
                 .then_some(header_pc + 1)
             })
             .expect("loop-iteration failure PC");
