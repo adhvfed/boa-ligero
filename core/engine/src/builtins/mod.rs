@@ -109,6 +109,7 @@ use crate::{
         iterable::wrap_for_valid_iterator::WrapForValidIterator,
         iterable::{AsyncFromSyncIterator, AsyncIterator, Iterator},
         map::MapIterator,
+        object::for_in_iterator::ForInIterator,
         regexp::RegExpStringIterator,
         set::SetIterator,
         string::StringIterator,
@@ -263,6 +264,7 @@ impl Realm {
         BuiltInFunctionObject::init(self);
         OrdinaryObject::init(self);
         Iterator::init(self);
+        ForInIterator::init(self);
         AsyncIterator::init(self);
         AsyncFromSyncIterator::init(self);
         IteratorConstructor::init(self);

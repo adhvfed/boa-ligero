@@ -6,12 +6,14 @@
 //! [spec]: https://tc39.es/ecma262/#sec-for-in-iterator-objects
 
 use crate::{
-    Context, JsData, JsResult, JsString, JsValue, NativeFunction,
-    builtins::iterable::create_iter_result_object,
+    Context, JsData, JsResult, JsString, JsValue,
+    builtins::{BuiltInBuilder, IntrinsicObject, iterable::create_iter_result_object},
+    context::intrinsics::Intrinsics,
     error::JsNativeError,
     js_string,
-    object::{FunctionObjectBuilder, JsObject, internal_methods::InternalMethodPropertyContext},
+    object::{JsObject, internal_methods::InternalMethodPropertyContext},
     property::PropertyKey,
+    realm::Realm,
 };
 use boa_gc::{Finalize, Trace};
 use rustc_hash::FxHashSet;
@@ -30,6 +32,19 @@ pub(crate) struct ForInIterator {
     visited_keys: FxHashSet<JsString>,
     remaining_keys: VecDeque<JsString>,
     object_was_visited: bool,
+}
+
+impl IntrinsicObject for ForInIterator {
+    fn init(realm: &Realm) {
+        BuiltInBuilder::with_intrinsic::<Self>(realm)
+            .prototype(realm.intrinsics().constructors().iterator().prototype())
+            .static_method(Self::next, js_string!("next"), 0)
+            .build();
+    }
+
+    fn get(intrinsics: &Intrinsics) -> JsObject {
+        intrinsics.objects().iterator_prototypes().for_in()
+    }
 }
 
 impl ForInIterator {
@@ -57,20 +72,25 @@ impl ForInIterator {
         object: JsValue,
         context: &Context,
     ) -> (JsObject, JsValue) {
+        let prototype = context
+            .intrinsics()
+            .objects()
+            .iterator_prototypes()
+            .for_in();
+        let next_method = prototype
+            .borrow()
+            .properties()
+            .get_own_named_data_property_value(&js_string!("next").into())
+            .cloned()
+            .expect("%ForInIteratorPrototype%.next must be initialized");
         let iterator = JsObject::from_proto_and_data_with_shared_shape(
             context.root_shape(),
-            context.intrinsics().constructors().iterator().prototype(),
+            prototype,
             Self::new(object),
         )
         .upcast();
 
-        let next_method =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(Self::next))
-                .name(js_string!("next"))
-                .length(0)
-                .build();
-
-        (iterator, next_method.into())
+        (iterator, next_method)
     }
 
     /// %ForInIteratorPrototype%.next( )
@@ -134,5 +154,44 @@ impl ForInIterator {
             iterator.object = JsValue::new(object.clone());
             iterator.object_was_visited = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iterators_share_intrinsic_prototype_and_next_method() {
+        let context = Context::default();
+        let source = JsObject::with_null_proto();
+
+        let (first, first_next) =
+            ForInIterator::create_for_in_iterator(source.clone().into(), &context);
+        let (second, second_next) = ForInIterator::create_for_in_iterator(source.into(), &context);
+
+        let prototype = context
+            .intrinsics()
+            .objects()
+            .iterator_prototypes()
+            .for_in();
+        let iterator_prototype = context.intrinsics().constructors().iterator().prototype();
+
+        assert!(first_next.strict_equals(&second_next));
+        assert!(
+            first
+                .prototype()
+                .is_some_and(|actual| JsObject::equals(&actual, &prototype))
+        );
+        assert!(
+            second
+                .prototype()
+                .is_some_and(|actual| JsObject::equals(&actual, &prototype))
+        );
+        assert!(
+            prototype
+                .prototype()
+                .is_some_and(|actual| JsObject::equals(&actual, &iterator_prototype))
+        );
     }
 }

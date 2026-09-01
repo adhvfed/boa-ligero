@@ -66,6 +66,9 @@ pub struct IteratorPrototypes {
     /// The `AsyncFromSyncIteratorPrototype` prototype object.
     async_from_sync_iterator: JsObject,
 
+    /// The `%ForInIteratorPrototype%` prototype object.
+    for_in: JsObject,
+
     /// The `ArrayIteratorPrototype` prototype object.
     array: JsObject,
 
@@ -98,6 +101,7 @@ impl Default for IteratorPrototypes {
             iterator: JsObject::with_null_proto(),
             async_iterator: JsObject::with_null_proto(),
             async_from_sync_iterator: JsObject::with_null_proto(),
+            for_in: JsObject::with_null_proto(),
             array: JsObject::with_null_proto(),
             set: JsObject::with_null_proto(),
             string: JsObject::with_null_proto(),
@@ -131,6 +135,13 @@ impl IteratorPrototypes {
     #[must_use]
     pub fn async_from_sync_iterator(&self) -> JsObject {
         self.async_from_sync_iterator.clone()
+    }
+
+    /// Returns the `%ForInIteratorPrototype%` object.
+    #[inline]
+    #[must_use]
+    pub fn for_in(&self) -> JsObject {
+        self.for_in.clone()
     }
 
     /// Returns the `SetIteratorPrototype` object.
