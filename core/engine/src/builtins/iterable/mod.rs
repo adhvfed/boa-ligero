@@ -10,7 +10,10 @@ use crate::{
     error::JsNativeError,
     js_string,
     native_function::{CoroutineBranch, CoroutineState},
-    object::{FunctionObjectBuilder, JsObject},
+    object::{
+        FunctionObjectBuilder, JsObject,
+        shape::{RootShape, shared_shape::template::ObjectTemplate},
+    },
     realm::Realm,
     symbol::JsSymbol,
     vm::CompletionRecord,
@@ -69,6 +72,9 @@ pub struct IteratorPrototypes {
     /// The `%ForInIteratorPrototype%` prototype object.
     for_in: JsObject,
 
+    /// The shared shape used for For-In Iterator instances.
+    for_in_instance: ObjectTemplate,
+
     /// The `ArrayIteratorPrototype` prototype object.
     array: JsObject,
 
@@ -97,11 +103,15 @@ pub struct IteratorPrototypes {
 
 impl Default for IteratorPrototypes {
     fn default() -> Self {
+        let root_shape = RootShape::default();
+        let for_in = JsObject::with_null_proto();
+        let for_in_instance = ObjectTemplate::with_prototype(root_shape.shape(), for_in.clone());
         Self {
             iterator: JsObject::with_null_proto(),
             async_iterator: JsObject::with_null_proto(),
             async_from_sync_iterator: JsObject::with_null_proto(),
-            for_in: JsObject::with_null_proto(),
+            for_in,
+            for_in_instance,
             array: JsObject::with_null_proto(),
             set: JsObject::with_null_proto(),
             string: JsObject::with_null_proto(),
@@ -142,6 +152,13 @@ impl IteratorPrototypes {
     #[must_use]
     pub fn for_in(&self) -> JsObject {
         self.for_in.clone()
+    }
+
+    /// Returns the shared shape for For-In Iterator instances.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn for_in_instance(&self) -> &ObjectTemplate {
+        &self.for_in_instance
     }
 
     /// Returns the `SetIteratorPrototype` object.

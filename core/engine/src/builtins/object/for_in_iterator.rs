@@ -72,23 +72,17 @@ impl ForInIterator {
         object: JsValue,
         context: &Context,
     ) -> (JsObject, JsValue) {
-        let prototype = context
-            .intrinsics()
-            .objects()
-            .iterator_prototypes()
-            .for_in();
+        let prototypes = context.intrinsics().objects().iterator_prototypes();
+        let prototype = prototypes.for_in();
         let next_method = prototype
             .borrow()
             .properties()
             .get_own_named_data_property_value(&js_string!("next").into())
             .cloned()
             .expect("%ForInIteratorPrototype%.next must be initialized");
-        let iterator = JsObject::from_proto_and_data_with_shared_shape(
-            context.root_shape(),
-            prototype,
-            Self::new(object),
-        )
-        .upcast();
+        let iterator = prototypes
+            .for_in_instance()
+            .create(Self::new(object), Vec::new());
 
         (iterator, next_method)
     }
@@ -178,6 +172,11 @@ mod tests {
         let iterator_prototype = context.intrinsics().constructors().iterator().prototype();
 
         assert!(first_next.strict_equals(&second_next));
+        assert_eq!(
+            first.borrow().properties().shape.to_addr_usize(),
+            second.borrow().properties().shape.to_addr_usize()
+        );
+        assert!(first.borrow().properties().shape.is_shared());
         assert!(
             first
                 .prototype()
