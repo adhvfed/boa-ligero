@@ -1087,6 +1087,7 @@ impl Context {
     #[inline(always)]
     #[allow(clippy::inline_always)]
     pub(crate) fn consume_instruction_budget(&mut self) -> Result<(), crate::error::EngineError> {
+        self.check_execution_deadline()?;
         if let Some(remaining) = &mut self.instruction_budget_remaining {
             if *remaining == 0 {
                 return Err(crate::error::EngineError::NoInstructionsRemain);
@@ -1102,12 +1103,32 @@ impl Context {
         &mut self,
         count: usize,
     ) -> Result<(), crate::error::EngineError> {
+        self.check_execution_deadline()?;
         if let Some(remaining) = &mut self.instruction_budget_remaining {
             if *remaining < count {
                 *remaining = 0;
                 return Err(crate::error::EngineError::NoInstructionsRemain);
             }
             *remaining -= count;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn check_execution_deadline(&mut self) -> Result<(), crate::error::EngineError> {
+        const CHECK_INTERVAL: u8 = 128;
+
+        let Some(deadline) = self.execution_deadline else {
+            return Ok(());
+        };
+        if self.execution_deadline_check_countdown > 0 {
+            self.execution_deadline_check_countdown -= 1;
+            return Ok(());
+        }
+
+        self.execution_deadline_check_countdown = CHECK_INTERVAL - 1;
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::error::EngineError::ExecutionDeadlineExceeded);
         }
         Ok(())
     }

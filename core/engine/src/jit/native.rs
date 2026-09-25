@@ -770,7 +770,7 @@ pub(super) struct NativeCompileOptions {
 
 #[derive(Clone, Copy)]
 pub(super) struct NativeAccounting {
-    pub(super) instruction_budget: bool,
+    pub(super) execution_checkpoints: bool,
     pub(super) loop_iterations: bool,
 }
 
@@ -1823,8 +1823,8 @@ impl<'a> NativeCompiler<'a> {
             bcx.switch_to_block(block);
             self.current_instruction = index;
 
-            if self.options.accounting.instruction_budget {
-                self.emit_consume_instruction_budget(&mut bcx, ctx_val, &helpers, pc, break_block);
+            if self.options.accounting.execution_checkpoints {
+                self.emit_execution_checkpoint(&mut bcx, ctx_val, &helpers, pc, break_block);
             }
 
             if !self.emit_instruction(
@@ -2254,7 +2254,7 @@ impl<'a> NativeCompiler<'a> {
             ),
             handle_return: make(jit_handle_return as *const () as usize, &[ptr], types::I64),
             consume_instruction_budget: make(
-                jit_consume_instruction_budget as *const () as usize,
+                jit_consume_execution_checkpoint as *const () as usize,
                 &[ptr, types::I32],
                 types::I64,
             ),
@@ -2269,7 +2269,7 @@ impl<'a> NativeCompiler<'a> {
     // kept as a method for a uniform `self.emit_*` dispatch style with the
     // sibling emitters below that do read `self`
     #[allow(clippy::unused_self)]
-    fn emit_consume_instruction_budget(
+    fn emit_execution_checkpoint(
         &self,
         bcx: &mut FunctionBuilder<'_>,
         ctx: cranelift_codegen::ir::Value,
@@ -2304,9 +2304,9 @@ impl<'a> NativeCompiler<'a> {
         helpers: &Helpers,
     ) -> bool {
         let guard = bcx.ins().iconst(helpers.ptr, helpers.guard.address as i64);
-        let charge_instruction_budget = bcx.ins().iconst(
+        let charge_execution_checkpoints = bcx.ins().iconst(
             types::I32,
-            i64::from(self.options.accounting.instruction_budget),
+            i64::from(self.options.accounting.execution_checkpoints),
         );
         let charge_loop_iterations = bcx.ins().iconst(
             types::I32,
@@ -2315,7 +2315,7 @@ impl<'a> NativeCompiler<'a> {
         let result = bcx.ins().call_indirect(
             helpers.guard.signature,
             guard,
-            &[ctx, charge_instruction_budget, charge_loop_iterations],
+            &[ctx, charge_execution_checkpoints, charge_loop_iterations],
         );
         let result = bcx.inst_results(result)[0];
         let native_entry = bcx.create_block();
@@ -3772,7 +3772,7 @@ impl<'a> NativeCompiler<'a> {
     /// first body bytecode.
     fn pure_reader_loop_fusion(&self, index: usize, limit: usize) -> Option<PureReaderLoopFusion> {
         if self.mode != NativeMode::I32
-            || self.options.accounting.instruction_budget
+            || self.options.accounting.execution_checkpoints
             || self.options.accounting.loop_iterations
         {
             return None;
@@ -4065,7 +4065,7 @@ impl<'a> NativeCompiler<'a> {
         limit: usize,
     ) -> Option<WrappingAffineLoopFusion> {
         if self.mode != NativeMode::I32
-            || self.options.accounting.instruction_budget
+            || self.options.accounting.execution_checkpoints
             || self.options.accounting.loop_iterations
         {
             return None;
@@ -4413,7 +4413,8 @@ impl<'a> NativeCompiler<'a> {
         index: usize,
         limit: usize,
     ) -> Option<IndexedWrappingSumFusion> {
-        if self.options.accounting.instruction_budget || self.options.accounting.loop_iterations {
+        if self.options.accounting.execution_checkpoints || self.options.accounting.loop_iterations
+        {
             return None;
         }
         let object_load_index = self.current_instruction.checked_add(1)?;
@@ -4703,7 +4704,7 @@ impl<'a> NativeCompiler<'a> {
         length_dst: usize,
         object: usize,
     ) -> Option<IndexedScanStepFusion> {
-        if self.options.accounting.instruction_budget
+        if self.options.accounting.execution_checkpoints
             || self.options.accounting.loop_iterations
             || self.mode != NativeMode::I32
         {
@@ -5140,7 +5141,7 @@ impl<'a> NativeCompiler<'a> {
     }
 
     // kept as a method for a uniform `self.emit_*` dispatch style, see
-    // emit_consume_instruction_budget above
+    // emit_execution_checkpoint above
     #[allow(clippy::unused_self)]
     fn sign_bit(
         &self,
@@ -5270,7 +5271,7 @@ impl<'a> NativeCompiler<'a> {
         // Budgeted native entries have charged this bytecode already, but a
         // guard exit asks the interpreter to execute the same bytecode. Refund
         // that charge so the interpreter remains the single owner of it.
-        if self.options.accounting.instruction_budget {
+        if self.options.accounting.execution_checkpoints {
             let helper = bcx.ins().iconst(
                 helpers.ptr,
                 helpers.refund_instruction_budget.address as i64,
@@ -5391,7 +5392,7 @@ impl<'a> NativeCompiler<'a> {
     }
 
     // kept as a method for a uniform `self.emit_*` dispatch style, see
-    // emit_consume_instruction_budget above
+    // emit_execution_checkpoint above
     #[allow(clippy::unused_self)]
     fn emit_set_pc(
         &self,
@@ -5711,7 +5712,7 @@ impl<'a> LoopRegionCompiler<'a> {
                 types::I64,
             ),
             consume_instruction_budget: make(
-                jit_consume_instruction_budget as *const () as usize,
+                jit_consume_execution_checkpoint as *const () as usize,
                 &[ptr, types::I32],
                 types::I64,
             ),
@@ -6192,16 +6193,16 @@ fn jit_break(
 
 extern "C" fn jit_guard(
     context: *mut Context,
-    charge_instruction_budget: u32,
+    charge_execution_checkpoints: u32,
     charge_loop_iterations: u32,
 ) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
-    let budget_mode_matches =
-        context.instruction_budget_remaining.is_some() == (charge_instruction_budget != 0);
+    let accounting_mode_matches =
+        context.requires_execution_checkpoints() == (charge_execution_checkpoints != 0);
     let loop_mode_matches = (context.vm.runtime_limits.loop_iteration_limit() != u64::MAX)
         == (charge_loop_iterations != 0);
-    if context.vm.frame().construct() || !budget_mode_matches || !loop_mode_matches {
+    if context.vm.frame().construct() || !accounting_mode_matches || !loop_mode_matches {
         return 0;
     }
     1
@@ -6217,14 +6218,14 @@ extern "C" fn jit_loop_entry_guard(
     backend_id: u64,
     code_id: u64,
     header_pc: u32,
-    charge_instruction_budget: u32,
+    charge_execution_checkpoints: u32,
     register_count: u32,
 ) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     let frame = context.vm.frame();
-    let budget_mode_matches =
-        context.instruction_budget_remaining.is_some() == (charge_instruction_budget != 0);
+    let accounting_mode_matches =
+        context.requires_execution_checkpoints() == (charge_execution_checkpoints != 0);
     let register_range_exists = register_count == frame.code_block.register_count
         && (register_count == 0
             || context
@@ -6237,7 +6238,7 @@ extern "C" fn jit_loop_entry_guard(
             && frame.code_block.debug_id == code_id
             && frame.pc == header_pc
             && !frame.construct()
-            && budget_mode_matches
+            && accounting_mode_matches
             && register_range_exists,
     )
 }
@@ -6263,7 +6264,7 @@ extern "C" fn jit_loop_register_guard(
 /// Charge one bytecode instruction before native lowering executes it.
 /// Failures stay in VM state because Rust values cannot unwind through the C
 /// ABI used by generated code.
-extern "C" fn jit_consume_instruction_budget(context: *mut Context, pc: u32) -> u64 {
+extern "C" fn jit_consume_execution_checkpoint(context: *mut Context, pc: u32) -> u64 {
     // SAFETY: generated code receives an exclusively borrowed live context.
     let context = unsafe { &mut *context };
     match context.consume_instruction_budget() {
@@ -7519,7 +7520,7 @@ pub(super) fn call_prepared_leaf(
     caller_code_id: u64,
     continuation_pc: u32,
 ) -> Option<u64> {
-    if context.instruction_budget_remaining().is_some()
+    if context.requires_execution_checkpoints()
         || context.runtime_limits().loop_iteration_limit() != u64::MAX
         || context.active_jit_observes_interpreted_sites
     {

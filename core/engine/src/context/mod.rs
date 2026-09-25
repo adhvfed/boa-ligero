@@ -1,7 +1,7 @@
 //! The ECMAScript context.
 
 use std::any::Any;
-use std::{cell::Cell, path::Path, rc::Rc};
+use std::{cell::Cell, path::Path, rc::Rc, time::Instant};
 
 use boa_ast::StatementList;
 use boa_interner::Interner;
@@ -104,6 +104,12 @@ pub struct Context {
     /// `None` leaves instruction accounting disabled, preserving the default
     /// behavior for embedders that do not need an execution budget.
     pub(crate) instruction_budget_remaining: Option<usize>,
+
+    /// Optional realm-thread deadline for ECMAScript bytecode execution.
+    /// Checked at bounded instruction intervals so clock reads do not happen
+    /// for every bytecode.
+    pub(crate) execution_deadline: Option<Instant>,
+    pub(crate) execution_deadline_check_countdown: u8,
 
     pub(crate) vm: Vm,
 
@@ -568,6 +574,38 @@ impl Context {
     #[inline]
     pub const fn clear_instruction_budget(&mut self) {
         self.instruction_budget_remaining = None;
+    }
+
+    /// Replaces the deadline checked during ECMAScript bytecode execution and
+    /// returns the previous deadline. The next instruction checks immediately;
+    /// subsequent checks occur at most every 128 instructions. Callers can
+    /// restore a previous deadline after a bounded callback with the returned
+    /// value.
+    ///
+    /// This deadline is cooperative: it is checked at VM instruction
+    /// boundaries and cannot interrupt a long-running native host operation.
+    /// With the JIT enabled, deadline checks use the same per-instruction path
+    /// as instruction-budget accounting.
+    #[inline]
+    pub fn replace_execution_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        let previous = std::mem::replace(&mut self.execution_deadline, deadline);
+        self.execution_deadline_check_countdown = 0;
+        previous
+    }
+
+    /// Returns whether bytecode execution has an active deadline.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn has_execution_deadline(&self) -> bool {
+        self.execution_deadline.is_some()
+    }
+
+    /// Whether VM/JIT code must retain per-instruction accounting hooks.
+    #[cfg(feature = "jit")]
+    #[inline]
+    #[must_use]
+    pub(crate) const fn requires_execution_checkpoints(&self) -> bool {
+        self.instruction_budget_remaining.is_some() || self.execution_deadline.is_some()
     }
 
     /// Returns the amount of remaining instructions to be executed.
@@ -1439,6 +1477,8 @@ impl ContextBuilder {
                 }
             },
             instruction_budget_remaining: self.instruction_budget,
+            execution_deadline: None,
+            execution_deadline_check_countdown: 0,
             kept_alive: Vec::new(),
             host_hooks,
             clock,

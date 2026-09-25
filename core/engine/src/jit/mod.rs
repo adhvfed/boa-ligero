@@ -2085,7 +2085,7 @@ impl JitBackend {
                 return JitLoopScheduleAction::Closed;
             }
         }
-        let budgeted = context.instruction_budget_remaining().is_some();
+        let budgeted = context.requires_execution_checkpoints();
         let diagnostic = self.diagnostics.is_some();
         let i32_key = JitCacheKey::loop_region(
             code.debug_id,
@@ -2532,7 +2532,7 @@ impl JitBackend {
         if !matches!(
             code.jit_admission(self.id),
             crate::vm::JitAdmissionState::DeniedLeaf | crate::vm::JitAdmissionState::DeniedSmall
-        ) || context.instruction_budget_remaining().is_some()
+        ) || context.requires_execution_checkpoints()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
             || self.diagnostics.is_some()
         {
@@ -2783,7 +2783,7 @@ impl JitBackend {
         });
 
         let target = if let Some(target_code_id) = ordinary_target {
-            let budgeted = context.instruction_budget_remaining().is_some();
+            let budgeted = context.requires_execution_checkpoints();
             let loop_metered = context.runtime_limits().loop_iteration_limit() != u64::MAX;
             let cached_native = match self.cache.get(&JitCacheKey::function_with_loop_mode(
                 target_code_id,
@@ -2819,14 +2819,14 @@ impl JitBackend {
     fn cached_entry(
         &mut self,
         code: &CodeBlock,
-        charge_instruction_budget: bool,
+        charge_execution_checkpoints: bool,
         charge_loop_iterations: bool,
     ) -> Option<CachedEntry> {
         self.stats.cache_requests = self.stats.cache_requests.saturating_add(1);
         let diagnostic = self.diagnostics.is_some();
         let cache_key = JitCacheKey::function_with_loop_mode(
             code.debug_id,
-            charge_instruction_budget,
+            charge_execution_checkpoints,
             charge_loop_iterations,
             diagnostic,
         );
@@ -2871,7 +2871,7 @@ impl JitBackend {
         let started = Instant::now();
         let result = self.compile_codeblock_with_kind(
             code,
-            charge_instruction_budget,
+            charge_execution_checkpoints,
             charge_loop_iterations,
             diagnostic,
         );
@@ -2929,7 +2929,7 @@ impl JitBackend {
             diagnostics.record_compile(JitCompileRecord {
                 code_id: code.debug_id,
                 entry_pc: 0,
-                budgeted: charge_instruction_budget,
+                budgeted: charge_execution_checkpoints,
                 loop_metered: charge_loop_iterations,
                 outcome: if native {
                     JitCompileOutcome::Native
@@ -2980,9 +2980,10 @@ impl JitBackend {
         code: &CodeBlock,
         context: &mut Context,
     ) -> Option<u64> {
-        let charge_instruction_budget = context.instruction_budget_remaining().is_some();
+        let charge_execution_checkpoints = context.requires_execution_checkpoints();
         let charge_loop_iterations = context.runtime_limits().loop_iteration_limit() != u64::MAX;
-        let cached = self.cached_entry(code, charge_instruction_budget, charge_loop_iterations)?;
+        let cached =
+            self.cached_entry(code, charge_execution_checkpoints, charge_loop_iterations)?;
         if cached.native {
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
         }
@@ -3154,7 +3155,7 @@ impl JitBackend {
     fn compile_codeblock_with_kind(
         &mut self,
         code: &CodeBlock,
-        charge_instruction_budget: bool,
+        charge_execution_checkpoints: bool,
         charge_loop_iterations: bool,
         instrument_storage: bool,
     ) -> FunctionCompileResult {
@@ -3164,7 +3165,7 @@ impl JitBackend {
             code,
             native::NativeCompileOptions {
                 accounting: native::NativeAccounting {
-                    instruction_budget: charge_instruction_budget,
+                    execution_checkpoints: charge_execution_checkpoints,
                     loop_iterations: charge_loop_iterations,
                 },
                 diagnostics: native::NativeDiagnostics {

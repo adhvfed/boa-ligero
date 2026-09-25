@@ -274,6 +274,9 @@ impl Call {
         if context.vm.trace || ordinary.codeblock().traceable() {
             return Ok(false);
         }
+        if context.has_execution_deadline() {
+            return Ok(false);
+        }
 
         let Some(input) = context
             .vm

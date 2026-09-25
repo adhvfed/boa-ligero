@@ -1652,6 +1652,7 @@ impl PureNumericLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -2036,6 +2037,7 @@ impl PureReaderLoopPlan {
 
     pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -2430,6 +2432,7 @@ impl PureIndexedReaderLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -2821,6 +2824,7 @@ impl PureClosureAffineLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -3201,6 +3205,7 @@ impl PureAffineLoopPlan {
 
     pub(crate) fn apply(self, caller_code: &CodeBlock, context: &mut Context) -> Option<()> {
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -3512,6 +3517,7 @@ impl PureMethodLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -3835,6 +3841,7 @@ impl PureGlobalAffineLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;
@@ -4194,6 +4201,7 @@ impl PurePropertyWriteLoopPlan {
             return None;
         }
         if context.instruction_budget_remaining().is_some()
+            || context.has_execution_deadline()
             || context.runtime_limits().loop_iteration_limit() != u64::MAX
         {
             return None;

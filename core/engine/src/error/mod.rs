@@ -365,6 +365,10 @@ pub enum EngineError {
     #[error("NoInstructionsRemainError: instruction budget was exhausted")]
     NoInstructionsRemain,
 
+    /// Error thrown when an execution deadline is reached.
+    #[error("ExecutionDeadlineExceededError: execution deadline was reached")]
+    ExecutionDeadlineExceeded,
+
     /// Error thrown when a runtime limit is exceeded.
     #[error("RuntimeLimitError: {0}")]
     RuntimeLimit(#[from] RuntimeLimitError),
@@ -383,6 +387,7 @@ impl EngineError {
     fn into_erased(self, context: &mut Context) -> ErasedEngineError {
         match self {
             EngineError::NoInstructionsRemain => ErasedEngineError::NoInstructionsRemain,
+            EngineError::ExecutionDeadlineExceeded => ErasedEngineError::ExecutionDeadlineExceeded,
             EngineError::RuntimeLimit(err) => ErasedEngineError::RuntimeLimit(err),
             EngineError::Panic(err) => ErasedEngineError::Panic(ErasedPanicError {
                 message: err.message,
@@ -1604,6 +1609,10 @@ pub enum ErasedEngineError {
     /// Error thrown when an instruction budget is exhausted.
     #[error("NoInstructionsRemainError: instruction budget was exhausted")]
     NoInstructionsRemain,
+
+    /// Error thrown when an execution deadline is reached.
+    #[error("ExecutionDeadlineExceededError: execution deadline was reached")]
+    ExecutionDeadlineExceeded,
 
     /// Error thrown when a runtime limit is exceeded.
     #[error("RuntimeLimitError: {0}")]
