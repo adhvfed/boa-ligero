@@ -962,6 +962,7 @@ impl PropertyMap {
     /// semantics. Returning `None` before iterating lets native callers replay
     /// the original property access when the storage kind or range is not
     /// exact.
+    #[cfg(any(feature = "jit", test))]
     pub(crate) fn wrapping_sum_contiguous_i32(
         &self,
         start: u32,

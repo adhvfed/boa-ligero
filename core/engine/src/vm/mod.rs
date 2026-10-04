@@ -20,7 +20,7 @@ use shadow_stack::ShadowStack;
 use std::{future::Future, ops::ControlFlow, path::Path, pin::Pin, task};
 
 #[cfg(feature = "trace")]
-use crate::sys::time::Instant;
+use crate::sys::time::Instant as TraceInstant;
 
 #[allow(unused_imports)]
 pub(crate) use opcode::{Instruction, InstructionIterator, Opcode};
@@ -1013,7 +1013,7 @@ impl Context {
             .code_block()
             .instruction_operands(&instruction);
 
-        let instant = Instant::now();
+        let instant = TraceInstant::now();
         let result = self.execute_instruction(f, opcode);
         let duration = instant.elapsed();
 
