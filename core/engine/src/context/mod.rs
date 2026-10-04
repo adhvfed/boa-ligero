@@ -310,6 +310,15 @@ impl Context {
         Script::parse(src, None, self)?.evaluate(self)
     }
 
+    /// Parse JSON with the engine's builtin parser in the current realm.
+    ///
+    /// This does not consult author-modifiable `JSON` or `JSON.parse` globals
+    /// and does not invoke a reviver. Syntax and execution-limit errors are
+    /// returned to the embedding.
+    pub fn parse_json(&mut self, text: &str) -> JsResult<JsValue> {
+        builtins::json::Json::parse(&JsValue::undefined(), &[JsString::from(text).into()], self)
+    }
+
     /// Applies optimizations to the [`StatementList`] inplace.
     pub fn optimize_statement_list(
         &mut self,

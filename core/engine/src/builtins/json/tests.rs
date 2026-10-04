@@ -17,6 +17,46 @@ fn json_sanity() {
 }
 
 #[test]
+fn embedding_json_parser_ignores_author_globals() {
+    let mut ctx = crate::Context::default();
+    ctx.eval(crate::Source::from_bytes(
+        "JSON.parse = () => { throw new Error('author parser'); }; globalThis.JSON = null;",
+    ))
+    .unwrap();
+    let value = ctx
+        .parse_json(r#"{"answer":42,"__proto__":{"safe":true}}"#)
+        .unwrap();
+    ctx.register_global_property(
+        js_string!("parsed"),
+        value,
+        crate::property::Attribute::all(),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.eval(crate::Source::from_bytes(
+            "parsed.answer === 42 && Object.hasOwn(parsed, '__proto__') && Object.getPrototypeOf(parsed) === Object.prototype",
+        ))
+        .unwrap(),
+        JsValue::from(true),
+    );
+    assert!(
+        ctx.parse_json("{invalid}")
+            .unwrap_err()
+            .as_native()
+            .is_some_and(|error| { matches!(error.kind(), JsNativeErrorKind::Syntax) })
+    );
+}
+
+#[test]
+fn embedding_json_parser_enforces_execution_limits() {
+    let mut ctx = crate::Context::default();
+    ctx.set_instruction_budget(0);
+    assert!(ctx.parse_json("{\"answer\":42}").is_err());
+    ctx.clear_instruction_budget();
+    assert!(ctx.parse_json("{\"answer\":42}").is_ok());
+}
+
+#[test]
 fn json_stringify_remove_undefined_values_from_objects() {
     run_test_actions([TestAction::assert_eq(
         r#"JSON.stringify({ aaa: undefined, bbb: 'ccc' })"#,
