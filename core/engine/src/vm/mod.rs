@@ -110,6 +110,9 @@ pub struct Vm {
     /// because we don't push a frame for them.
     pub(crate) native_active_function: Option<JsObject>,
 
+    /// Realm from which the currently executing native function was invoked.
+    pub(crate) native_caller_realm: Option<Realm>,
+
     /// Number of nested host calls that re-enter the VM via `Context::run()`.
     ///
     /// This is incremented by high-level host entry points such as
@@ -604,6 +607,7 @@ impl Vm {
             pending_exception: None,
             runtime_limits: RuntimeLimits::default(),
             native_active_function: None,
+            native_caller_realm: None,
             host_call_depth: 0,
             shadow_stack: ShadowStack::default(),
             #[cfg(feature = "jit")]

@@ -635,6 +635,19 @@ impl Context {
         &self.vm.frame().realm
     }
 
+    /// Returns the realm that invoked the currently executing native function.
+    ///
+    /// Native functions execute in their defining realm. Host bindings that
+    /// expose realm-specific wrappers can use this to identify the immediate
+    /// caller instead. Nested native calls replace this value temporarily and
+    /// restore it when they return, including when they throw. Outside a native
+    /// call this returns `None`; it does not model an HTML incumbent realm.
+    #[inline]
+    #[must_use]
+    pub fn native_caller_realm(&self) -> Option<&Realm> {
+        self.vm.native_caller_realm.as_ref()
+    }
+
     /// Set the value of trace on the context
     #[cfg(feature = "trace")]
     #[inline]
@@ -1590,5 +1603,81 @@ mod jit_defaults_tests {
     #[test]
     fn unsupported_hosts_remain_in_interpreter_mode() {
         assert!(JitBackend::try_new_with_isa_builder(Err("unsupported architecture")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod native_caller_realm_tests {
+    use super::Context;
+    use crate::object::FunctionObjectBuilder;
+    use crate::property::Attribute;
+    use crate::{JsNativeError, JsValue, NativeFunction, Source, js_string};
+
+    #[test]
+    fn native_caller_realm_restores_nested_calls_and_errors() {
+        let mut context = Context::default();
+        let caller = context.realm().clone();
+        let callee = context.create_realm().unwrap();
+        assert!(context.native_caller_realm().is_none());
+
+        let inner = NativeFunction::from_copy_closure_with_captures(
+            |_, args, (caller, callee), context| {
+                assert_eq!(context.realm(), caller);
+                assert_eq!(context.native_caller_realm(), Some(callee));
+                if args.first().is_some_and(JsValue::to_boolean) {
+                    return Err(JsNativeError::typ().with_message("nested failure").into());
+                }
+                Ok(JsValue::undefined())
+            },
+            (caller.clone(), callee.clone()),
+        )
+        .to_js_function(&caller);
+        let outer = NativeFunction::from_copy_closure_with_captures(
+            |_, _, (caller, callee, inner), context| {
+                assert_eq!(context.realm(), callee);
+                assert_eq!(context.native_caller_realm(), Some(caller));
+                let active = context.active_function_object();
+                for throws in [false, true] {
+                    let result = inner.call(&JsValue::undefined(), &[throws.into()], context);
+                    assert_eq!(result.is_err(), throws);
+                    assert_eq!(context.realm(), callee);
+                    assert_eq!(context.native_caller_realm(), Some(caller));
+                    assert_eq!(context.active_function_object(), active);
+                }
+                Ok(JsValue::undefined())
+            },
+            (caller.clone(), callee.clone(), inner),
+        );
+        let outer = FunctionObjectBuilder::new(&callee, outer)
+            .constructor(true)
+            .build();
+        context
+            .register_global_property(js_string!("outer"), outer, Attribute::all())
+            .unwrap();
+        context
+            .eval(Source::from_bytes("outer(); new outer();"))
+            .unwrap();
+        let failing = NativeFunction::from_copy_closure_with_captures(
+            |_, _, (caller, callee), context| {
+                assert_eq!(context.realm(), callee);
+                assert_eq!(context.native_caller_realm(), Some(caller));
+                Err(JsNativeError::typ().with_message("outer failure").into())
+            },
+            (caller.clone(), callee.clone()),
+        );
+        let failing = FunctionObjectBuilder::new(&callee, failing)
+            .constructor(true)
+            .build();
+        context
+            .register_global_property(js_string!("failing"), failing, Attribute::all())
+            .unwrap();
+        context
+            .eval(Source::from_bytes(
+                "try { failing(); } catch {} try { new failing(); } catch {}",
+            ))
+            .unwrap();
+        assert_eq!(context.realm(), &caller);
+        assert!(context.native_caller_realm().is_none());
+        assert!(context.vm.native_active_function.is_none());
     }
 }
