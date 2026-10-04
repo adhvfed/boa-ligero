@@ -1616,39 +1616,39 @@ mod native_caller_realm_tests {
     #[test]
     fn native_caller_realm_restores_nested_calls_and_errors() {
         let mut context = Context::default();
-        let caller = context.realm().clone();
-        let callee = context.create_realm().unwrap();
+        let origin = context.realm().clone();
+        let destination = context.create_realm().unwrap();
         assert!(context.native_caller_realm().is_none());
 
         let inner = NativeFunction::from_copy_closure_with_captures(
-            |_, args, (caller, callee), context| {
-                assert_eq!(context.realm(), caller);
-                assert_eq!(context.native_caller_realm(), Some(callee));
+            |_, args, (origin, destination), context| {
+                assert_eq!(context.realm(), origin);
+                assert_eq!(context.native_caller_realm(), Some(destination));
                 if args.first().is_some_and(JsValue::to_boolean) {
                     return Err(JsNativeError::typ().with_message("nested failure").into());
                 }
                 Ok(JsValue::undefined())
             },
-            (caller.clone(), callee.clone()),
+            (origin.clone(), destination.clone()),
         )
-        .to_js_function(&caller);
+        .to_js_function(&origin);
         let outer = NativeFunction::from_copy_closure_with_captures(
-            |_, _, (caller, callee, inner), context| {
-                assert_eq!(context.realm(), callee);
-                assert_eq!(context.native_caller_realm(), Some(caller));
+            |_, _, (origin, destination, inner), context| {
+                assert_eq!(context.realm(), destination);
+                assert_eq!(context.native_caller_realm(), Some(origin));
                 let active = context.active_function_object();
                 for throws in [false, true] {
                     let result = inner.call(&JsValue::undefined(), &[throws.into()], context);
                     assert_eq!(result.is_err(), throws);
-                    assert_eq!(context.realm(), callee);
-                    assert_eq!(context.native_caller_realm(), Some(caller));
+                    assert_eq!(context.realm(), destination);
+                    assert_eq!(context.native_caller_realm(), Some(origin));
                     assert_eq!(context.active_function_object(), active);
                 }
                 Ok(JsValue::undefined())
             },
-            (caller.clone(), callee.clone(), inner),
+            (origin.clone(), destination.clone(), inner),
         );
-        let outer = FunctionObjectBuilder::new(&callee, outer)
+        let outer = FunctionObjectBuilder::new(&destination, outer)
             .constructor(true)
             .build();
         context
@@ -1658,14 +1658,14 @@ mod native_caller_realm_tests {
             .eval(Source::from_bytes("outer(); new outer();"))
             .unwrap();
         let failing = NativeFunction::from_copy_closure_with_captures(
-            |_, _, (caller, callee), context| {
-                assert_eq!(context.realm(), callee);
-                assert_eq!(context.native_caller_realm(), Some(caller));
+            |_, _, (origin, destination), context| {
+                assert_eq!(context.realm(), destination);
+                assert_eq!(context.native_caller_realm(), Some(origin));
                 Err(JsNativeError::typ().with_message("outer failure").into())
             },
-            (caller.clone(), callee.clone()),
+            (origin.clone(), destination.clone()),
         );
-        let failing = FunctionObjectBuilder::new(&callee, failing)
+        let failing = FunctionObjectBuilder::new(&destination, failing)
             .constructor(true)
             .build();
         context
@@ -1676,7 +1676,7 @@ mod native_caller_realm_tests {
                 "try { failing(); } catch {} try { new failing(); } catch {}",
             ))
             .unwrap();
-        assert_eq!(context.realm(), &caller);
+        assert_eq!(context.realm(), &origin);
         assert!(context.native_caller_realm().is_none());
         assert!(context.vm.native_active_function.is_none());
     }
