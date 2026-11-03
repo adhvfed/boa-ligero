@@ -38,6 +38,10 @@ impl TestFetcher {
 }
 
 impl crate::fetch::Fetcher for TestFetcher {
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "Record requests when polled, matching the lazy production fetcher contract"
+    )]
     async fn fetch(
         self: Rc<Self>,
         request: JsRequest,
