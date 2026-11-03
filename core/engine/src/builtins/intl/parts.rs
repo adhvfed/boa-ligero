@@ -247,7 +247,7 @@ mod tests {
     fn unmarked_text_policies_preserve_boundaries() {
         let mut ignored = PartsCollector::new(UnmarkedStyle::Ignore);
         ignored.write_str("ignored").unwrap();
-        assert!(ignored.parts.is_empty());
+        assert_eq!(ignored.parts.len(), 0);
 
         let mut literal = PartsCollector::new(UnmarkedStyle::Literal);
         literal.write_str("two ").unwrap();

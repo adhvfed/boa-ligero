@@ -4406,7 +4406,7 @@ mod tests {
         assert_eq!(snapshot.schema_version, JIT_DIAGNOSTIC_SCHEMA_VERSION);
         assert_eq!(snapshot.admission_records.len(), 4);
         assert_eq!(snapshot.dropped_admission_records, 0);
-        assert!(snapshot.compile_records.is_empty());
+        assert_eq!(snapshot.compile_records.len(), 0);
         assert!(snapshot.admission_records.iter().any(|record| {
             !record.allowed
                 && record.reason == JitAdmissionReason::DeniedStraightLineTooSmall
@@ -4590,7 +4590,7 @@ mod tests {
         assert!(one.dropped_call_observations >= 1, "snapshot: {one:?}");
 
         let zero = run(0);
-        assert!(zero.call_records.is_empty());
+        assert_eq!(zero.call_records.len(), 0);
         assert!(zero.dropped_call_observations >= 2, "snapshot: {zero:?}");
     }
 
@@ -7617,7 +7617,7 @@ mod tests {
         assert_eq!(retained.dropped_loop_observations, 0);
 
         let zero = run(0);
-        assert!(zero.loop_records.is_empty());
+        assert_eq!(zero.loop_records.len(), 0);
         assert_eq!(zero.dropped_loop_observations, 440);
     }
 
@@ -8572,7 +8572,7 @@ mod tests {
         let snapshot = context
             .jit_diagnostic_snapshot()
             .expect("diagnostics were enabled");
-        assert!(snapshot.compile_records.is_empty());
+        assert_eq!(snapshot.compile_records.len(), 0);
         assert_eq!(snapshot.exit_records.len(), 1, "snapshot: {snapshot:?}");
         let exit = snapshot.exit_records[0];
         assert_eq!(exit.kind, JitDiagnosticExitKind::Deopt);

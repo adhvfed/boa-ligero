@@ -961,6 +961,10 @@ fn detached_static_and_dynamic_module_loads_survive_non_blocking_job_drains() {
             }))
         }
 
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Fail only if the borrowing fallback future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
