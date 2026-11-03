@@ -11,6 +11,10 @@ use boa_engine::{Context, JsResult, JsString, Module, Source, js_string};
 fn test_json_module_from_str() {
     struct TestModuleLoader(JsString);
     impl ModuleLoader for TestModuleLoader {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Defer module parsing and context borrows until the loader future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
@@ -66,6 +70,10 @@ fn test_json_module_from_str() {
 fn test_json_module_dynamic_import() {
     struct TestModuleLoader(JsString);
     impl ModuleLoader for TestModuleLoader {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Defer module parsing and context borrows until the loader future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
@@ -148,6 +156,10 @@ fn test_json_module_dynamic_import() {
 fn test_json_module_static_import_with_attributes() {
     struct TestModuleLoader(JsString);
     impl ModuleLoader for TestModuleLoader {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Defer module parsing and context borrows until the loader future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
@@ -203,6 +215,10 @@ fn test_json_module_static_import_with_attributes() {
 fn test_json_module_reexport_with_attributes() {
     struct TestModuleLoader(JsString);
     impl ModuleLoader for TestModuleLoader {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Defer module parsing and context borrows until the loader future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
@@ -367,6 +383,10 @@ fn test_dynamic_import_non_string_attribute_value() {
 fn test_dynamic_import_symbol_key() {
     struct TestModuleLoader(JsString);
     impl ModuleLoader for TestModuleLoader {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "Defer module parsing and context borrows until the loader future is polled"
+        )]
         async fn load_imported_module(
             self: Rc<Self>,
             _referrer: Referrer,
