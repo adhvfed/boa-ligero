@@ -17,7 +17,7 @@ impl Fetcher for ErrorFetcher {
         _request: JsRequest,
         _signal: Option<JsObject>,
         _context: &RefCell<&mut Context>,
-    ) -> impl std::future::Future<Output = JsResult<JsResponse>> {
+    ) -> impl Future<Output = JsResult<JsResponse>> {
         std::future::ready(Err(
             js_error!(ReferenceError: "ErrorFetcher used in fetch API."),
         ))
