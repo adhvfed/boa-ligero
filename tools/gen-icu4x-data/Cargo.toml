@@ -28,17 +28,19 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 ureq.workspace = true
 zip.workspace = true
+icu_pattern = { workspace = true, features = ["serde"] }
 
 # Components
 
 icu_casemap = { workspace = true, features = ["datagen"] }
+icu_calendar = { workspace = true, features = ["datagen"] }
 icu_collator = { workspace = true, features = ["datagen"] }
 icu_datetime = { workspace = true, features = ["datagen"] }
 icu_time = { workspace = true, features = ["datagen"] }
 icu_decimal = { workspace = true, features = ["datagen", "unstable"] }
-icu_experimental = { workspace = true, features = ["datagen"] }
 icu_list = { workspace = true, features = ["datagen"] }
 icu_locale = { workspace = true, features = ["datagen"] }
+icu_locale_fallback = { workspace = true, features = ["datagen"] }
 icu_normalizer = { workspace = true, features = ["datagen"] }
 icu_plurals = { workspace = true, features = ["datagen", "unstable"] }
 icu_segmenter = { workspace = true, features = ["datagen"] }
@@ -48,3 +50,7 @@ workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
+
+[dev-dependencies]
+icu_plurals = { workspace = true, features = ["compiled_data"] }
+writeable.workspace = true

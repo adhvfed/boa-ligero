@@ -21,7 +21,7 @@ fn dtf_basic() {
             let formatter = new Intl.DateTimeFormat('en-US');
             let result = formatter.format(date);
         "}),
-        TestAction::assert_eq("result === '12/20/20'", true),
+        TestAction::assert_eq("result === '12/20/2020'", true),
     ]);
     run_test_actions([
         TestAction::run(indoc! {"
@@ -264,4 +264,37 @@ fn format_to_parts_rejects_a_non_finite_date() {
         crate::JsNativeErrorKind::Range,
         "formatted date cannot be NaN",
     )]);
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn bundled_calendar_data_formats_non_gregorian_years() {
+    run_test_actions([
+        TestAction::run(
+            r#"
+            const calendarResults = ["gregory", "japanese", "buddhist"].map(calendar => {
+                const formatter = new Intl.DateTimeFormat("en-US", {
+                    calendar, year: "numeric", month: "numeric", day: "numeric", timeZone: "UTC"
+                });
+                const date = new Date(Date.UTC(2020, 11, 20));
+                const parts = formatter.formatToParts(date);
+                return {
+                    year: parts.find(part => part.type === "year")?.value,
+                    partsAgree: parts.map(part => part.value).join("") === formatter.format(date)
+                };
+            });
+        "#,
+        ),
+        TestAction::assert_eq(
+            "JSON.stringify(calendarResults.map(result => result.year))",
+            js_string!(r#"["2020","2","2563"]"#),
+        ),
+        TestAction::assert("calendarResults.every(result => result.partsAgree)"),
+        TestAction::assert_eq(
+            r#"new Intl.DateTimeFormat("en-US", {
+                year: "2-digit", month: "numeric", day: "numeric", timeZone: "UTC"
+            }).formatToParts(new Date(Date.UTC(2020, 11, 20))).find(part => part.type === "year").value"#,
+            js_string!("20"),
+        ),
+    ]);
 }

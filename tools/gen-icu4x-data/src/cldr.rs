@@ -64,6 +64,7 @@ struct CurrencyFormats {
 
 /// Supplemental number-format data indexed by CLDR locale and numbering system.
 pub(crate) struct SupplementalNumberData {
+    unit_patterns: HashMap<DataIdentifierCow<'static>, boa_icu_data::UnitsDisplayNames<'static>>,
     special_symbols: HashMap<DataIdentifierCow<'static>, NumberSpecialSymbols<'static>>,
     accounting_patterns: HashMap<DataLocale, CurrencyAccountingPatterns<'static>>,
 }
@@ -72,6 +73,7 @@ impl SupplementalNumberData {
     pub(crate) fn load() -> Result<Self, Box<dyn Error>> {
         let archive_path = cldr_archive_path()?;
         let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+        let unit_patterns = load_unit_patterns(&mut archive)?;
         let mut special_symbols = HashMap::new();
         let mut accounting_patterns = HashMap::new();
 
@@ -153,9 +155,16 @@ impl SupplementalNumberData {
         }
 
         Ok(Self {
+            unit_patterns,
             special_symbols,
             accounting_patterns,
         })
+    }
+
+    pub(crate) const fn unit_patterns(
+        &self,
+    ) -> &HashMap<DataIdentifierCow<'static>, boa_icu_data::UnitsDisplayNames<'static>> {
+        &self.unit_patterns
     }
 
     pub(crate) const fn special_symbols(
@@ -392,11 +401,105 @@ fn cldr_archive_path() -> Result<PathBuf, Box<dyn Error>> {
             .parent()
             .expect("the CLDR cache path has a parent"),
     )?;
-    io::copy(
-        &mut reader,
-        &mut BufWriter::new(File::create(&archive_path)?),
-    )?;
+    let partial_path = archive_path.with_extension(format!("{}.partial", std::process::id()));
+    let result = (|| -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(&partial_path)?);
+        io::copy(&mut reader, &mut writer)?;
+        io::Write::flush(&mut writer)?;
+        drop(writer);
+        fs::rename(&partial_path, &archive_path)
+    })();
+    if let Err(error) = result {
+        let _unused = fs::remove_file(&partial_path);
+        return Err(error.into());
+    }
     Ok(archive_path)
+}
+
+fn load_unit_patterns(
+    archive: &mut ZipArchive<File>,
+) -> Result<
+    HashMap<DataIdentifierCow<'static>, boa_icu_data::UnitsDisplayNames<'static>>,
+    Box<dyn Error>,
+> {
+    let mut unit_patterns = HashMap::new();
+    for index in 0..archive.len() {
+        let name = archive.by_index_raw(index)?.name()?.into_owned();
+        let Some(locale_name) = name
+            .strip_prefix("cldr-units-full/main/")
+            .and_then(|n| n.strip_suffix("/units.json"))
+        else {
+            continue;
+        };
+        let locale = if locale_name == "root" {
+            DataLocale::default()
+        } else {
+            DataLocale::try_from_str(locale_name)?
+        };
+        let resource: serde_json::Value = serde_json::from_reader(archive.by_index(index)?)?;
+        let main = resource
+            .get("main")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("invalid CLDR unit resource")?;
+        let entry = main.get(locale_name).ok_or("CLDR unit locale mismatch")?;
+        for width in ["long", "short", "narrow"] {
+            let units = entry
+                .get("units")
+                .and_then(|u| u.get(width))
+                .and_then(serde_json::Value::as_object)
+                .ok_or("missing CLDR unit width")?;
+            for (key, value) in units {
+                let Some((_, unit)) = key.split_once('-') else {
+                    continue;
+                };
+                let attribute = format!("{width}-{unit}");
+                if !super::is_sanctioned_unit_attribute(&attribute) {
+                    continue;
+                }
+                unit_patterns.insert(
+                    DataIdentifierCow::from_owned(
+                        DataMarkerAttributes::try_from_str(&attribute)
+                            .map_err(|_| "invalid CLDR unit attribute")?
+                            .to_owned(),
+                        locale,
+                    ),
+                    parse_unit_patterns(value)?,
+                );
+            }
+        }
+    }
+    Ok(unit_patterns)
+}
+
+fn parse_unit_patterns(
+    value: &serde_json::Value,
+) -> Result<boa_icu_data::UnitsDisplayNames<'static>, Box<dyn Error>> {
+    use icu_pattern::{PatternString, SinglePlaceholder};
+    use icu_plurals::PluralElements;
+    let parse = |key: &str| -> Result<Option<PatternString<SinglePlaceholder>>, serde_json::Error> {
+        value
+            .get(key)
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+    };
+    let other = parse("unitPattern-count-other")?.ok_or("unit has no other plural pattern")?;
+    let zero = parse("unitPattern-count-zero")?;
+    let one = parse("unitPattern-count-one")?;
+    let two = parse("unitPattern-count-two")?;
+    let few = parse("unitPattern-count-few")?;
+    let many = parse("unitPattern-count-many")?;
+    let explicit_zero = parse("displayName-count-0")?;
+    let explicit_one = parse("displayName-count-1")?;
+    Ok(PluralElements::new(&*other)
+        .with_zero_value(zero.as_deref())
+        .with_one_value(one.as_deref())
+        .with_two_value(two.as_deref())
+        .with_few_value(few.as_deref())
+        .with_many_value(many.as_deref())
+        .with_explicit_zero_value(explicit_zero.as_deref())
+        .with_explicit_one_value(explicit_one.as_deref())
+        .into())
 }
 
 #[cfg(test)]
@@ -445,5 +548,57 @@ mod tests {
             .get(&DataLocale::try_from_str("pt").unwrap())
             .unwrap();
         assert!(pt.standard.is_none());
+    }
+}
+
+#[cfg(test)]
+mod unit_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn requires_other_plural_pattern_and_valid_placeholders() {
+        assert!(
+            parse_unit_patterns(&serde_json::json!({"unitPattern-count-one": "{0} byte"})).is_err()
+        );
+        assert!(
+            parse_unit_patterns(&serde_json::json!({"unitPattern-count-other": "{0 bytes"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preserves_plural_categories_and_literal_patterns() {
+        use icu_plurals::{PluralRules, PluralRulesPreferences};
+        use writeable::Writeable;
+        let patterns = parse_unit_patterns(&serde_json::json!({
+            "unitPattern-count-one": "{0} byte",
+            "unitPattern-count-other": "{0} bytes",
+            "displayName-count-0": "no bytes"
+        }))
+        .unwrap();
+        let rules =
+            PluralRules::try_new_cardinal(PluralRulesPreferences::from(icu_locale::locale!("en")))
+                .unwrap();
+        assert_eq!(
+            patterns
+                .get(1.into(), &rules)
+                .interpolate(["1"])
+                .write_to_string(),
+            "1 byte"
+        );
+        assert_eq!(
+            patterns
+                .get(2.into(), &rules)
+                .interpolate(["2"])
+                .write_to_string(),
+            "2 bytes"
+        );
+        assert_eq!(
+            patterns
+                .get(0.into(), &rules)
+                .interpolate(["0"])
+                .write_to_string(),
+            "no bytes"
+        );
     }
 }

@@ -19,7 +19,7 @@ use icu_calendar::cal::{
 use icu_datetime::{
     DateTimeFormatterPreferences,
     fieldsets::builder::{DateFields, ZoneStyle},
-    options::{Length, SubsecondDigits as IcuSubsecondDigits, TimePrecision},
+    options::{Length, SubsecondDigits as IcuSubsecondDigits, TimePrecision, YearStyle},
     preferences::{CalendarAlgorithm, HijriCalendarAlgorithm, HourCycle as IcuHourCycle},
     scaffold::CldrCalendar,
 };
@@ -320,6 +320,15 @@ impl FormatOptions {
             (None, None, Some(day_period), _) => Some(day_period.to_length()),
             (None, None, None, Some(era)) => Some(era.to_length()),
             (None, None, None, None) => None,
+        }
+    }
+
+    /// Keep numeric years complete even when the locale uses a short date pattern.
+    pub(super) fn to_year_style(&self) -> Option<YearStyle> {
+        match self.year {
+            Some(Year::Numeric) => Some(YearStyle::Full),
+            Some(Year::TwoDigit) => Some(YearStyle::Auto),
+            None => None,
         }
     }
 

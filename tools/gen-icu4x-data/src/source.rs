@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use boa_icu_data::{BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV2};
+use boa_icu_data::{
+    BoaCurrencyAccountingPatternsV1, BoaNumberSpecialSymbolsV2, BoaUnitsDisplayNamesV1,
+};
 use icu_decimal::provider::DecimalDigitsV1;
 use icu_provider::{
     DataError, DataErrorKind, DataIdentifierCow, DataMarker, DataMarkerAttributes, DataMarkerInfo,
@@ -138,6 +140,20 @@ impl DynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
         marker: DataMarkerInfo,
         request: DataRequest<'_>,
     ) -> Result<DataResponse<ExportMarker>, DataError> {
+        if marker.id == BoaUnitsDisplayNamesV1::INFO.id {
+            let patterns = self
+                .supplemental_numbers
+                .unit_patterns()
+                .get(&request.id.as_cow())
+                .ok_or_else(|| DataErrorKind::IdentifierNotFound.with_req(marker, request))?;
+            let payload = DataPayload::<BoaUnitsDisplayNamesV1>::from_owned(patterns.clone());
+            return Ok(DataResponse {
+                metadata: DataResponseMetadata::default(),
+                payload: <ExportMarker as UpcastDataPayload<BoaUnitsDisplayNamesV1>>::upcast(
+                    payload,
+                ),
+            });
+        }
         if marker.id == BoaNumberSpecialSymbolsV2::INFO.id {
             let Some(symbols) = self
                 .supplemental_numbers
@@ -197,6 +213,14 @@ impl IterableDynamicDataProvider<ExportMarker> for Ecma402SourceProvider<'_> {
         &self,
         marker: DataMarkerInfo,
     ) -> Result<BTreeSet<DataIdentifierCow<'_>>, DataError> {
+        if marker.id == BoaUnitsDisplayNamesV1::INFO.id {
+            return Ok(self
+                .supplemental_numbers
+                .unit_patterns()
+                .keys()
+                .cloned()
+                .collect());
+        }
         if marker.id == BoaNumberSpecialSymbolsV2::INFO.id {
             return Ok(self
                 .supplemental_numbers
@@ -239,6 +263,7 @@ impl ExportableProvider for Ecma402SourceProvider<'_> {
     fn supported_markers(&self) -> BTreeSet<DataMarkerInfo> {
         let mut markers = self.inner.supported_markers();
         markers.insert(BoaNumberSpecialSymbolsV2::INFO);
+        markers.insert(BoaUnitsDisplayNamesV1::INFO);
         markers.insert(BoaCurrencyAccountingPatternsV1::INFO);
         markers
     }

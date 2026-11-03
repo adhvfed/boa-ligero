@@ -650,6 +650,11 @@ pub(crate) fn create_date_time_format(
         context.intl_provider(),
     )?;
 
+    // Pass the resolved preferences to ICU before the legacy reporting defaults
+    // below fill absent values. Explicit options must reach the formatter, while
+    // absent options must retain ICU's locale-specific defaults.
+    let formatter_preferences = intl_options.preferences;
+
     // TODO: The resolved calendar, numbering system, and hour cycle should come from
     // the ICU4X locale resolution result, not hardcoded defaults. However, ICU4X does
     // not yet expose getters for these computed values on DateTimeFormatter.
@@ -850,7 +855,7 @@ pub(crate) fn create_date_time_format(
     // 34. Return dateTimeFormat.
     let formatter = DateTimeFormatter::try_new_with_buffer_provider(
         context.intl_provider().erased_provider(),
-        resolved_locale.clone().into(),
+        formatter_preferences,
         fieldset,
     )
     .map_err(|e| JsNativeError::range().with_message(format!("failed to load formatter: {e}")))?;
@@ -1172,6 +1177,7 @@ fn best_fit_date_time_format(format_options: &FormatOptions) -> JsResult<Composi
     let mut builder = FieldSetBuilder::default();
     builder.length = format_options.to_length();
     builder.date_fields = format_options.to_date_fields();
+    builder.year_style = format_options.to_year_style();
     builder.time_precision = format_options.to_time_fields();
     builder.zone_style = format_options.to_zone_style();
     builder

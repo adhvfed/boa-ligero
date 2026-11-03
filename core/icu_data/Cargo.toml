@@ -13,14 +13,15 @@ rust-version.workspace = true
 [dependencies]
 databake = { workspace = true, optional = true, features = ["derive"] }
 icu_provider.workspace = true
+icu_experimental.workspace = true
 serde = { workspace = true, optional = true, features = ["derive"] }
 yoke = { workspace = true, features = ["derive"] }
 zerofrom = { workspace = true, features = ["derive"] }
 
 [features]
 default = []
-datagen = ["serde", "dep:databake", "icu_provider/export"]
-serde = ["dep:serde", "icu_provider/serde"]
+datagen = ["serde", "dep:databake", "icu_provider/export", "icu_experimental/datagen"]
+serde = ["dep:serde", "icu_provider/serde", "icu_experimental/serde"]
 
 [lints]
 workspace = true

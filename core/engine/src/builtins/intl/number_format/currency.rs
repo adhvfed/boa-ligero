@@ -6,15 +6,14 @@ use boa_icu_data::{
     CurrencyAccountingPattern, CurrencyAccountingPatterns, CurrencyAccountingPlaceholderOrder,
 };
 use fixed_decimal::Sign;
-use icu_decimal::DecimalFormatter;
-use icu_experimental::dimension::provider::currency::essentials::{
-    CurrencyEssentials, PatternSelection, PlaceholderValue,
-};
+use icu_decimal::{AbstractFormatter, DecimalFormatter};
+use icu_experimental::dimension::provider::currency::essentials::CurrencyEssentials;
+use icu_experimental::dimension::provider::currency::symbols::CurrencySymbol;
 use icu_pattern::{DoublePlaceholderKey, DoublePlaceholderPattern, PatternItem};
 use tinystr::TinyAsciiStr;
 use writeable::{LengthHint, Part, PartsWrite, Writeable};
 
-use super::{Currency, CurrencyDisplay, CurrencySign};
+use super::{Currency, CurrencySign};
 
 const CURRENCY: Part = Part {
     category: "number",
@@ -184,10 +183,10 @@ impl<W: Writeable> Writeable for CurrencyBody<'_, W> {
 pub(super) struct FormattedCurrency<'a, W> {
     number: W,
     essentials: &'a CurrencyEssentials<'a>,
+    symbol: Option<&'a CurrencySymbol<'a>>,
     sign_formatter: &'a DecimalFormatter,
     sign: Sign,
     currency: TinyAsciiStr<3>,
-    display: CurrencyDisplay,
     currency_sign: CurrencySign,
     accounting_patterns: Option<&'a CurrencyAccountingPatterns<'a>>,
 }
@@ -195,7 +194,6 @@ pub(super) struct FormattedCurrency<'a, W> {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CurrencyFormatterOptions {
     pub(super) currency: Currency,
-    pub(super) display: CurrencyDisplay,
     pub(super) sign: CurrencySign,
 }
 
@@ -203,6 +201,7 @@ impl<'a, W> FormattedCurrency<'a, W> {
     pub(super) fn new(
         number: W,
         essentials: &'a CurrencyEssentials<'a>,
+        symbol: Option<&'a CurrencySymbol<'a>>,
         sign_formatter: &'a DecimalFormatter,
         sign: Sign,
         options: CurrencyFormatterOptions,
@@ -211,56 +210,34 @@ impl<'a, W> FormattedCurrency<'a, W> {
         Self {
             number,
             essentials,
+            symbol,
             sign_formatter,
             sign,
             currency: options.currency.as_tinystr(),
-            display: options.display,
             currency_sign: options.sign,
             accounting_patterns,
         }
     }
 
-    fn symbol_and_pattern(&self) -> (&str, &DoublePlaceholderPattern, PatternSelection) {
-        let config = self
+    fn symbol_and_pattern(&self) -> (&str, &DoublePlaceholderPattern, bool) {
+        let symbol = self
+            .symbol
+            .map_or(self.currency.as_str(), CurrencySymbol::as_str);
+        let starts_with_letter = self.symbol.is_none_or(CurrencySymbol::starts_with_letter);
+        let ends_with_letter = self.symbol.is_none_or(CurrencySymbol::ends_with_letter);
+        let pattern = self
             .essentials
-            .pattern_config_map
-            .get_copied(&self.currency.to_unvalidated())
-            .unwrap_or(self.essentials.default_pattern_config);
-
-        let (placeholder, selection) = match self.display {
-            CurrencyDisplay::Symbol => (
-                config.short_placeholder_value,
-                config.short_pattern_selection,
-            ),
-            CurrencyDisplay::NarrowSymbol => (
-                config.narrow_placeholder_value,
-                config.narrow_pattern_selection,
-            ),
-            // ICU4X's essentials provider does not contain pluralized currency names.
-            // The ISO code is the required fallback when localized display data is absent.
-            CurrencyDisplay::Code | CurrencyDisplay::Name => (
-                Some(PlaceholderValue::ISO),
-                PatternSelection::StandardAlphaNextToNumber,
-            ),
-        };
-
-        let symbol = match placeholder {
-            Some(PlaceholderValue::Index(index)) => self
+            .get_positive(starts_with_letter, ends_with_letter);
+        let alpha = self.essentials.indices.standard_alpha_next_to_number
+            != self.essentials.indices.standard
+            && self
                 .essentials
-                .placeholders
-                .get(index.into())
-                .unwrap_or(self.currency.as_str()),
-            Some(PlaceholderValue::ISO) | None => self.currency.as_str(),
-        };
-
-        let pattern = match selection {
-            PatternSelection::Standard => &*self.essentials.standard_pattern,
-            PatternSelection::StandardAlphaNextToNumber => {
-                &*self.essentials.standard_alpha_next_to_number_pattern
-            }
-        };
-
-        (symbol, pattern, selection)
+                .patterns
+                .get(usize::from(
+                    self.essentials.indices.standard_alpha_next_to_number,
+                ))
+                .is_some_and(|candidate| candidate == pattern);
+        (symbol, pattern, alpha)
     }
 
     fn body(&self) -> CurrencyBody<'_, W> {
@@ -278,9 +255,10 @@ impl<'a, W> FormattedCurrency<'a, W> {
         }
         let patterns = self.accounting_patterns?;
         let (symbol, _, selection) = self.symbol_and_pattern();
-        let pattern = match selection {
-            PatternSelection::Standard => patterns.standard.as_ref(),
-            PatternSelection::StandardAlphaNextToNumber => patterns.alpha_next_to_number.as_ref(),
+        let pattern = if selection {
+            patterns.alpha_next_to_number.as_ref()
+        } else {
+            patterns.standard.as_ref()
         }?;
         Some(AccountingCurrencyBody {
             number: &self.number,
@@ -297,7 +275,7 @@ impl<W: Writeable> Writeable for FormattedCurrency<'_, W> {
             return accounting.write_to(sink);
         }
         self.sign_formatter
-            .format_sign(self.sign, self.body())
+            .format_sign(self.body(), self.sign)
             .write_to(sink)
     }
 
@@ -306,7 +284,7 @@ impl<W: Writeable> Writeable for FormattedCurrency<'_, W> {
             return accounting.write_to_parts(sink);
         }
         self.sign_formatter
-            .format_sign(self.sign, self.body())
+            .format_sign(self.body(), self.sign)
             .write_to_parts(sink)
     }
 
@@ -315,7 +293,7 @@ impl<W: Writeable> Writeable for FormattedCurrency<'_, W> {
             return accounting.writeable_length_hint();
         }
         self.sign_formatter
-            .format_sign(self.sign, self.body())
+            .format_sign(self.body(), self.sign)
             .writeable_length_hint()
     }
 }

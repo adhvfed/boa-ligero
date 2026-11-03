@@ -112,43 +112,14 @@ macro_rules! provider_from_icu_crate {
     };
 }
 
-const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
-    icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
-    icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
-    icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
-    icu_experimental::dimension::provider::units::display_names::UnitsDisplayNamesV1::INFO,
-    icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
-    icu_experimental::relativetime::provider::LongDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongYearRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowYearRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortYearRelativeV1::INFO,
-];
+use boa_icu_data::EXPERIMENTAL_MARKERS;
 
 /// Boa's default buffer provider.
 static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBufferProvider>>> =
     Lazy::new(|| {
         let provider = MultiForkByMarkerProvider::new(alloc::vec![
             provider_from_icu_crate!(icu_casemap),
+            provider_from_icu_crate!(icu_calendar),
             provider_from_icu_crate!(icu_collator),
             provider_from_icu_crate!(icu_datetime),
             provider_from_icu_crate!(icu_time),
@@ -156,6 +127,7 @@ static PROVIDER: Lazy<LocaleFallbackProvider<MultiForkByMarkerProvider<LazyBuffe
             provider_from_icu_crate!(icu_experimental, EXPERIMENTAL_MARKERS),
             provider_from_icu_crate!(icu_list),
             provider_from_icu_crate!(icu_locale),
+            provider_from_icu_crate!(icu_locale_fallback),
             provider_from_icu_crate!(icu_normalizer),
             provider_from_icu_crate!(icu_plurals),
             provider_from_icu_crate!(icu_segmenter),
@@ -259,6 +231,40 @@ mod tests {
             .unwrap();
         let standard = response.payload.get().standard.as_ref().unwrap();
         assert_eq!((&*standard.prefix, &*standard.suffix), ("(", ")"));
+    }
+
+    #[test]
+    fn bundled_provider_covers_units_outside_icu_categorized_inventory() {
+        let provider = super::buffer();
+        for locale in ["en", "nb", "ar"] {
+            let locale = locale.parse().unwrap();
+            for unit in [
+                "byte",
+                "megabit",
+                "celsius",
+                "fahrenheit",
+                "degree",
+                "percent",
+                "meter",
+                "liter",
+            ] {
+                for width in ["long", "short", "narrow"] {
+                    let attribute = format!("{width}-{unit}");
+                    let attributes = DataMarkerAttributes::try_from_str(&attribute).unwrap();
+                    let _response: DataResponse<boa_icu_data::BoaUnitsDisplayNamesV1> = provider
+                        .as_deserializing()
+                        .load(DataRequest {
+                            id: DataIdentifierBorrowed::for_marker_attributes_and_locale(
+                                attributes, &locale,
+                            ),
+                            ..DataRequest::default()
+                        })
+                        .unwrap_or_else(|error| {
+                            panic!("missing {attribute} for {locale}: {error}")
+                        });
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! Supplemental ICU4X data schemas used by Boa's ECMA-402 implementation.
+//! Shared ICU4X data contracts used by Boa's ECMA-402 implementation.
 //!
 //! ICU4X does not yet expose every piece of CLDR number-format data required by
 //! ECMA-402. Keeping those schemas in a small, engine-independent crate lets
 //! both Boa's bundled provider and custom providers supply the missing data.
+//! The experimental marker catalog also keeps generation and runtime routing in sync.
 
 #![no_std]
 #![allow(single_use_lifetimes, unused_crate_dependencies)]
@@ -146,4 +147,50 @@ icu_provider::data_struct!(
 pub const MARKERS: &[DataMarkerInfo] = &[
     BoaNumberSpecialSymbolsV2::INFO,
     BoaCurrencyAccountingPatternsV1::INFO,
+    BoaUnitsDisplayNamesV1::INFO,
+];
+
+/// Unit patterns for every ECMA-402 sanctioned unit, including categories not
+/// covered by ICU4X's categorized unit inventory.
+pub use icu_experimental::dimension::provider::units::display_names::UnitsDisplayNames;
+icu_provider::data_marker!(
+    /// Complete ECMA-402 unit-name inventory.
+    BoaUnitsDisplayNamesV1,
+    "boa/units/display/names/v1",
+    UnitsDisplayNames<'static>,
+    #[cfg(feature = "datagen")]
+    attributes_domain = "units"
+);
+
+/// ICU experimental markers shared by data generation and runtime routing.
+pub const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
+    icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
+    icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
+    icu_experimental::dimension::provider::currency::symbols::CurrencySymbolsV1::INFO,
+    icu_experimental::dimension::provider::percent::DecimalPercentV1::INFO,
+    icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeDayLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeHourLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMinuteLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMonthLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeQuarterLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeSecondLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeWeekLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeYearLongV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeDayNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeHourNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMinuteNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMonthNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeQuarterNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeSecondNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeWeekNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeYearNarrowV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeDayShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeHourShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMinuteShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeMonthShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeQuarterShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeSecondShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeWeekShortV1::INFO,
+    icu_experimental::relativetime::provider::DatetimeRelativeYearShortV1::INFO,
 ];

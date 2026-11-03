@@ -6,16 +6,20 @@ use boa_icu_data::{
 };
 use fixed_decimal::{Decimal, FloatPrecision, Sign, SignDisplay};
 use icu_decimal::{
-    CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences, FormattedDecimal,
-    FormattedSign,
+    AbstractFormatter, CompactDecimalFormatter, DecimalFormatter, DecimalFormatterPreferences,
+    FormattedDecimal, FormattedSign,
     options::{DecimalFormatterOptions, GroupingStrategy},
     preferences::{CompactDecimalFormatterPreferences, NumberingSystem},
     provider::{DecimalDigitsV1, DecimalSymbolsV1},
 };
 
+use icu_experimental::dimension::currency::CurrencyType;
 use icu_experimental::dimension::provider::{
-    currency::{essentials::CurrencyEssentialsV1, fractions::CurrencyFractionsV1},
-    percent::PercentEssentialsV1,
+    currency::{
+        essentials::CurrencyEssentialsV1, fractions::CurrencyFractionsV1,
+        symbols::CurrencySymbolsV1,
+    },
+    percent::DecimalPercentV1,
 };
 use icu_locale::{Locale, extensions::unicode::Value};
 use icu_plurals::PluralOperands;
@@ -262,11 +266,11 @@ impl Formatter {
                 let sign = special_value_sign(value, sign_display);
                 let value = special_symbols.map_or("∞", |symbols| &*symbols.infinity);
                 FormattedNumeric::Special(self.sign_formatter().format_sign(
-                    sign,
                     SpecialValue {
                         value,
                         part: "infinity",
                     },
+                    sign,
                 ))
             }
             IntlMathematicalValue::NaN => {
@@ -274,7 +278,7 @@ impl Formatter {
                 let value = special_symbols.map_or("NaN", |symbols| &*symbols.nan);
                 FormattedNumeric::Special(
                     self.sign_formatter()
-                        .format_sign(sign, SpecialValue { value, part: "nan" }),
+                        .format_sign(SpecialValue { value, part: "nan" }, sign),
                 )
             }
         }
@@ -300,9 +304,10 @@ impl Formatter {
 #[derive(Debug)]
 enum StyleData {
     Plain,
-    Percent(DataPayload<PercentEssentialsV1>),
+    Percent(DataPayload<DecimalPercentV1>),
     Currency {
         essentials: DataPayload<CurrencyEssentialsV1>,
+        symbol: Option<DataPayload<CurrencySymbolsV1>>,
         accounting_patterns: Option<DataPayload<BoaCurrencyAccountingPatternsV1>>,
     },
     Unit(UnitData),
@@ -440,11 +445,12 @@ impl NumberFormat {
             )),
             StyleData::Currency {
                 essentials,
+                symbol,
                 accounting_patterns,
             } => {
                 let UnitFormatOptions::Currency {
                     currency,
-                    display,
+                    display: _,
                     sign,
                 } = &self.unit_options
                 else {
@@ -453,11 +459,11 @@ impl NumberFormat {
                 FormattedNumber::Currency(FormattedCurrency::new(
                     number,
                     essentials.get(),
+                    symbol.as_ref().map(DataPayload::get),
                     self.formatter.sign_formatter(),
                     style_sign,
                     CurrencyFormatterOptions {
                         currency: *currency,
-                        display: *display,
                         sign: *sign,
                     },
                     accounting_patterns.as_ref().map(DataPayload::get),
@@ -849,7 +855,7 @@ impl NumberFormat {
         };
         let style_data = match unit_options.style() {
             Style::Percent => {
-                let response: icu_provider::DataResponse<PercentEssentialsV1> = context
+                let response: icu_provider::DataResponse<DecimalPercentV1> = context
                     .intl_provider()
                     .load(request)
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
@@ -860,6 +866,54 @@ impl NumberFormat {
                     .intl_provider()
                     .load(request)
                     .map_err(|err| js_error!(TypeError: "{}", err.to_string()))?;
+                let symbol = if let UnitFormatOptions::Currency {
+                    currency, display, ..
+                } = &unit_options
+                {
+                    if matches!(
+                        display,
+                        CurrencyDisplay::Symbol | CurrencyDisplay::NarrowSymbol
+                    ) {
+                        let currency_type =
+                            CurrencyType::try_from_str(currency.as_tinystr().as_str())
+                                .map_err(|_| js_error!(TypeError: "invalid currency code"))?;
+                        let width = if *display == CurrencyDisplay::NarrowSymbol {
+                            CurrencySymbolsV1::NARROW
+                        } else {
+                            CurrencySymbolsV1::SHORT
+                        };
+                        let mut attribute_buffer = tinystr::TinyAsciiStr::default();
+                        let attributes = CurrencySymbolsV1::make_attributes(
+                            currency_type,
+                            width,
+                            &mut attribute_buffer,
+                        );
+                        let mut symbol_request = request;
+                        symbol_request.id.marker_attributes = attributes;
+                        match DataProvider::<CurrencySymbolsV1>::load(
+                            context.intl_provider(),
+                            symbol_request,
+                        ) {
+                            Ok(response) => Some(response.payload),
+                            Err(error)
+                                if matches!(
+                                    error.kind,
+                                    DataErrorKind::IdentifierNotFound
+                                        | DataErrorKind::MarkerNotFound
+                                ) =>
+                            {
+                                None
+                            }
+                            Err(error) => {
+                                return Err(js_error!(TypeError: "{}", error.to_string()));
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    unreachable!("currency style requires currency options")
+                };
                 let accounting_patterns = if matches!(
                     unit_options,
                     UnitFormatOptions::Currency {
@@ -891,6 +945,7 @@ impl NumberFormat {
                 };
                 StyleData::Currency {
                     essentials: response.payload,
+                    symbol,
                     accounting_patterns,
                 }
             }

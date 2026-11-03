@@ -1,11 +1,10 @@
 //! Structured unit output built from ICU4X locale patterns.
 
+use boa_icu_data::{BoaUnitsDisplayNamesV1, UnitsDisplayNames};
+
 use core::fmt::Write as _;
 
-use icu_experimental::dimension::provider::units::{
-    display_names::{UnitsDisplayNames, UnitsDisplayNamesV1},
-    essentials::UnitsEssentialsV1,
-};
+use icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1;
 use icu_locale::Locale;
 use icu_pattern::{
     DoublePlaceholderKey, DoublePlaceholderPattern, ParserOptions, PatternItem,
@@ -28,10 +27,10 @@ const UNIT: Part = Part {
 
 #[derive(Debug)]
 enum UnitPatterns {
-    Direct(DataPayload<UnitsDisplayNamesV1>),
+    Direct(DataPayload<BoaUnitsDisplayNamesV1>),
     Compound {
-        numerator: DataPayload<UnitsDisplayNamesV1>,
-        denominator: DataPayload<UnitsDisplayNamesV1>,
+        numerator: DataPayload<BoaUnitsDisplayNamesV1>,
+        denominator: DataPayload<BoaUnitsDisplayNamesV1>,
         per: Box<DoublePlaceholderPattern>,
     },
 }
@@ -65,8 +64,8 @@ impl UnitData {
                 ),
                 metadata,
             };
-            DryDataProvider::<UnitsDisplayNamesV1>::dry_load(provider, request)?;
-            let response = DataProvider::<UnitsDisplayNamesV1>::load(provider, request)?;
+            DryDataProvider::<BoaUnitsDisplayNamesV1>::dry_load(provider, request)?;
+            let response = DataProvider::<BoaUnitsDisplayNamesV1>::load(provider, request)?;
             Ok::<_, DataError>(response.payload)
         };
 
@@ -272,9 +271,7 @@ impl<'a, W> FormattedUnit<'a, W> {
     fn direct(&self, data: &'a UnitsDisplayNames<'a>) -> SelectedUnit<'_, W> {
         SelectedUnit {
             number: &self.number,
-            pattern: data
-                .patterns
-                .get(self.data.operands(self.operands), &self.data.plural_rules),
+            pattern: data.get(self.data.operands(self.operands), &self.data.plural_rules),
         }
     }
 }
@@ -290,10 +287,7 @@ impl<W: Writeable> Writeable for FormattedUnit<'_, W> {
             } => {
                 let numerator = self.direct(numerator.get());
                 let denominator = UnitName {
-                    pattern: denominator
-                        .get()
-                        .patterns
-                        .get(1.into(), &self.data.plural_rules),
+                    pattern: denominator.get().get(1.into(), &self.data.plural_rules),
                 };
                 for item in per.iter() {
                     match item {
@@ -321,10 +315,7 @@ impl<W: Writeable> Writeable for FormattedUnit<'_, W> {
             } => {
                 let numerator = self.direct(numerator.get());
                 let denominator = UnitName {
-                    pattern: denominator
-                        .get()
-                        .patterns
-                        .get(1.into(), &self.data.plural_rules),
+                    pattern: denominator.get().get(1.into(), &self.data.plural_rules),
                 };
                 for item in per.iter() {
                     match item {

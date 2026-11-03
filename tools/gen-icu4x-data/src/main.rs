@@ -1,6 +1,6 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{error::Error, fs::File};
 
 use clap::Parser;
@@ -17,42 +17,15 @@ const EXPORT_PATH: &str = "core/icu_provider/data";
 
 #[derive(Debug, Parser)]
 struct Args {
+    /// Write generated blobs to a staging directory before installing them.
+    #[arg(long, default_value = EXPORT_PATH)]
+    output_dir: PathBuf,
     /// Regenerate only one service blob, preserving all other generated data.
     #[arg(long)]
     service: Option<String>,
 }
 
-const EXPERIMENTAL_MARKERS: &[DataMarkerInfo] = &[
-    icu_experimental::dimension::provider::currency::essentials::CurrencyEssentialsV1::INFO,
-    icu_experimental::dimension::provider::currency::fractions::CurrencyFractionsV1::INFO,
-    icu_experimental::dimension::provider::percent::PercentEssentialsV1::INFO,
-    icu_experimental::dimension::provider::units::display_names::UnitsDisplayNamesV1::INFO,
-    icu_experimental::dimension::provider::units::essentials::UnitsEssentialsV1::INFO,
-    icu_experimental::relativetime::provider::LongDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::LongYearRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::NarrowYearRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortDayRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortHourRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortMinuteRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortMonthRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortQuarterRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortSecondRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortWeekRelativeV1::INFO,
-    icu_experimental::relativetime::provider::ShortYearRelativeV1::INFO,
-];
+use boa_icu_data::EXPERIMENTAL_MARKERS;
 
 /// Units accepted by ECMA-402's `IsSanctionedSimpleUnitIdentifier` operation.
 const SANCTIONED_SIMPLE_UNITS: &[&str] = &[
@@ -121,6 +94,7 @@ fn is_sanctioned_unit_attribute(attributes: &str) -> bool {
 /// This must be kept in sync with the list of implemented services for `Intl`.
 const SERVICES: &[(&str, &[DataMarkerInfo])] = &[
     ("icu_casemap", icu_casemap::provider::MARKERS),
+    ("icu_calendar", icu_calendar::provider::MARKERS),
     ("icu_collator", icu_collator::provider::MARKERS),
     ("icu_datetime", icu_datetime::provider::MARKERS),
     ("icu_time", icu_time::provider::MARKERS),
@@ -128,6 +102,10 @@ const SERVICES: &[(&str, &[DataMarkerInfo])] = &[
     ("icu_experimental", EXPERIMENTAL_MARKERS),
     ("icu_list", icu_list::provider::MARKERS),
     ("icu_locale", icu_locale::provider::MARKERS),
+    (
+        "icu_locale_fallback",
+        icu_locale_fallback::provider::MARKERS,
+    ),
     ("icu_normalizer", icu_normalizer::provider::MARKERS),
     ("icu_plurals", icu_plurals::provider::MARKERS),
     ("icu_segmenter", icu_segmenter::provider::MARKERS),
@@ -136,13 +114,13 @@ const SERVICES: &[(&str, &[DataMarkerInfo])] = &[
 
 fn export_for_service(
     service: &str,
+    export_path: &Path,
     markers: &[DataMarkerInfo],
     provider: &Ecma402SourceProvider<'_>,
     driver: ExportDriver,
 ) -> Result<(), Box<dyn Error>> {
     log::info!("Generating ICU4X data for service `{service}` with markers: {markers:#?}");
 
-    let export_path = Path::new(EXPORT_PATH);
     let export_file = export_path.join(format!("{service}.postcard"));
 
     driver.with_markers(markers.iter().copied()).export(
@@ -166,12 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_level(log::LevelFilter::Info)
         .init()?;
 
-    if args.service.is_none() {
-        // Removal will throw an error if the directory doesn't exist, hence
-        // why we can ignore the error.
-        let _unused = std::fs::remove_dir_all(EXPORT_PATH);
-    }
-    std::fs::create_dir_all(EXPORT_PATH)?;
+    std::fs::create_dir_all(&args.output_dir)?;
 
     let source = SourceDataProvider::new();
     let locales = source
@@ -210,7 +183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             continue;
         }
-        export_for_service(service, keys, &provider, driver.clone())?;
+        export_for_service(service, &args.output_dir, keys, &provider, driver.clone())?;
     }
 
     Ok(())

@@ -9,7 +9,7 @@ use icu_decimal::{
 use icu_experimental::relativetime::{
     RelativeTimeFormatter as NativeRelativeTimeFormatter, RelativeTimeFormatterOptions,
     RelativeTimeFormatterPreferences, options::Numeric as NativeNumeric,
-    provider::LongSecondRelativeV1,
+    provider::DatetimeRelativeSecondLongV1,
 };
 use icu_locale::{
     LanguageIdentifier, Locale,
@@ -223,7 +223,7 @@ pub(crate) struct RelativeTimeFormat {
 }
 
 impl Service for RelativeTimeFormat {
-    type LangMarker = LongSecondRelativeV1;
+    type LangMarker = DatetimeRelativeSecondLongV1;
     type Preferences = RelativeTimeFormatterPreferences;
 }
 
@@ -301,7 +301,7 @@ impl BuiltInConstructor for RelativeTimeFormat {
         )?;
 
         let mut native_options = RelativeTimeFormatterOptions::default();
-        native_options.numeric = numeric.to_native();
+        native_options.numeric = Some(numeric.to_native());
         let preferences = intl_options.preferences;
         let numbering_system = resolved_numbering_system(
             context.intl_provider().erased_provider(),
@@ -449,7 +449,7 @@ impl RelativeTimeFormat {
     ) -> JsResult<NativeRelativeTimeFormatter> {
         let preferences = RelativeTimeFormatterPreferences::from(&self.locale);
         let mut options = RelativeTimeFormatterOptions::default();
-        options.numeric = self.numeric.to_native();
+        options.numeric = Some(self.numeric.to_native());
         new_formatter(
             context.intl_provider().erased_provider(),
             preferences,

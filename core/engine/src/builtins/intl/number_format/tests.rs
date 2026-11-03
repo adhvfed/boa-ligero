@@ -229,6 +229,13 @@ fn currency_style_uses_localized_symbols_and_patterns() {
 fn currency_style_uses_accounting_patterns() {
     run_test_actions([
         TestAction::assert_eq(
+            r#"new Intl.NumberFormat("en-US", {
+                style: "currency", currency: "USD", currencyDisplay: "code",
+                currencySign: "accounting"
+            }).format(-987)"#,
+            js_string!("(USD\u{a0}987.00)"),
+        ),
+        TestAction::assert_eq(
             r#"
                 JSON.stringify(["en-US", "ja-JP", "ko-KR", "zh-TW"].map(locale =>
                     new Intl.NumberFormat(locale, {
@@ -542,4 +549,25 @@ fn u16_to_rounding_increment_rainy_day() {
     for num in INVALID_CASES {
         assert!(RoundingIncrement::from_u16(num).is_none());
     }
+}
+
+#[cfg(feature = "intl_bundled")]
+#[test]
+fn migrated_unit_data_preserves_format_and_parts_across_categories() {
+    run_test_actions([TestAction::assert(
+        r#"
+        ["en", "nb", "ar"].every(locale =>
+            ["byte", "megabit", "celsius", "fahrenheit", "degree", "percent", "meter", "liter"].every(unit =>
+                ["long", "short", "narrow"].every(unitDisplay => {
+                    const nf = new Intl.NumberFormat(locale, {style: "unit", unit, unitDisplay});
+                    return [0, 1, 2, 5, -3].every(value => {
+                        const parts = nf.formatToParts(value);
+                        return parts.some(part => part.type === "unit") &&
+                            parts.map(part => part.value).join("") === nf.format(value);
+                    });
+                })
+            )
+        )
+    "#,
+    )]);
 }
