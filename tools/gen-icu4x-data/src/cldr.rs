@@ -76,7 +76,7 @@ impl SupplementalNumberData {
         let mut accounting_patterns = HashMap::new();
 
         for index in 0..archive.len() {
-            let file_name = archive.by_index_raw(index)?.name().to_owned();
+            let file_name = archive.by_index_raw(index)?.name()?.into_owned();
             let Some(locale_name) = file_name
                 .strip_prefix(CLDR_NUMBERS_PREFIX)
                 .and_then(|name| name.strip_suffix(NUMBERS_SUFFIX))
