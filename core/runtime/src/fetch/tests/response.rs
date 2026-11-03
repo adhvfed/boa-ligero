@@ -109,7 +109,7 @@ fn response_json() {
             let response = ctx.global_object().get(js_str!("response"), ctx).unwrap();
             let response = response.as_promise().unwrap().await_blocking(ctx).unwrap();
             assert_eq!(
-                format!("{}", response.display_obj(false)),
+                response.display_obj(false).to_string(),
                 "{\n    hello world: 123\n}"
             );
         }),

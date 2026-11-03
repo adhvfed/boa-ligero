@@ -43,6 +43,10 @@ impl E2eFetcher {
 }
 
 impl crate::fetch::Fetcher for E2eFetcher {
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "Borrow the JS context when polled, matching the lazy fetch contract"
+    )]
     async fn fetch(
         self: Rc<Self>,
         request: JsRequest,
